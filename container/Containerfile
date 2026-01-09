@@ -1,0 +1,19 @@
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y \
+    git \
+    ripgrep \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt /opt/mcp/
+RUN pip install --no-cache-dir -r /opt/mcp/requirements.txt
+
+COPY server.py /opt/mcp/
+
+RUN mkdir /workspace
+WORKDIR /workspace
+ENV WORKSPACE=/workspace
+
+EXPOSE 8080
+
+ENTRYPOINT ["python", "/opt/mcp/server.py"]
