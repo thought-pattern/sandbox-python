@@ -5,14 +5,23 @@ RUN apt-get update && apt-get install -y \
     ripgrep \
     && rm -rf /var/lib/apt/lists/*
 
+# Non-root user with a writable virtualenv on PATH, so the sandbox runs
+# unprivileged while pip_install/pip_uninstall still work at runtime.
+RUN useradd --create-home --shell /usr/sbin/nologin sandbox \
+    && python -m venv /opt/venv
+ENV PATH=/opt/venv/bin:$PATH
+
 COPY requirements.txt /opt/mcp/
 RUN pip install --no-cache-dir -r /opt/mcp/requirements.txt
 
 COPY server.py /opt/mcp/
 
-RUN mkdir /workspace
+RUN mkdir /workspace \
+    && chown -R sandbox:sandbox /workspace /opt/venv
 WORKDIR /workspace
 ENV WORKSPACE=/workspace
+
+USER sandbox
 
 EXPOSE 8080
 

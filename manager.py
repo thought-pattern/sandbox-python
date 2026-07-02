@@ -1,6 +1,7 @@
 """Container lifecycle management for Python sandbox."""
 
 import subprocess
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 import boto3
@@ -34,14 +35,27 @@ def parse_memory(mem):
         raise ValueError(f"Invalid memory format: {mem}. Use '2g' or '512m'.")
 
 
-def create_container(config, runtime="docker"):
-    cmd = [
-        runtime, "create",
-        "--publish", f"{config.port}:{config.port}",
-        "--memory", config.memory_limit,
-        "--cpus", str(config.cpu_limit),
-        "--env", f"MCP_PORT={config.port}",
-    ]
+def create_container(config, runtime="container"):
+    cmd = [runtime, "create"]
+    # Docker and podman share the host kernel, so the sandbox drops Linux
+    # capabilities and blocks privilege escalation there. Apple's container
+    # runtime gives each container its own lightweight VM -- a stronger
+    # boundary that neither exposes nor needs those flags; the non-root USER
+    # in the image still applies inside the guest.
+    if runtime in ("docker", "podman"):
+        cmd.extend(["--security-opt", "no-new-privileges", "--cap-drop", "ALL"])
+    cmd.extend(
+        [
+            "--publish",
+            f"{config.port}:{config.port}",
+            "--memory",
+            config.memory_limit.upper(),
+            "--cpus",
+            str(int(config.cpu_limit)),
+            "--env",
+            f"SANDBOX_PORT={config.port}",
+        ]
+    )
     for k, v in config.environment.items():
         cmd.extend(["--env", f"{k}={v}"])
     if config.workspace_mount:
@@ -54,18 +68,34 @@ def create_container(config, runtime="docker"):
     return result.stdout.strip()
 
 
-def start_container(container_id, runtime="docker"):
+def start_container(container_id, runtime="container"):
     result = subprocess.run([runtime, "start", container_id], capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"Failed to start container: {result.stderr}")
 
 
-def stop_container(container_id, runtime="docker"):
+def stop_container(container_id, runtime="container"):
     subprocess.run([runtime, "stop", "-t", "10", container_id], capture_output=True, text=True)
 
 
-def destroy_container(container_id, runtime="docker"):
+def destroy_container(container_id, runtime="container"):
     subprocess.run([runtime, "rm", "-f", container_id], capture_output=True, text=True)
+
+
+@contextmanager
+def sandbox_session(config, runtime="container"):
+    """Create, start, and always destroy a sandbox container.
+
+    The container is torn down on the way out even when the work inside the
+    block raises, so a sandbox is disposable by construction rather than by
+    the caller remembering to clean up.
+    """
+    container_id = create_container(config, runtime=runtime)
+    try:
+        start_container(container_id, runtime=runtime)
+        yield container_id
+    finally:
+        destroy_container(container_id, runtime=runtime)
 
 
 def create_fargate_task(config, cluster, subnet_ids, security_group_ids):
@@ -84,12 +114,8 @@ def create_fargate_task(config, cluster, subnet_ids, security_group_ids):
         taskDefinition=task_def,
         launchType="FARGATE",
         networkConfiguration={
-            "awsvpcConfiguration": {
-                "subnets": subnet_ids,
-                "securityGroups": security_group_ids,
-                "assignPublicIp": "DISABLED"
-            }
-        }
+            "awsvpcConfiguration": {"subnets": subnet_ids, "securityGroups": security_group_ids, "assignPublicIp": "DISABLED"}
+        },
     )
     return resp["tasks"][0]["taskArn"]
 
@@ -98,7 +124,7 @@ def register_task_def(config):
     if ecs is None:
         raise RuntimeError("AWS credentials not configured")
 
-    env = [{"name": "MCP_PORT", "value": str(config.port)}]
+    env = [{"name": "SANDBOX_PORT", "value": str(config.port)}]
     env.extend({"name": k, "value": v} for k, v in config.environment.items())
 
     resp = ecs.register_task_definition(
@@ -107,13 +133,15 @@ def register_task_def(config):
         requiresCompatibilities=["FARGATE"],
         cpu=str(int(config.cpu_limit * 1024)),
         memory=parse_memory(config.memory_limit),
-        containerDefinitions=[{
-            "name": "sandbox",
-            "image": config.image,
-            "essential": True,
-            "environment": env,
-            "portMappings": [{"containerPort": config.port}]
-        }]
+        containerDefinitions=[
+            {
+                "name": "sandbox",
+                "image": config.image,
+                "essential": True,
+                "environment": env,
+                "portMappings": [{"containerPort": config.port}],
+            }
+        ],
     )
     return resp["taskDefinition"]["taskDefinitionArn"]
 

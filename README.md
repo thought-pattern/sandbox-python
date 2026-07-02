@@ -1,16 +1,17 @@
 # sandbox-python
 
-Python 3.12 sandbox container exposing development tools via MCP over SSE.
+Python 3.12 sandbox container exposing development tools over a plain HTTP tool interface.
 
 ## Project Structure
 
 ```
 sandbox-python/
 ├── container/
-│   ├── Containerfile     # Python 3.12-slim
-│   ├── requirements.txt
-│   └── server.py         # MCP server
-├── manager.py            # Container lifecycle functions
+│   ├── Containerfile     # Python 3.12-slim, runs non-root
+│   ├── requirements.txt  # empty; the server is standard-library only
+│   └── server.py         # HTTP tool server
+├── manager.py            # Container lifecycle (Apple container / Docker / podman, Fargate)
+├── tests/                # Unit tests + a runtime-gated build/run smoke test
 └── README.md
 ```
 
@@ -18,73 +19,59 @@ sandbox-python/
 
 ```bash
 cd container
-podman build -t python-sandbox:latest -f Containerfile .
+container build -t python-sandbox:latest -f Containerfile .
 ```
+
+`docker` or `podman` work identically in place of `container`.
 
 ## Running
 
 ```bash
-podman run -p 8080:8080 python-sandbox:latest
+container run --rm -p 8080:8080 python-sandbox:latest
 ```
 
-## MCP Tools
+## HTTP Tool Interface
 
-### Files
+The server exposes three endpoints from the Python standard library. The same interface serves development and production; only the base URL changes.
 
-| Tool | Description |
-|------|-------------|
-| `file_read(path)` | Read file |
-| `file_write(path, content)` | Write file |
-| `file_patch(path, patches)` | Find/replace patches |
-| `file_delete(path)` | Delete file |
-| `file_list(path, depth)` | List directory |
-| `file_search(pattern, path)` | Ripgrep search |
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/health` | Liveness: `{"status": "healthy", "python": "..."}` |
+| GET | `/tools` | Self-describing manifest of every tool |
+| POST | `/tools/<name>` | Invoke a tool with a JSON object of arguments |
 
-### Pip
+A successful call returns `{"result": ...}`; a failure returns a non-2xx status with `{"error": "..."}`. The manifest is derived from the tool functions by introspection, so it cannot drift from the code:
 
-| Tool | Description |
-|------|-------------|
-| `pip_install(packages)` | Install packages |
-| `pip_uninstall(packages)` | Uninstall packages |
-| `pip_list()` | List installed |
-| `pip_freeze()` | Requirements format |
+```json
+{
+  "tools": [
+    {"name": "file_read", "description": "Read contents of a file.",
+     "parameters": [{"name": "path", "required": true, "default": null}]}
+  ]
+}
+```
 
-### Git
+### Tools
 
-| Tool | Description |
-|------|-------------|
-| `git_clone(repo_url, branch)` | Clone repo |
-| `git_status()` | Status |
-| `git_diff(staged)` | Diff |
-| `git_commit(message)` | Commit all |
-| `git_push(remote, branch)` | Push |
-
-### Execution
-
-| Tool | Description |
-|------|-------------|
-| `run_command(command, timeout)` | Shell command |
-| `run_python(script, timeout)` | Python code |
-
-### Environment
-
-| Tool | Description |
-|------|-------------|
-| `python_version()` | Python version string |
+- **Files:** `file_read`, `file_write`, `file_patch`, `file_delete`, `file_list`, `file_search`
+- **Pip:** `pip_install`, `pip_uninstall`, `pip_list`, `pip_freeze`
+- **Git:** `git_clone`, `git_status`, `git_diff`, `git_commit`, `git_push`
+- **Execution:** `run_command`, `run_python`
+- **Environment:** `python_version`
 
 ## Container Manager
 
 ```python
-from manager import ContainerConfig, create_container, start_container, destroy_container
+from manager import ContainerConfig, sandbox_session
 
 config = ContainerConfig(port=8080)
-container_id = create_container(config, runtime="podman")
-start_container(container_id, runtime="podman")
-
-# connect MCP client to http://localhost:8080
-
-destroy_container(container_id, runtime="podman")
+with sandbox_session(config, runtime="container") as container_id:
+    # connect an HTTP client to http://localhost:8080
+    ...
+# the container is always destroyed on exit
 ```
+
+`runtime` defaults to `container` (Apple's container runtime); `docker` and `podman` are interchangeable. The lower-level `create_container` / `start_container` / `stop_container` / `destroy_container` functions are available when you need to drive the lifecycle directly.
 
 ### Fargate
 
@@ -97,19 +84,17 @@ wait_for_fargate_task(task_arn, cluster)
 endpoint = get_fargate_endpoint(task_arn, cluster, config.port)
 ```
 
-## Health Check
+## Tests
 
 ```bash
-curl http://localhost:8080/health
+python3 -m pytest tests/ -q
 ```
 
-```json
-{"status": "healthy", "python": "3.12.x ..."}
-```
+Unit tests run anywhere; the build-and-run smoke test runs only when a container runtime (`container`, `docker`, or `podman`) is present and skips otherwise.
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MCP_PORT` | 8080 | Server port |
+| `SANDBOX_PORT` | 8080 | Server port |
 | `WORKSPACE` | /workspace | Working directory |

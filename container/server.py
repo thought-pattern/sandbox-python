@@ -1,39 +1,49 @@
-"""MCP server for Python sandbox environment."""
+"""HTTP tool server for the Python sandbox.
 
+Exposes the workspace tools over a small plain-HTTP interface the consultant
+reaches as a client, using only the standard library: GET /health for liveness,
+GET /tools for the self-describing manifest, and POST /tools/<name> to invoke a
+tool with a JSON object of arguments. The same interface serves development and
+production; only the endpoint URL changes.
+"""
+
+import inspect
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-import uvicorn
-from fastmcp import FastMCP
-from starlette.applications import Starlette
-from starlette.responses import JSONResponse
-from starlette.routing import Route, Mount
-
 WORKSPACE = Path(os.environ.get("WORKSPACE", "/workspace"))
-mcp = FastMCP("python-sandbox")
+
+TOOLS = {}
+
+
+def tool(fn):
+    """Register a function as a callable tool surfaced in the manifest."""
+    TOOLS[fn.__name__] = fn
+    return fn
 
 
 def resolve_path(path):
-    """Resolve path within workspace, raise if outside."""
+    """Resolve a path within the workspace, rejecting anything outside it."""
     target = (WORKSPACE / path).resolve()
     if not target.is_relative_to(WORKSPACE):
         raise ValueError("Path must be within workspace")
     return target
 
 
-@mcp.tool()
-def file_read(path: str):
+@tool
+def file_read(path):
     """Read contents of a file."""
     return resolve_path(path).read_text()
 
 
-@mcp.tool()
-def file_write(path: str, content: str):
+@tool
+def file_write(path, content):
     """Write content to a file."""
     target = resolve_path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -41,89 +51,81 @@ def file_write(path: str, content: str):
     return f"Wrote {len(content)} bytes"
 
 
-@mcp.tool()
-def file_patch(path: str, patches: list):
+@tool
+def file_patch(path, patches):
     """Apply find/replace patches to a file."""
     target = resolve_path(path)
     content = target.read_text()
-    for p in patches:
-        if p["old"] not in content:
-            raise ValueError(f"Not found: {p['old'][:50]}...")
-        content = content.replace(p["old"], p["new"], 1)
+    for patch in patches:
+        old = patch.get("old", "")
+        if old not in content:
+            raise ValueError(f"Not found: {old[:50]}...")
+        content = content.replace(old, patch.get("new", ""), 1)
     target.write_text(content)
     return f"Applied {len(patches)} patches"
 
 
-@mcp.tool()
-def file_delete(path: str):
+@tool
+def file_delete(path):
     """Delete a file."""
     resolve_path(path).unlink(missing_ok=False)
     return f"Deleted {path}"
 
 
-@mcp.tool()
-def file_list(path: str = ".", depth: int = 2):
-    """List files in directory."""
+@tool
+def file_list(path=".", depth=2):
+    """List files in a directory."""
     target = resolve_path(path)
     result = subprocess.run(
-        ["find", str(target), "-maxdepth", str(depth), "-type", "f"],
-        capture_output=True, text=True, cwd=WORKSPACE
+        ["find", str(target), "-maxdepth", str(depth), "-type", "f"], capture_output=True, text=True, cwd=WORKSPACE
     )
     lines = [l for l in result.stdout.strip().split("\n") if l]
     return [str(Path(f).relative_to(WORKSPACE)) for f in lines]
 
 
-@mcp.tool()
-def file_search(pattern: str, path: str = "."):
-    """Search for pattern in files using ripgrep."""
+@tool
+def file_search(pattern, path="."):
+    """Search for a pattern in files using ripgrep."""
     target = resolve_path(path)
-    result = subprocess.run(
-        ["rg", "--json", pattern, str(target)],
-        capture_output=True, text=True, cwd=WORKSPACE
-    )
-
+    result = subprocess.run(["rg", "--json", pattern, str(target)], capture_output=True, text=True, cwd=WORKSPACE)
     matches = []
     for line in result.stdout.strip().split("\n"):
         if not line:
             continue
         data = json.loads(line)
-        if data["type"] == "match":
-            d = data["data"]
-            matches.append({
-                "file": str(Path(d["path"]["text"]).relative_to(WORKSPACE)),
-                "line": d["line_number"],
-                "content": d["lines"]["text"].strip()
-            })
+        if data.get("type") == "match":
+            d = data.get("data", {})
+            matches.append(
+                {
+                    "file": str(Path(d["path"]["text"]).relative_to(WORKSPACE)),
+                    "line": d["line_number"],
+                    "content": d["lines"]["text"].strip(),
+                }
+            )
     return matches
 
 
-@mcp.tool()
-def pip_install(packages: list):
+@tool
+def pip_install(packages):
     """Install Python packages."""
     for pkg in packages:
-        if not re.match(r'^[a-zA-Z0-9_.-]+([=<>!~\[\]][a-zA-Z0-9._,<>=!~\[\]]*)?$', pkg):
+        if not re.match(r"^[a-zA-Z0-9_.-]+([=<>!~\[\]][a-zA-Z0-9._,<>=!~\[\]]*)?$", pkg):
             raise ValueError(f"Invalid package: {pkg}")
-    result = subprocess.run(
-        ["pip", "install", "--no-cache-dir"] + packages,
-        capture_output=True, text=True, timeout=300
-    )
-    return {"stdout": result.stdout, "stderr": result.stderr, "exit_code": result.returncode}
+    result = subprocess.run(["pip", "install", "--no-cache-dir"] + packages, capture_output=True, text=True, timeout=300)
+    return {"stdout": result.stdout, "stderr": result.stderr, "exitCode": result.returncode}
 
 
-@mcp.tool()
-def pip_uninstall(packages: list):
+@tool
+def pip_uninstall(packages):
     """Uninstall Python packages."""
     for pkg in packages:
-        if not re.match(r'^[a-zA-Z0-9_.-]+$', pkg):
+        if not re.match(r"^[a-zA-Z0-9_.-]+$", pkg):
             raise ValueError(f"Invalid package: {pkg}")
-    result = subprocess.run(
-        ["pip", "uninstall", "-y"] + packages,
-        capture_output=True, text=True, timeout=60
-    )
-    return {"stdout": result.stdout, "stderr": result.stderr, "exit_code": result.returncode}
+    result = subprocess.run(["pip", "uninstall", "-y"] + packages, capture_output=True, text=True, timeout=60)
+    return {"stdout": result.stdout, "stderr": result.stderr, "exitCode": result.returncode}
 
 
-@mcp.tool()
+@tool
 def pip_list():
     """List installed packages."""
     result = subprocess.run(["pip", "list", "--format=json"], capture_output=True, text=True)
@@ -132,149 +134,165 @@ def pip_list():
     return json.loads(result.stdout)
 
 
-@mcp.tool()
+@tool
 def pip_freeze():
     """Get installed packages in requirements.txt format."""
     result = subprocess.run(["pip", "freeze"], capture_output=True, text=True)
     return result.stdout
 
 
-@mcp.tool()
-def run_command(command: str, timeout: int = 60):
-    """Execute shell command in workspace."""
+@tool
+def run_command(command, timeout=60):
+    """Execute a shell command in the workspace."""
     try:
-        result = subprocess.run(
-            command, shell=True, capture_output=True, text=True,
-            cwd=WORKSPACE, timeout=timeout
-        )
-        return {"stdout": result.stdout, "stderr": result.stderr, "exit_code": result.returncode}
+        result = subprocess.run(command, shell=True, capture_output=True, text=True, cwd=WORKSPACE, timeout=timeout)
+        return {"stdout": result.stdout, "stderr": result.stderr, "exitCode": result.returncode}
     except subprocess.TimeoutExpired:
-        return {"stdout": "", "stderr": f"Timed out after {timeout}s", "exit_code": -1}
+        return {"stdout": "", "stderr": f"Timed out after {timeout}s", "exitCode": -1}
 
 
-@mcp.tool()
-def run_python(script: str, timeout: int = 60):
+@tool
+def run_python(script, timeout=60):
     """Execute Python code."""
     try:
         result = subprocess.run(
-            [sys.executable, "-c", script],
-            capture_output=True, text=True, cwd=WORKSPACE, timeout=timeout
+            [sys.executable, "-c", script], capture_output=True, text=True, cwd=WORKSPACE, timeout=timeout
         )
-        return {"stdout": result.stdout, "stderr": result.stderr, "exit_code": result.returncode}
+        return {"stdout": result.stdout, "stderr": result.stderr, "exitCode": result.returncode}
     except subprocess.TimeoutExpired:
-        return {"stdout": "", "stderr": f"Timed out after {timeout}s", "exit_code": -1}
+        return {"stdout": "", "stderr": f"Timed out after {timeout}s", "exitCode": -1}
 
 
-@mcp.tool()
-def git_clone(repo_url: str, branch: str = "main"):
-    """Clone repository into workspace."""
+@tool
+def git_clone(repo_url, branch="main"):
+    """Clone a repository into the workspace."""
     for item in WORKSPACE.iterdir():
         if item.is_dir():
             shutil.rmtree(item)
         else:
             item.unlink()
-
     result = subprocess.run(
-        ["git", "clone", "--branch", branch, repo_url, "."],
-        capture_output=True, text=True, cwd=WORKSPACE
+        ["git", "clone", "--branch", branch, repo_url, "."], capture_output=True, text=True, cwd=WORKSPACE
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr)
     return f"Cloned {repo_url} (branch: {branch})"
 
 
-@mcp.tool()
+@tool
 def git_status():
-    """Get current git status."""
-    branch = subprocess.run(
-        ["git", "branch", "--show-current"],
-        capture_output=True, text=True, cwd=WORKSPACE
-    )
-    status = subprocess.run(
-        ["git", "status", "--porcelain"],
-        capture_output=True, text=True, cwd=WORKSPACE
-    )
-    return {
-        "branch": branch.stdout.strip(),
-        "changes": [l for l in status.stdout.strip().split("\n") if l]
-    }
+    """Get the current git status."""
+    branch = subprocess.run(["git", "branch", "--show-current"], capture_output=True, text=True, cwd=WORKSPACE)
+    status = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True, cwd=WORKSPACE)
+    return {"branch": branch.stdout.strip(), "changes": [l for l in status.stdout.strip().split("\n") if l]}
 
 
-@mcp.tool()
-def git_diff(staged: bool = False):
-    """Get diff of changes."""
+@tool
+def git_diff(staged=False):
+    """Get the diff of changes."""
     cmd = ["git", "diff", "--staged"] if staged else ["git", "diff"]
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=WORKSPACE)
     return result.stdout
 
 
-@mcp.tool()
-def git_commit(message: str):
+@tool
+def git_commit(message):
     """Stage all changes and commit."""
     add_result = subprocess.run(["git", "add", "-A"], capture_output=True, text=True, cwd=WORKSPACE)
     if add_result.returncode != 0:
         raise RuntimeError(add_result.stderr)
-    result = subprocess.run(
-        ["git", "commit", "-m", message],
-        capture_output=True, text=True, cwd=WORKSPACE
-    )
+    result = subprocess.run(["git", "commit", "-m", message], capture_output=True, text=True, cwd=WORKSPACE)
     if result.returncode != 0:
         raise RuntimeError(result.stderr)
     return result.stdout
 
 
-@mcp.tool()
-def git_push(remote: str = "origin", branch=None):
-    """Push commits to remote."""
+@tool
+def git_push(remote="origin", branch=None):
+    """Push commits to a remote."""
     if branch is None:
-        result = subprocess.run(
-            ["git", "branch", "--show-current"],
-            capture_output=True, text=True, cwd=WORKSPACE
-        )
+        result = subprocess.run(["git", "branch", "--show-current"], capture_output=True, text=True, cwd=WORKSPACE)
         branch = result.stdout.strip()
-    result = subprocess.run(
-        ["git", "push", remote, branch],
-        capture_output=True, text=True, cwd=WORKSPACE
-    )
+    result = subprocess.run(["git", "push", remote, branch], capture_output=True, text=True, cwd=WORKSPACE)
     if result.returncode != 0:
         raise RuntimeError(result.stderr)
     return f"Pushed to {remote}/{branch}"
 
 
-@mcp.tool()
+@tool
 def python_version():
-    """Get Python version."""
+    """Get the Python version string."""
     return sys.version
 
 
-@mcp.resource("workspace://tree")
-def workspace_tree():
-    """Current workspace file tree."""
-    result = subprocess.run(
-        ["find", ".", "-maxdepth", "3", "-type", "f"],
-        capture_output=True, text=True, cwd=WORKSPACE
-    )
-    return "\n".join(result.stdout.strip().split("\n")[:100])
+def build_manifest():
+    """Describe every registered tool: name, description, and parameters."""
+    tools = []
+    for name, fn in TOOLS.items():
+        parameters = []
+        for param_name, param in inspect.signature(fn).parameters.items():
+            required = param.default is inspect.Parameter.empty
+            parameters.append(
+                {"name": param_name, "required": required, "default": None if required else param.default}
+            )
+        tools.append({"name": name, "description": (fn.__doc__ or "").strip(), "parameters": parameters})
+    return {"tools": tools}
 
 
-@mcp.resource("workspace://git-log")
-def git_log():
-    """Recent git history."""
-    result = subprocess.run(
-        ["git", "log", "--oneline", "-20"],
-        capture_output=True, text=True, cwd=WORKSPACE
-    )
-    return result.stdout
+class ToolHandler(BaseHTTPRequestHandler):
+    def send_json(self, status, payload):
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/health":
+            self.send_json(200, {"status": "healthy", "python": sys.version})
+        elif self.path == "/tools":
+            self.send_json(200, build_manifest())
+        else:
+            self.send_json(404, {"error": f"no such path: {self.path}"})
+
+    def do_POST(self):
+        if not self.path.startswith("/tools/"):
+            self.send_json(404, {"error": f"no such path: {self.path}"})
+            return
+        name = self.path[len("/tools/") :]
+        fn = TOOLS.get(name)
+        if fn is None:
+            self.send_json(404, {"error": f"no such tool: {name}"})
+            return
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length) if length else b""
+        try:
+            arguments = json.loads(raw) if raw else {}
+        except ValueError as err:
+            self.send_json(400, {"error": f"invalid JSON body: {err}"})
+            return
+        if not isinstance(arguments, dict):
+            self.send_json(400, {"error": "request body must be a JSON object of arguments"})
+            return
+        try:
+            result = fn(**arguments)
+        except TypeError as err:
+            self.send_json(400, {"error": f"bad arguments for {name}: {err}"})
+            return
+        except Exception as err:
+            self.send_json(500, {"error": str(err)})
+            return
+        self.send_json(200, {"result": result})
+
+    def log_message(self, format, *args):
+        return
 
 
-def health(request):
-    return JSONResponse({"status": "healthy", "python": sys.version})
+def main():
+    port = int(os.environ.get("SANDBOX_PORT", "8080"))
+    ThreadingHTTPServer(("0.0.0.0", port), ToolHandler).serve_forever()
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("MCP_PORT", "8080"))
-    app = Starlette(routes=[
-        Route("/health", health),
-        Mount("/", app=mcp.sse_app()),
-    ])
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    main()

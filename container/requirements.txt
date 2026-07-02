@@ -1,3 +1,3 @@
-fastmcp==2.14.2
-starlette
-uvicorn
+# The tool server uses only the Python standard library; no third-party
+# dependencies. Task-time packages are installed into the venv at runtime
+# through the pip_install tool.
