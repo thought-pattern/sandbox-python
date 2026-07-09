@@ -36,11 +36,16 @@ def parse_memory(mem):
 
 def create_container(config, runtime="docker"):
     cmd = [
-        runtime, "create",
-        "--publish", f"{config.port}:{config.port}",
-        "--memory", config.memory_limit,
-        "--cpus", str(config.cpu_limit),
-        "--env", f"MCP_PORT={config.port}",
+        runtime,
+        "create",
+        "--publish",
+        f"{config.port}:{config.port}",
+        "--memory",
+        config.memory_limit,
+        "--cpus",
+        str(config.cpu_limit),
+        "--env",
+        f"MCP_PORT={config.port}",
     ]
     for k, v in config.environment.items():
         cmd.extend(["--env", f"{k}={v}"])
@@ -84,12 +89,8 @@ def create_fargate_task(config, cluster, subnet_ids, security_group_ids):
         taskDefinition=task_def,
         launchType="FARGATE",
         networkConfiguration={
-            "awsvpcConfiguration": {
-                "subnets": subnet_ids,
-                "securityGroups": security_group_ids,
-                "assignPublicIp": "DISABLED"
-            }
-        }
+            "awsvpcConfiguration": {"subnets": subnet_ids, "securityGroups": security_group_ids, "assignPublicIp": "DISABLED"}
+        },
     )
     return resp["tasks"][0]["taskArn"]
 
@@ -107,13 +108,15 @@ def register_task_def(config):
         requiresCompatibilities=["FARGATE"],
         cpu=str(int(config.cpu_limit * 1024)),
         memory=parse_memory(config.memory_limit),
-        containerDefinitions=[{
-            "name": "sandbox",
-            "image": config.image,
-            "essential": True,
-            "environment": env,
-            "portMappings": [{"containerPort": config.port}]
-        }]
+        containerDefinitions=[
+            {
+                "name": "sandbox",
+                "image": config.image,
+                "essential": True,
+                "environment": env,
+                "portMappings": [{"containerPort": config.port}],
+            }
+        ],
     )
     return resp["taskDefinition"]["taskDefinitionArn"]
 
