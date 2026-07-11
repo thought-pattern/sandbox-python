@@ -1,90 +1,198 @@
 """Container lifecycle management for Python sandbox."""
 
 import subprocess
-from dataclasses import dataclass, field
 
 import boto3
 
 try:
     ecs = boto3.client("ecs")
-except Exception:
+    ecs_init_error = None
+except Exception as exc:  # region/profile/config resolution errors surface here
     ecs = None
+    ecs_init_error = exc
 
 task_def_cache = {}
 
+DEFAULT_CONFIG = {
+    "image": "python-sandbox:latest",
+    "workspace_mount": "",
+    "environment": {},
+    "memory_limit": "2g",
+    "cpu_limit": 1.0,
+    "port": 8080,
+}
 
-@dataclass
-class ContainerConfig:
-    image: str = "python-sandbox:latest"
-    workspace_mount: str = None
-    environment: dict = field(default_factory=dict)
-    memory_limit: str = "2g"
-    cpu_limit: float = 1.0
-    port: int = 8080
+CREATE_TIMEOUT = 120
+RUNTIME_TIMEOUT = 60
+
+
+def require_ecs():
+    """Return the ECS client, or raise with the original initialization error.
+
+    Returns:
+        The boto3 ECS client.
+
+    Raises:
+        RuntimeError: If the client failed to initialize (missing region,
+            credentials, or configuration).
+    """
+    if ecs is None:
+        raise RuntimeError(f"AWS ECS client unavailable: {ecs_init_error}")
+    return ecs
 
 
 def parse_memory(mem):
-    """Parse memory string like '2g' or '512m' to MB string."""
+    """Parse a memory string like '2g' or '512m' into a MB string.
+
+    Args:
+        mem: Memory size such as '2g' or '512m'.
+
+    Returns:
+        The size in megabytes as a string, e.g. '2048'.
+
+    Raises:
+        ValueError: If the format is not recognized.
+    """
     mem = mem.lower()
     if mem.endswith("g"):
-        return str(int(mem[:-1]) * 1024)
+        mb = str(int(mem[:-1]) * 1024)
     elif mem.endswith("m"):
-        return mem[:-1]
+        mb = mem[:-1]
     else:
         raise ValueError(f"Invalid memory format: {mem}. Use '2g' or '512m'.")
+    return mb
 
 
 def create_container(config, runtime="docker"):
+    """Create a sandbox container from a config dict.
+
+    Args:
+        config: Partial container config; missing keys fall back to
+            DEFAULT_CONFIG.
+        runtime: Container runtime executable ('docker' or 'podman').
+
+    Returns:
+        The created container id.
+
+    Raises:
+        RuntimeError: If the runtime fails to create the container.
+    """
+    config = {**DEFAULT_CONFIG, **config}
+    port = config.get("port")
     cmd = [
         runtime,
         "create",
         "--publish",
-        f"{config.port}:{config.port}",
+        f"{port}:{port}",
         "--memory",
-        config.memory_limit,
+        config.get("memory_limit"),
         "--cpus",
-        str(config.cpu_limit),
+        str(config.get("cpu_limit")),
         "--env",
-        f"MCP_PORT={config.port}",
+        f"MCP_PORT={port}",
     ]
-    for k, v in config.environment.items():
+    for k, v in config.get("environment", {}).items():
         cmd.extend(["--env", f"{k}={v}"])
-    if config.workspace_mount:
-        cmd.extend(["--volume", f"{config.workspace_mount}:/workspace"])
-    cmd.append(config.image)
+    workspace_mount = config.get("workspace_mount")
+    if workspace_mount:
+        # --mount separates source/destination by commas rather than colons,
+        # so Windows source paths (e.g. C:\work) are not mis-split.
+        cmd.extend(["--mount", f"type=bind,source={workspace_mount},destination=/workspace"])
+    cmd.append(config.get("image"))
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=CREATE_TIMEOUT)
     if result.returncode != 0:
         raise RuntimeError(f"Failed to create container: {result.stderr}")
-    return result.stdout.strip()
+    container_id = result.stdout.strip()
+    return container_id
 
 
 def start_container(container_id, runtime="docker"):
-    result = subprocess.run([runtime, "start", container_id], capture_output=True, text=True)
+    """Start a previously created container.
+
+    Args:
+        container_id: Id returned by create_container.
+        runtime: Container runtime executable.
+
+    Raises:
+        RuntimeError: If the runtime fails to start the container.
+    """
+    result = subprocess.run(
+        [runtime, "start", container_id], capture_output=True, text=True, timeout=RUNTIME_TIMEOUT
+    )
     if result.returncode != 0:
         raise RuntimeError(f"Failed to start container: {result.stderr}")
 
 
 def stop_container(container_id, runtime="docker"):
-    subprocess.run([runtime, "stop", "-t", "10", container_id], capture_output=True, text=True)
+    """Stop a running container.
+
+    Args:
+        container_id: Id of the container to stop.
+        runtime: Container runtime executable.
+
+    Raises:
+        RuntimeError: If the runtime fails to stop the container.
+    """
+    result = subprocess.run(
+        [runtime, "stop", "-t", "10", container_id], capture_output=True, text=True, timeout=RUNTIME_TIMEOUT
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to stop container: {result.stderr}")
 
 
 def destroy_container(container_id, runtime="docker"):
-    subprocess.run([runtime, "rm", "-f", container_id], capture_output=True, text=True)
+    """Remove a container, force-killing it if still running.
+
+    Args:
+        container_id: Id of the container to remove.
+        runtime: Container runtime executable.
+
+    Raises:
+        RuntimeError: If the runtime fails to remove the container.
+    """
+    result = subprocess.run(
+        [runtime, "rm", "-f", container_id], capture_output=True, text=True, timeout=RUNTIME_TIMEOUT
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to destroy container: {result.stderr}")
 
 
 def create_fargate_task(config, cluster, subnet_ids, security_group_ids):
-    if ecs is None:
-        raise RuntimeError("AWS credentials not configured")
+    """Run the sandbox as a Fargate task, reusing a cached task definition.
 
-    key = f"{config.image}:{config.memory_limit}:{config.cpu_limit}:{config.port}"
-    if key in task_def_cache:
-        task_def = task_def_cache[key]
-    else:
+    Args:
+        config: Partial container config; missing keys fall back to
+            DEFAULT_CONFIG.
+        cluster: ECS cluster name or ARN.
+        subnet_ids: Non-empty list of subnet ids for the task ENI.
+        security_group_ids: Non-empty list of security group ids.
+
+    Returns:
+        The running task ARN.
+
+    Raises:
+        ValueError: If subnet_ids or security_group_ids is empty.
+        RuntimeError: If ECS is unavailable or task placement fails.
+    """
+    client = require_ecs()
+    if not subnet_ids:
+        raise ValueError("subnet_ids must not be empty")
+    if not security_group_ids:
+        raise ValueError("security_group_ids must not be empty")
+
+    config = {**DEFAULT_CONFIG, **config}
+    # Environment is baked into the task definition, so it must be part of the
+    # cache key or two configs differing only in env would share a definition.
+    env_key = ",".join(f"{k}={v}" for k, v in sorted(config.get("environment", {}).items()))
+    key = f"{config.get('image')}:{config.get('memory_limit')}:{config.get('cpu_limit')}:{config.get('port')}:{env_key}"
+
+    task_def = task_def_cache.get(key)
+    if task_def is None:
         task_def = register_task_def(config)
         task_def_cache[key] = task_def
 
-    resp = ecs.run_task(
+    resp = client.run_task(
         cluster=cluster,
         taskDefinition=task_def,
         launchType="FARGATE",
@@ -92,58 +200,117 @@ def create_fargate_task(config, cluster, subnet_ids, security_group_ids):
             "awsvpcConfiguration": {"subnets": subnet_ids, "securityGroups": security_group_ids, "assignPublicIp": "DISABLED"}
         },
     )
-    return resp["tasks"][0]["taskArn"]
+
+    failures = resp.get("failures")
+    if failures:
+        raise RuntimeError(f"Failed to run Fargate task: {failures}")
+    tasks = resp.get("tasks")
+    if not tasks:
+        raise RuntimeError("run_task returned no tasks and no failures")
+    task_arn = tasks[0].get("taskArn")
+    return task_arn
 
 
 def register_task_def(config):
-    if ecs is None:
-        raise RuntimeError("AWS credentials not configured")
+    """Register an ECS task definition for the sandbox container.
 
-    env = [{"name": "MCP_PORT", "value": str(config.port)}]
-    env.extend({"name": k, "value": v} for k, v in config.environment.items())
+    Args:
+        config: Partial container config; missing keys fall back to
+            DEFAULT_CONFIG.
 
-    resp = ecs.register_task_definition(
+    Returns:
+        The registered task definition ARN.
+
+    Raises:
+        RuntimeError: If ECS is unavailable.
+    """
+    client = require_ecs()
+
+    config = {**DEFAULT_CONFIG, **config}
+    cpu_limit = config.get("cpu_limit")
+    if not isinstance(cpu_limit, (int, float)):
+        raise ValueError(f"cpu_limit must be numeric, got {cpu_limit!r}")
+
+    env = [{"name": "MCP_PORT", "value": str(config.get("port"))}]
+    env.extend({"name": k, "value": v} for k, v in config.get("environment", {}).items())
+
+    resp = client.register_task_definition(
         family="python-sandbox",
         networkMode="awsvpc",
         requiresCompatibilities=["FARGATE"],
-        cpu=str(int(config.cpu_limit * 1024)),
-        memory=parse_memory(config.memory_limit),
+        cpu=str(int(cpu_limit * 1024)),
+        memory=parse_memory(config.get("memory_limit")),
         containerDefinitions=[
             {
                 "name": "sandbox",
-                "image": config.image,
+                "image": config.get("image"),
                 "essential": True,
                 "environment": env,
-                "portMappings": [{"containerPort": config.port}],
+                "portMappings": [{"containerPort": config.get("port")}],
             }
         ],
     )
-    return resp["taskDefinition"]["taskDefinitionArn"]
+    task_def_arn = resp.get("taskDefinition", {}).get("taskDefinitionArn")
+    return task_def_arn
 
 
 def wait_for_fargate_task(task_arn, cluster):
-    if ecs is None:
-        raise RuntimeError("AWS credentials not configured")
-    waiter = ecs.get_waiter("tasks_running")
+    """Block until the given Fargate task reaches the RUNNING state.
+
+    Args:
+        task_arn: ARN of the task to wait on.
+        cluster: ECS cluster name or ARN.
+
+    Raises:
+        RuntimeError: If ECS is unavailable.
+    """
+    client = require_ecs()
+    waiter = client.get_waiter("tasks_running")
     waiter.wait(cluster=cluster, tasks=[task_arn])
 
 
 def stop_fargate_task(task_arn, cluster):
-    if ecs is None:
-        raise RuntimeError("AWS credentials not configured")
-    ecs.stop_task(cluster=cluster, task=task_arn)
+    """Stop a running Fargate task.
+
+    Args:
+        task_arn: ARN of the task to stop.
+        cluster: ECS cluster name or ARN.
+
+    Raises:
+        RuntimeError: If ECS is unavailable.
+    """
+    client = require_ecs()
+    client.stop_task(cluster=cluster, task=task_arn)
 
 
 def get_fargate_endpoint(task_arn, cluster, port):
-    if ecs is None:
-        raise RuntimeError("AWS credentials not configured")
-    resp = ecs.describe_tasks(cluster=cluster, tasks=[task_arn])
-    task = resp["tasks"][0]
+    """Resolve the private HTTP endpoint of a running Fargate task.
+
+    Args:
+        task_arn: ARN of the running task.
+        cluster: ECS cluster name or ARN.
+        port: Container port to address.
+
+    Returns:
+        An 'http://IP:port' endpoint string.
+
+    Raises:
+        RuntimeError: If ECS is unavailable or the task IP cannot be found.
+    """
+    client = require_ecs()
+    resp = client.describe_tasks(cluster=cluster, tasks=[task_arn])
+    tasks = resp.get("tasks")
+    if not tasks:
+        raise RuntimeError("Task not found")
+    task = tasks[0]
 
     for att in task.get("attachments", []):
         if att.get("type") == "ElasticNetworkInterface":
             for d in att.get("details", []):
                 if d.get("name") == "privateIPv4Address":
-                    return f"http://{d['value']}:{port}"
+                    ip = d.get("value")
+                    if ip:
+                        endpoint = f"http://{ip}:{port}"
+                        return endpoint
 
     raise RuntimeError("Could not find task IP address")

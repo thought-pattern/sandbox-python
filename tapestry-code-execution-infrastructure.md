@@ -98,7 +98,7 @@ Architecture:
 │  Regulator ◄── intercepts calls ─────────────┤              │
 │                                               │              │
 └───────────────────────────────────────────────┼──────────────┘
-                                                │ stdio/SSE
+                                                │ HTTP
                                                 ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                    CONTAINER                                 │
@@ -106,15 +106,15 @@ Architecture:
 │  ┌───────────────────────────────────────────────────────┐  │
 │  │            MCP Server (Python + FastMCP)              │  │
 │  │                                                        │  │
-│  │  Tools:                                                │  │
-│  │    file_read, file_write, file_patch, file_list       │  │
-│  │    run_command, run_tests                             │  │
-│  │    git_clone, git_status, git_commit, git_push        │  │
-│  │    install_packages                                    │  │
+│  │  Tools:                                               │  │
+│  │    file_read/write/patch/delete/list/search           │  │
+│  │    pip_install/uninstall/list/freeze                  │  │
+│  │    run_command, run_python, python_version            │  │
+│  │    git_init/clone/status/diff/commit/push             │  │
 │  └───────────────────────────────────────────────────────┘  │
 │                                                              │
 │  /workspace/  ← mounted or cloned repo                      │
-│  Runtimes: python, node, git, ripgrep                       │
+│  Runtimes: python, git, ripgrep                             │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -124,8 +124,7 @@ Architecture:
 |----------|-----------|
 | Agent outside container | Regulator can gate every tool call; proof extraction possible |
 | MCP protocol | Standardized, tools self-describe, portable |
-| Stdio transport (local) | Simple, direct, no network overhead |
-| SSE transport (Fargate) | Works over network, same protocol |
+| Streamable HTTP transport | One MCP transport local and cloud; works over the network |
 | Same image everywhere | Build once, deploy anywhere |
 
 ### 3.3 Comparison to Claude Code Web
@@ -133,7 +132,7 @@ Architecture:
 | Aspect | Claude Code Web | Tapestry MCP Container |
 |--------|-----------------|------------------------|
 | Agent location | Inside container | Outside container |
-| Tool interface | Direct bash/file access | MCP protocol over stdio |
+| Tool interface | Direct bash/file access | MCP protocol over HTTP |
 | Agent logic | Claude Code CLI bundled | Tapestry Actor (separate) |
 | Oversight | Permission prompts | Regulator intercepts tool calls |
 | Learning | None | Proof extraction from tool sequences |
@@ -144,9 +143,9 @@ Architecture:
 
 | Stage | Container Runtime | Orchestration | MCP Transport |
 |-------|-------------------|---------------|---------------|
-| Prototype | Docker local | Python `docker` SDK | stdio |
-| MVP | Docker local/remote | Docker SDK | stdio |
-| GA | ECS/Fargate | Boto3 / AWS SDK | SSE |
+| Prototype | Docker/Podman local | `manager.py` (CLI subprocess) | Streamable HTTP |
+| MVP | Docker/Podman local/remote | `manager.py` (CLI subprocess) | Streamable HTTP |
+| GA | ECS/Fargate | `manager.py` (boto3) | Streamable HTTP |
 
 The MCP server code stays identical across all environments—only the orchestration layer changes.
 
@@ -157,562 +156,826 @@ The MCP server code stays identical across all environments—only the orchestra
 ### 5.1 Project Structure
 
 ```
-tapestry/
-├── containers/
-│   ├── dev/
-│   │   ├── Dockerfile
-│   │   ├── requirements.txt
-│   │   └── server.py           # MCP server (runs IN container)
-│   └── manager.py              # ContainerManager abstraction
-├── agent/
-│   ├── dev_environment.py      # MCP client wrapper
-│   └── code_agent.py           # Actor/Regulator orchestration loop
-└── config/
-    └── environments.py         # Docker vs Fargate configuration
+sandbox-python/                 # this repo: container image + host-side manager
+├── container/
+│   ├── Containerfile           # Python 3.12-slim image
+│   ├── requirements.txt        # fastmcp, starlette, uvicorn
+│   └── server.py               # MCP server (runs IN container)
+├── manager.py                  # container lifecycle functions (host side)
+├── requirements.txt            # boto3 (Fargate management)
+└── README.md
+
+Tapestry-side integration (separate codebase, not in this repo):
+    agent/dev_environment.py     # MCP client wrapper
+    agent/code_agent.py          # Actor/Regulator orchestration loop
 ```
 
 ### 5.2 MCP Server
 
 The MCP server runs inside the container and exposes development tools.
 
-**File:** `containers/dev/server.py`
+**File:** `container/server.py`
 
 ```python
-import asyncio
+"""MCP server for Python sandbox environment."""
+
 import json
 import os
+import re
+import shutil
 import subprocess
+import sys
+import tempfile
 from pathlib import Path
+
 from fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
-WORKSPACE = Path(os.environ.get("WORKSPACE", "/workspace"))
+WORKSPACE = Path(os.environ.get("WORKSPACE", "/workspace")).resolve()
+mcp = FastMCP("python-sandbox")
 
-mcp = FastMCP("tapestry-dev")
+COMMAND_TIMEOUT = 60
+CLONE_TIMEOUT = 300
+MAX_FILE_BYTES = 10 * 1024 * 1024
+# Disable git's interactive credential prompt so clone/push fail fast instead
+# of blocking forever waiting on stdin.
+GIT_ENV = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
 
-# ═══════════════════════════════════════════════════════════
-# File Operations
-# ═══════════════════════════════════════════════════════════
+
+def resolve_path(path):
+    """Resolve path within workspace, raise if outside."""
+    target = (WORKSPACE / path).resolve()
+    if not target.is_relative_to(WORKSPACE):
+        raise ValueError("Path must be within workspace")
+    return target
+
 
 @mcp.tool()
-def file_read(path: str) -> str:
+def file_read(path: str):
     """Read contents of a file."""
-    target = (WORKSPACE / path).resolve()
-    if not target.is_relative_to(WORKSPACE):
-        raise ValueError("Path must be within workspace")
-    return target.read_text()
+    target = resolve_path(path)
+    size = target.stat().st_size
+    if size > MAX_FILE_BYTES:
+        raise ValueError(f"File too large: {size} bytes (max {MAX_FILE_BYTES})")
+    content = target.read_text()
+    return content
 
 
 @mcp.tool()
-def file_write(path: str, content: str) -> str:
-    """Write content to a file. Creates parent directories if needed."""
-    target = (WORKSPACE / path).resolve()
-    if not target.is_relative_to(WORKSPACE):
-        raise ValueError("Path must be within workspace")
+def file_write(path: str, content: str):
+    """Write content to a file."""
+    target = resolve_path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content)
-    return f"Wrote {len(content)} bytes to {path}"
+    message = f"Wrote {len(content)} bytes"
+    return message
 
 
 @mcp.tool()
-def file_patch(path: str, patches: list[dict]) -> str:
-    """Apply surgical edits to a file.
-    
-    Args:
-        path: File path relative to workspace
-        patches: List of {"old": "text to find", "new": "replacement"}
-    """
-    target = (WORKSPACE / path).resolve()
-    if not target.is_relative_to(WORKSPACE):
-        raise ValueError("Path must be within workspace")
-    
+def file_patch(path: str, patches: list):
+    """Apply find/replace patches to a file."""
+    target = resolve_path(path)
     content = target.read_text()
-    for patch in patches:
-        old, new = patch["old"], patch["new"]
+    for p in patches:
+        old = p.get("old")
+        new = p.get("new")
+        if old is None or new is None:
+            raise ValueError("Each patch must have 'old' and 'new'")
         if old not in content:
-            raise ValueError(f"Could not find: {old[:50]}...")
+            raise ValueError(f"Not found: {old[:50]}...")
         content = content.replace(old, new, 1)
-    
     target.write_text(content)
-    return f"Applied {len(patches)} patches to {path}"
+    message = f"Applied {len(patches)} patches"
+    return message
 
 
 @mcp.tool()
-def file_list(path: str = ".", depth: int = 2) -> list[str]:
+def file_delete(path: str):
+    """Delete a file."""
+    resolve_path(path).unlink(missing_ok=False)
+    message = f"Deleted {path}"
+    return message
+
+
+@mcp.tool()
+def file_list(path: str = ".", depth: int = 2):
     """List files in directory."""
-    target = (WORKSPACE / path).resolve()
-    if not target.is_relative_to(WORKSPACE):
-        raise ValueError("Path must be within workspace")
-    
+    target = resolve_path(path)
     result = subprocess.run(
         ["find", str(target), "-maxdepth", str(depth), "-type", "f"],
-        capture_output=True, text=True, cwd=WORKSPACE
+        capture_output=True,
+        text=True,
+        cwd=WORKSPACE,
+        timeout=COMMAND_TIMEOUT,
     )
-    files = [str(Path(f).relative_to(WORKSPACE)) 
-             for f in result.stdout.strip().split("\n") if f]
+    lines = [line for line in result.stdout.strip().split("\n") if line]
+    files = [str(Path(f).relative_to(WORKSPACE)) for f in lines]
     return files
 
 
 @mcp.tool()
-def file_search(pattern: str, path: str = ".") -> list[dict]:
+def file_search(pattern: str, path: str = "."):
     """Search for pattern in files using ripgrep."""
-    target = (WORKSPACE / path).resolve()
-    if not target.is_relative_to(WORKSPACE):
-        raise ValueError("Path must be within workspace")
-    
-    result = subprocess.run(
-        ["rg", "--json", pattern, str(target)],
-        capture_output=True, text=True, cwd=WORKSPACE
-    )
-    
+    target = resolve_path(path)
+    try:
+        result = subprocess.run(
+            ["rg", "--json", pattern, str(target)],
+            capture_output=True,
+            text=True,
+            cwd=WORKSPACE,
+            timeout=COMMAND_TIMEOUT,
+        )
+    except FileNotFoundError:
+        raise RuntimeError("ripgrep (rg) is not installed")
+
     matches = []
     for line in result.stdout.strip().split("\n"):
         if not line:
             continue
-        data = json.loads(line)
-        if data["type"] == "match":
-            matches.append({
-                "file": str(Path(data["data"]["path"]["text"]).relative_to(WORKSPACE)),
-                "line": data["data"]["line_number"],
-                "content": data["data"]["lines"]["text"].strip()
-            })
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if data.get("type") != "match":
+            continue
+        d = data.get("data", {})
+        path_text = d.get("path", {}).get("text", "")
+        if not path_text:
+            continue
+        lines_text = d.get("lines", {}).get("text", "")
+        matches.append(
+            {
+                "file": str(Path(path_text).relative_to(WORKSPACE)),
+                "line": d.get("line_number"),
+                "content": lines_text.strip(),
+            }
+        )
     return matches
 
 
-# ═══════════════════════════════════════════════════════════
-# Command Execution
-# ═══════════════════════════════════════════════════════════
+@mcp.tool()
+def pip_install(packages: list):
+    """Install Python packages."""
+    for pkg in packages:
+        if not re.match(r"^[a-zA-Z0-9_.-]+([=<>!~\[\]][a-zA-Z0-9._,<>=!~\[\]]*)?$", pkg):
+            raise ValueError(f"Invalid package: {pkg}")
+    result = subprocess.run(
+        ["pip", "install", "--no-cache-dir"] + packages, capture_output=True, text=True, timeout=300
+    )
+    output = {"stdout": result.stdout, "stderr": result.stderr, "exit_code": result.returncode}
+    return output
+
 
 @mcp.tool()
-def run_command(command: str, timeout: int = 60) -> dict:
+def pip_uninstall(packages: list):
+    """Uninstall Python packages."""
+    for pkg in packages:
+        if not re.match(r"^[a-zA-Z0-9_.-]+$", pkg):
+            raise ValueError(f"Invalid package: {pkg}")
+    result = subprocess.run(
+        ["pip", "uninstall", "-y"] + packages, capture_output=True, text=True, timeout=COMMAND_TIMEOUT
+    )
+    output = {"stdout": result.stdout, "stderr": result.stderr, "exit_code": result.returncode}
+    return output
+
+
+@mcp.tool()
+def pip_list():
+    """List installed packages."""
+    result = subprocess.run(
+        ["pip", "list", "--format=json"], capture_output=True, text=True, timeout=COMMAND_TIMEOUT
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr)
+    packages = json.loads(result.stdout)
+    return packages
+
+
+@mcp.tool()
+def pip_freeze():
+    """Get installed packages in requirements.txt format."""
+    result = subprocess.run(["pip", "freeze"], capture_output=True, text=True, timeout=COMMAND_TIMEOUT)
+    freeze = result.stdout
+    return freeze
+
+
+@mcp.tool()
+def run_command(command: str, timeout: int = 60):
     """Execute shell command in workspace."""
     try:
-        result = subprocess.run(
-            command,
-            shell=True,
-            cwd=WORKSPACE,
-            capture_output=True,
-            text=True,
-            timeout=timeout
-        )
-        return {
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "exit_code": result.returncode
-        }
+        result = subprocess.run(command, shell=True, capture_output=True, text=True, cwd=WORKSPACE, timeout=timeout)
+        output = {"stdout": result.stdout, "stderr": result.stderr, "exit_code": result.returncode}
     except subprocess.TimeoutExpired:
-        return {
-            "stdout": "",
-            "stderr": f"Command timed out after {timeout}s",
-            "exit_code": -1
-        }
+        output = {"stdout": "", "stderr": f"Timed out after {timeout}s", "exit_code": -1}
+    return output
 
 
 @mcp.tool()
-def run_tests(command: str = "pytest --tb=short -q") -> dict:
-    """Run test suite."""
-    result = run_command(command)
-    return {
-        "passed": result["exit_code"] == 0,
-        "output": result["stdout"],
-        "errors": result["stderr"],
-        "exit_code": result["exit_code"]
-    }
+def run_python(script: str, timeout: int = 60):
+    """Execute Python code."""
+    try:
+        result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, cwd=WORKSPACE, timeout=timeout)
+        output = {"stdout": result.stdout, "stderr": result.stderr, "exit_code": result.returncode}
+    except subprocess.TimeoutExpired:
+        output = {"stdout": "", "stderr": f"Timed out after {timeout}s", "exit_code": -1}
+    return output
 
 
 @mcp.tool()
-def install_packages(packages: list[str], manager: str = "pip") -> dict:
-    """Install packages."""
-    if manager == "pip":
-        cmd = f"pip install {' '.join(packages)}"
-    elif manager == "npm":
-        cmd = f"npm install {' '.join(packages)}"
-    else:
-        raise ValueError(f"Unknown package manager: {manager}")
-    
-    return run_command(cmd, timeout=300)
+def git_init(branch: str = "main"):
+    """Initialize a new git repository in the workspace."""
+    result = subprocess.run(
+        ["git", "init", f"--initial-branch={branch}"],
+        capture_output=True,
+        text=True,
+        cwd=WORKSPACE,
+        env=GIT_ENV,
+        timeout=COMMAND_TIMEOUT,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr)
+    message = result.stdout.strip()
+    return message
 
-
-# ═══════════════════════════════════════════════════════════
-# Git Operations
-# ═══════════════════════════════════════════════════════════
 
 @mcp.tool()
-def git_clone(repo_url: str, branch: str = "main") -> str:
+def git_clone(repo_url: str, branch: str = "main"):
     """Clone repository into workspace."""
-    run_command("rm -rf /workspace/*")
-    result = run_command(f"git clone --branch {branch} {repo_url} .")
-    if result["exit_code"] != 0:
-        raise RuntimeError(result["stderr"])
-    return f"Cloned {repo_url} (branch: {branch})"
+    for item in WORKSPACE.iterdir():
+        if item.is_dir():
+            shutil.rmtree(item)
+        else:
+            item.unlink()
+
+    result = subprocess.run(
+        ["git", "clone", "--branch", branch, repo_url, "."],
+        capture_output=True,
+        text=True,
+        cwd=WORKSPACE,
+        env=GIT_ENV,
+        timeout=CLONE_TIMEOUT,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr)
+    message = f"Cloned {repo_url} (branch: {branch})"
+    return message
 
 
 @mcp.tool()
-def git_status() -> dict:
+def git_status():
     """Get current git status."""
-    branch = run_command("git branch --show-current")
-    status = run_command("git status --porcelain")
-    return {
-        "branch": branch["stdout"].strip(),
-        "changes": [l for l in status["stdout"].strip().split("\n") if l]
-    }
+    branch = subprocess.run(
+        ["git", "branch", "--show-current"], capture_output=True, text=True, cwd=WORKSPACE, env=GIT_ENV, timeout=COMMAND_TIMEOUT
+    )
+    status = subprocess.run(
+        ["git", "status", "--porcelain"], capture_output=True, text=True, cwd=WORKSPACE, env=GIT_ENV, timeout=COMMAND_TIMEOUT
+    )
+    changes = [line for line in status.stdout.strip().split("\n") if line]
+    output = {"branch": branch.stdout.strip(), "changes": changes}
+    return output
 
 
 @mcp.tool()
-def git_diff(staged: bool = False) -> str:
+def git_diff(staged: bool = False):
     """Get diff of changes."""
-    cmd = "git diff --staged" if staged else "git diff"
-    result = run_command(cmd)
-    return result["stdout"]
+    cmd = ["git", "diff", "--staged"] if staged else ["git", "diff"]
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=WORKSPACE, env=GIT_ENV, timeout=COMMAND_TIMEOUT)
+    diff = result.stdout
+    return diff
 
 
 @mcp.tool()
-def git_commit(message: str) -> str:
+def git_commit(message: str):
     """Stage all changes and commit."""
-    run_command("git add -A")
-    result = run_command(f'git commit -m "{message}"')
-    if result["exit_code"] != 0:
-        raise RuntimeError(result["stderr"])
-    return result["stdout"]
+    add_result = subprocess.run(
+        ["git", "add", "-A"], capture_output=True, text=True, cwd=WORKSPACE, env=GIT_ENV, timeout=COMMAND_TIMEOUT
+    )
+    if add_result.returncode != 0:
+        raise RuntimeError(add_result.stderr)
+    result = subprocess.run(
+        ["git", "commit", "-m", message], capture_output=True, text=True, cwd=WORKSPACE, env=GIT_ENV, timeout=COMMAND_TIMEOUT
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr)
+    output = result.stdout
+    return output
 
 
 @mcp.tool()
-def git_push(remote: str = "origin", branch: str | None = None) -> str:
+def git_push(remote: str = "origin", branch=None):
     """Push commits to remote."""
     if branch is None:
-        branch_result = run_command("git branch --show-current")
-        branch = branch_result["stdout"].strip()
-    
-    result = run_command(f"git push {remote} {branch}")
-    if result["exit_code"] != 0:
-        raise RuntimeError(result["stderr"])
-    return f"Pushed to {remote}/{branch}"
+        result = subprocess.run(
+            ["git", "branch", "--show-current"], capture_output=True, text=True, cwd=WORKSPACE, env=GIT_ENV, timeout=COMMAND_TIMEOUT
+        )
+        branch = result.stdout.strip()
+    result = subprocess.run(
+        ["git", "push", remote, branch], capture_output=True, text=True, cwd=WORKSPACE, env=GIT_ENV, timeout=CLONE_TIMEOUT
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr)
+    message = f"Pushed to {remote}/{branch}"
+    return message
 
 
-# ═══════════════════════════════════════════════════════════
-# Resources (contextual info for the LLM)
-# ═══════════════════════════════════════════════════════════
+@mcp.tool()
+def python_version():
+    """Get Python version."""
+    version = sys.version
+    return version
+
 
 @mcp.resource("workspace://tree")
-def workspace_tree() -> str:
+def workspace_tree():
     """Current workspace file tree."""
-    result = run_command("find . -maxdepth 3 -type f | head -100")
-    return result["stdout"]
+    result = subprocess.run(
+        ["find", ".", "-maxdepth", "3", "-type", "f"], capture_output=True, text=True, cwd=WORKSPACE, timeout=COMMAND_TIMEOUT
+    )
+    tree = "\n".join(result.stdout.strip().split("\n")[:100])
+    return tree
 
 
-@mcp.resource("workspace://git-log")  
-def git_log() -> str:
+@mcp.resource("workspace://git-log")
+def git_log():
     """Recent git history."""
-    result = run_command("git log --oneline -20")
-    return result["stdout"]
+    result = subprocess.run(
+        ["git", "log", "--oneline", "-20"], capture_output=True, text=True, cwd=WORKSPACE, env=GIT_ENV, timeout=COMMAND_TIMEOUT
+    )
+    log = result.stdout
+    return log
 
 
-# ═══════════════════════════════════════════════════════════
-# Entry Point
-# ═══════════════════════════════════════════════════════════
+@mcp.custom_route("/health", methods=["GET"])
+async def health(request: Request):
+    """Readiness probe: verify the workspace is writable and required tools exist.
+
+    Returns 200 when every dependency the sandbox tools rely on is present, and
+    503 otherwise so orchestrators (ECS/ALB health checks) can react. A plain
+    'process is up' probe would report healthy even with /workspace read-only or
+    ripgrep missing.
+    """
+    required_tools = ("git", "rg", "find", "pip")
+    tools = {tool: shutil.which(tool) is not None for tool in required_tools}
+
+    workspace_writable = False
+    workspace_free_mb = None
+    if WORKSPACE.is_dir():
+        try:
+            with tempfile.NamedTemporaryFile(dir=WORKSPACE):
+                pass
+            workspace_writable = True
+        except OSError:
+            workspace_writable = False
+        workspace_free_mb = shutil.disk_usage(WORKSPACE).free // (1024 * 1024)
+
+    healthy = workspace_writable and all(tools.values())
+    payload = {
+        "status": "healthy" if healthy else "unhealthy",
+        "python": sys.version,
+        "checks": {
+            "workspace_path": str(WORKSPACE),
+            "workspace_writable": workspace_writable,
+            "workspace_free_mb": workspace_free_mb,
+            "tools": tools,
+        },
+    }
+    status_code = 200 if healthy else 503
+    response = JSONResponse(payload, status_code=status_code)
+    return response
+
 
 if __name__ == "__main__":
-    transport = os.environ.get("MCP_TRANSPORT", "stdio")
-    
-    if transport == "stdio":
-        mcp.run(transport="stdio")
-    elif transport == "sse":
-        mcp.run(transport="sse", port=8080)
+    port = int(os.environ.get("MCP_PORT", "8080"))
+    mcp.run(transport="http", host="0.0.0.0", port=port)
 ```
 
-**File:** `containers/dev/requirements.txt`
+**File:** `container/requirements.txt`
 
 ```
-fastmcp>=0.1.0
+fastmcp==2.14.2
+starlette
+uvicorn
 ```
 
-**File:** `containers/dev/Dockerfile`
+**File:** `container/Containerfile`
 
 ```dockerfile
-FROM python:3.11-slim
+FROM python:3.12-slim
 
-# System tools
 RUN apt-get update && apt-get install -y \
     git \
     ripgrep \
-    curl \
-    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Node.js (optional, for JS projects)
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y nodejs \
-    && rm -rf /var/lib/apt/lists/*
-
-# Python MCP server
 COPY requirements.txt /opt/mcp/
 RUN pip install --no-cache-dir -r /opt/mcp/requirements.txt
 
 COPY server.py /opt/mcp/
 
-# Workspace
 RUN mkdir /workspace
 WORKDIR /workspace
-
 ENV WORKSPACE=/workspace
 
-# MCP server on stdio
+EXPOSE 8080
+
 ENTRYPOINT ["python", "/opt/mcp/server.py"]
 ```
 
 ### 5.3 Container Manager
 
-Abstract container lifecycle management with implementations for Docker and Fargate.
+Container lifecycle functions for local runtimes (Docker/Podman CLI) and AWS Fargate (boto3). Configuration is a plain dict merged over `DEFAULT_CONFIG`; there are no classes or dataclasses.
 
-**File:** `containers/manager.py`
+**File:** `manager.py`
 
 ```python
-from abc import ABC, abstractmethod
-from dataclasses import dataclass
+"""Container lifecycle management for Python sandbox."""
+
+import subprocess
+
+import boto3
+
+try:
+    ecs = boto3.client("ecs")
+    ecs_init_error = None
+except Exception as exc:  # region/profile/config resolution errors surface here
+    ecs = None
+    ecs_init_error = exc
+
+task_def_cache = {}
+
+DEFAULT_CONFIG = {
+    "image": "python-sandbox:latest",
+    "workspace_mount": "",
+    "environment": {},
+    "memory_limit": "2g",
+    "cpu_limit": 1.0,
+    "port": 8080,
+}
+
+CREATE_TIMEOUT = 120
+RUNTIME_TIMEOUT = 60
 
 
-@dataclass
-class ContainerConfig:
-    image: str = "tapestry-dev:latest"
-    workspace_mount: str | None = None
-    environment: dict | None = None
-    network_mode: str = "none"
-    memory_limit: str = "2g"
-    cpu_limit: float = 1.0
+def require_ecs():
+    """Return the ECS client, or raise with the original initialization error.
+
+    Returns:
+        The boto3 ECS client.
+
+    Raises:
+        RuntimeError: If the client failed to initialize (missing region,
+            credentials, or configuration).
+    """
+    if ecs is None:
+        raise RuntimeError(f"AWS ECS client unavailable: {ecs_init_error}")
+    return ecs
 
 
-class ContainerManager(ABC):
-    """Abstract container lifecycle management."""
-    
-    @abstractmethod
-    async def create(self, config: ContainerConfig) -> str:
-        """Create container, return container_id."""
-        pass
-    
-    @abstractmethod
-    async def start(self, container_id: str) -> None:
-        """Start container."""
-        pass
-    
-    @abstractmethod
-    async def stop(self, container_id: str) -> None:
-        """Stop container."""
-        pass
-    
-    @abstractmethod
-    async def destroy(self, container_id: str) -> None:
-        """Remove container."""
-        pass
-    
-    @abstractmethod
-    async def exec(self, container_id: str, command: list[str]) -> tuple[int, str, str]:
-        """Execute command, return (exit_code, stdout, stderr)."""
-        pass
-    
-    @abstractmethod
-    async def attach_stdio(self, container_id: str):
-        """Get stdin/stdout streams for MCP connection."""
-        pass
+def parse_memory(mem):
+    """Parse a memory string like '2g' or '512m' into a MB string.
+
+    Args:
+        mem: Memory size such as '2g' or '512m'.
+
+    Returns:
+        The size in megabytes as a string, e.g. '2048'.
+
+    Raises:
+        ValueError: If the format is not recognized.
+    """
+    mem = mem.lower()
+    if mem.endswith("g"):
+        mb = str(int(mem[:-1]) * 1024)
+    elif mem.endswith("m"):
+        mb = mem[:-1]
+    else:
+        raise ValueError(f"Invalid memory format: {mem}. Use '2g' or '512m'.")
+    return mb
 
 
-class DockerManager(ContainerManager):
-    """Local Docker implementation."""
-    
-    def __init__(self):
-        import docker
-        self.client = docker.from_env()
-    
-    async def create(self, config: ContainerConfig) -> str:
-        container = self.client.containers.create(
-            config.image,
-            stdin_open=True,
-            tty=False,
-            detach=True,
-            network_mode=config.network_mode,
-            mem_limit=config.memory_limit,
-            nano_cpus=int(config.cpu_limit * 1e9),
-            environment=config.environment,
-        )
-        return container.id
-    
-    async def start(self, container_id: str) -> None:
-        container = self.client.containers.get(container_id)
-        container.start()
-    
-    async def stop(self, container_id: str) -> None:
-        container = self.client.containers.get(container_id)
-        container.stop(timeout=10)
-    
-    async def destroy(self, container_id: str) -> None:
-        container = self.client.containers.get(container_id)
-        container.remove(force=True)
-    
-    async def exec(self, container_id: str, command: list[str]) -> tuple[int, str, str]:
-        container = self.client.containers.get(container_id)
-        result = container.exec_run(command, demux=True)
-        stdout = result.output[0].decode() if result.output[0] else ""
-        stderr = result.output[1].decode() if result.output[1] else ""
-        return result.exit_code, stdout, stderr
-    
-    async def attach_stdio(self, container_id: str):
-        container = self.client.containers.get(container_id)
-        return container.attach_socket(params={"stdin": 1, "stdout": 1, "stream": 1})
+def create_container(config, runtime="docker"):
+    """Create a sandbox container from a config dict.
+
+    Args:
+        config: Partial container config; missing keys fall back to
+            DEFAULT_CONFIG.
+        runtime: Container runtime executable ('docker' or 'podman').
+
+    Returns:
+        The created container id.
+
+    Raises:
+        RuntimeError: If the runtime fails to create the container.
+    """
+    config = {**DEFAULT_CONFIG, **config}
+    port = config.get("port")
+    cmd = [
+        runtime,
+        "create",
+        "--publish",
+        f"{port}:{port}",
+        "--memory",
+        config.get("memory_limit"),
+        "--cpus",
+        str(config.get("cpu_limit")),
+        "--env",
+        f"MCP_PORT={port}",
+    ]
+    for k, v in config.get("environment", {}).items():
+        cmd.extend(["--env", f"{k}={v}"])
+    workspace_mount = config.get("workspace_mount")
+    if workspace_mount:
+        # --mount separates source/destination by commas rather than colons,
+        # so Windows source paths (e.g. C:\work) are not mis-split.
+        cmd.extend(["--mount", f"type=bind,source={workspace_mount},destination=/workspace"])
+    cmd.append(config.get("image"))
+
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=CREATE_TIMEOUT)
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to create container: {result.stderr}")
+    container_id = result.stdout.strip()
+    return container_id
 
 
-class FargateManager(ContainerManager):
-    """AWS ECS/Fargate implementation."""
-    
-    def __init__(self, cluster: str, subnet_ids: list[str], security_group_ids: list[str]):
-        import boto3
-        self.ecs = boto3.client("ecs")
-        self.cluster = cluster
-        self.subnet_ids = subnet_ids
-        self.security_group_ids = security_group_ids
-        self.task_definitions = {}
-    
-    async def create(self, config: ContainerConfig) -> str:
-        task_def_arn = await self._ensure_task_definition(config)
-        
-        response = self.ecs.run_task(
-            cluster=self.cluster,
-            taskDefinition=task_def_arn,
-            launchType="FARGATE",
-            networkConfiguration={
-                "awsvpcConfiguration": {
-                    "subnets": self.subnet_ids,
-                    "securityGroups": self.security_group_ids,
-                    "assignPublicIp": "DISABLED"
-                }
-            }
-        )
-        
-        task_arn = response["tasks"][0]["taskArn"]
-        return task_arn
-    
-    async def _ensure_task_definition(self, config: ContainerConfig) -> str:
-        # Register or return cached task definition
-        cache_key = f"{config.image}:{config.memory_limit}:{config.cpu_limit}"
-        if cache_key in self.task_definitions:
-            return self.task_definitions[cache_key]
-        
-        # Register new task definition
-        response = self.ecs.register_task_definition(
-            family="tapestry-dev",
-            networkMode="awsvpc",
-            requiresCompatibilities=["FARGATE"],
-            cpu=str(int(config.cpu_limit * 1024)),
-            memory=config.memory_limit.replace("g", "GB"),
-            containerDefinitions=[{
-                "name": "dev",
-                "image": config.image,
+def start_container(container_id, runtime="docker"):
+    """Start a previously created container.
+
+    Args:
+        container_id: Id returned by create_container.
+        runtime: Container runtime executable.
+
+    Raises:
+        RuntimeError: If the runtime fails to start the container.
+    """
+    result = subprocess.run(
+        [runtime, "start", container_id], capture_output=True, text=True, timeout=RUNTIME_TIMEOUT
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to start container: {result.stderr}")
+
+
+def stop_container(container_id, runtime="docker"):
+    """Stop a running container.
+
+    Args:
+        container_id: Id of the container to stop.
+        runtime: Container runtime executable.
+
+    Raises:
+        RuntimeError: If the runtime fails to stop the container.
+    """
+    result = subprocess.run(
+        [runtime, "stop", "-t", "10", container_id], capture_output=True, text=True, timeout=RUNTIME_TIMEOUT
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to stop container: {result.stderr}")
+
+
+def destroy_container(container_id, runtime="docker"):
+    """Remove a container, force-killing it if still running.
+
+    Args:
+        container_id: Id of the container to remove.
+        runtime: Container runtime executable.
+
+    Raises:
+        RuntimeError: If the runtime fails to remove the container.
+    """
+    result = subprocess.run(
+        [runtime, "rm", "-f", container_id], capture_output=True, text=True, timeout=RUNTIME_TIMEOUT
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to destroy container: {result.stderr}")
+
+
+def create_fargate_task(config, cluster, subnet_ids, security_group_ids):
+    """Run the sandbox as a Fargate task, reusing a cached task definition.
+
+    Args:
+        config: Partial container config; missing keys fall back to
+            DEFAULT_CONFIG.
+        cluster: ECS cluster name or ARN.
+        subnet_ids: Non-empty list of subnet ids for the task ENI.
+        security_group_ids: Non-empty list of security group ids.
+
+    Returns:
+        The running task ARN.
+
+    Raises:
+        ValueError: If subnet_ids or security_group_ids is empty.
+        RuntimeError: If ECS is unavailable or task placement fails.
+    """
+    client = require_ecs()
+    if not subnet_ids:
+        raise ValueError("subnet_ids must not be empty")
+    if not security_group_ids:
+        raise ValueError("security_group_ids must not be empty")
+
+    config = {**DEFAULT_CONFIG, **config}
+    # Environment is baked into the task definition, so it must be part of the
+    # cache key or two configs differing only in env would share a definition.
+    env_key = ",".join(f"{k}={v}" for k, v in sorted(config.get("environment", {}).items()))
+    key = f"{config.get('image')}:{config.get('memory_limit')}:{config.get('cpu_limit')}:{config.get('port')}:{env_key}"
+
+    task_def = task_def_cache.get(key)
+    if task_def is None:
+        task_def = register_task_def(config)
+        task_def_cache[key] = task_def
+
+    resp = client.run_task(
+        cluster=cluster,
+        taskDefinition=task_def,
+        launchType="FARGATE",
+        networkConfiguration={
+            "awsvpcConfiguration": {"subnets": subnet_ids, "securityGroups": security_group_ids, "assignPublicIp": "DISABLED"}
+        },
+    )
+
+    failures = resp.get("failures")
+    if failures:
+        raise RuntimeError(f"Failed to run Fargate task: {failures}")
+    tasks = resp.get("tasks")
+    if not tasks:
+        raise RuntimeError("run_task returned no tasks and no failures")
+    task_arn = tasks[0].get("taskArn")
+    return task_arn
+
+
+def register_task_def(config):
+    """Register an ECS task definition for the sandbox container.
+
+    Args:
+        config: Partial container config; missing keys fall back to
+            DEFAULT_CONFIG.
+
+    Returns:
+        The registered task definition ARN.
+
+    Raises:
+        RuntimeError: If ECS is unavailable.
+    """
+    client = require_ecs()
+
+    config = {**DEFAULT_CONFIG, **config}
+    cpu_limit = config.get("cpu_limit")
+    if not isinstance(cpu_limit, (int, float)):
+        raise ValueError(f"cpu_limit must be numeric, got {cpu_limit!r}")
+
+    env = [{"name": "MCP_PORT", "value": str(config.get("port"))}]
+    env.extend({"name": k, "value": v} for k, v in config.get("environment", {}).items())
+
+    resp = client.register_task_definition(
+        family="python-sandbox",
+        networkMode="awsvpc",
+        requiresCompatibilities=["FARGATE"],
+        cpu=str(int(cpu_limit * 1024)),
+        memory=parse_memory(config.get("memory_limit")),
+        containerDefinitions=[
+            {
+                "name": "sandbox",
+                "image": config.get("image"),
                 "essential": True,
-                "environment": [
-                    {"name": "MCP_TRANSPORT", "value": "sse"}
-                ],
-                "portMappings": [{"containerPort": 8080}]
-            }]
-        )
-        
-        arn = response["taskDefinition"]["taskDefinitionArn"]
-        self.task_definitions[cache_key] = arn
-        return arn
-    
-    async def start(self, container_id: str) -> None:
-        waiter = self.ecs.get_waiter("tasks_running")
-        waiter.wait(cluster=self.cluster, tasks=[container_id])
-    
-    async def stop(self, container_id: str) -> None:
-        self.ecs.stop_task(cluster=self.cluster, task=container_id)
-    
-    async def destroy(self, container_id: str) -> None:
-        await self.stop(container_id)
-    
-    async def exec(self, container_id: str, command: list[str]) -> tuple[int, str, str]:
-        response = self.ecs.execute_command(
-            cluster=self.cluster,
-            task=container_id,
-            container="dev",
-            interactive=False,
-            command=" ".join(command)
-        )
-        # Parse response
-        return 0, "", ""
-    
-    async def attach_stdio(self, container_id: str):
-        # For Fargate, return task IP for SSE connection
-        response = self.ecs.describe_tasks(cluster=self.cluster, tasks=[container_id])
-        eni_id = response["tasks"][0]["attachments"][0]["details"][1]["value"]
-        
-        ec2 = boto3.client("ec2")
-        eni = ec2.describe_network_interfaces(NetworkInterfaceIds=[eni_id])
-        return eni["NetworkInterfaces"][0]["PrivateIpAddress"]
+                "environment": env,
+                "portMappings": [{"containerPort": config.get("port")}],
+            }
+        ],
+    )
+    task_def_arn = resp.get("taskDefinition", {}).get("taskDefinitionArn")
+    return task_def_arn
+
+
+def wait_for_fargate_task(task_arn, cluster):
+    """Block until the given Fargate task reaches the RUNNING state.
+
+    Args:
+        task_arn: ARN of the task to wait on.
+        cluster: ECS cluster name or ARN.
+
+    Raises:
+        RuntimeError: If ECS is unavailable.
+    """
+    client = require_ecs()
+    waiter = client.get_waiter("tasks_running")
+    waiter.wait(cluster=cluster, tasks=[task_arn])
+
+
+def stop_fargate_task(task_arn, cluster):
+    """Stop a running Fargate task.
+
+    Args:
+        task_arn: ARN of the task to stop.
+        cluster: ECS cluster name or ARN.
+
+    Raises:
+        RuntimeError: If ECS is unavailable.
+    """
+    client = require_ecs()
+    client.stop_task(cluster=cluster, task=task_arn)
+
+
+def get_fargate_endpoint(task_arn, cluster, port):
+    """Resolve the private HTTP endpoint of a running Fargate task.
+
+    Args:
+        task_arn: ARN of the running task.
+        cluster: ECS cluster name or ARN.
+        port: Container port to address.
+
+    Returns:
+        An 'http://IP:port' endpoint string.
+
+    Raises:
+        RuntimeError: If ECS is unavailable or the task IP cannot be found.
+    """
+    client = require_ecs()
+    resp = client.describe_tasks(cluster=cluster, tasks=[task_arn])
+    tasks = resp.get("tasks")
+    if not tasks:
+        raise RuntimeError("Task not found")
+    task = tasks[0]
+
+    for att in task.get("attachments", []):
+        if att.get("type") == "ElasticNetworkInterface":
+            for d in att.get("details", []):
+                if d.get("name") == "privateIPv4Address":
+                    ip = d.get("value")
+                    if ip:
+                        endpoint = f"http://{ip}:{port}"
+                        return endpoint
+
+    raise RuntimeError("Could not find task IP address")
 ```
 
 ### 5.4 Dev Environment Client
 
 Wrapper connecting Tapestry to the containerized MCP server.
 
+> Status: forward-looking Tapestry integration — the MCP client and agent loop below are not yet implemented in this repo. The code targets the flat-function `manager.py` API from §5.3 (dict config, no manager classes).
+
 **File:** `agent/dev_environment.py`
 
 ```python
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
 
-from tapestry.containers.manager import ContainerManager, DockerManager, FargateManager, ContainerConfig
+import manager
 
 
 class DevEnvironment:
-    """Manages a containerized dev environment via MCP."""
-    
-    def __init__(self, manager: ContainerManager, config: ContainerConfig | None = None):
-        self.manager = manager
-        self.config = config or ContainerConfig()
-        self.container_id: str | None = None
-        self.session: ClientSession | None = None
-    
-    async def start(self) -> None:
-        """Start container and establish MCP connection."""
-        self.container_id = await self.manager.create(self.config)
-        await self.manager.start(self.container_id)
-        
-        if isinstance(self.manager, DockerManager):
-            await self._connect_stdio()
-        elif isinstance(self.manager, FargateManager):
-            await self._connect_sse()
-    
-    async def _connect_stdio(self) -> None:
-        """Connect via stdio for local Docker."""
-        socket = await self.manager.attach_stdio(self.container_id)
-        # Establish MCP session over socket
-        # Implementation depends on mcp library specifics
-        pass
-    
-    async def _connect_sse(self) -> None:
-        """Connect via SSE for Fargate."""
-        task_ip = await self.manager.attach_stdio(self.container_id)
-        # Establish MCP session over HTTP/SSE
-        # self.session = await connect_sse(f"http://{task_ip}:8080/mcp")
-        pass
-    
-    async def stop(self) -> None:
-        """Tear down container."""
-        if self.session:
-            # Close MCP session
-            pass
-        if self.container_id:
-            await self.manager.destroy(self.container_id)
-    
-    async def call_tool(self, name: str, arguments: dict) -> any:
+    """Manages a containerized dev environment via MCP over Streamable HTTP."""
+
+    def __init__(self, config=None, backend="local", runtime="podman", fargate=None):
+        self.config = config or {"port": 8080}
+        self.backend = backend
+        self.runtime = runtime
+        self.fargate = fargate or {}
+        self.container_id = None
+        self.task_arn = None
+        self.endpoint = None
+        self.session = None
+
+    async def start(self):
+        """Start the container/task and record its MCP endpoint."""
+        port = self.config.get("port", 8080)
+        if self.backend == "local":
+            self.container_id = manager.create_container(self.config, runtime=self.runtime)
+            manager.start_container(self.container_id, runtime=self.runtime)
+            self.endpoint = f"http://localhost:{port}/mcp"
+        else:
+            cluster = self.fargate.get("cluster")
+            self.task_arn = manager.create_fargate_task(
+                self.config,
+                cluster,
+                self.fargate.get("subnet_ids"),
+                self.fargate.get("security_group_ids"),
+            )
+            manager.wait_for_fargate_task(self.task_arn, cluster)
+            self.endpoint = manager.get_fargate_endpoint(self.task_arn, cluster, port) + "/mcp"
+        # MCP session wiring over Streamable HTTP (streamablehttp_client) TBD
+
+    async def stop(self):
+        """Tear down the container/task."""
+        if self.backend == "local":
+            if self.container_id:
+                manager.destroy_container(self.container_id, runtime=self.runtime)
+        elif self.task_arn:
+            manager.stop_fargate_task(self.task_arn, self.fargate.get("cluster"))
+
+    async def call_tool(self, name, arguments):
         """Call a tool in the dev environment."""
         result = await self.session.call_tool(name, arguments)
         return result
-    
-    async def list_tools(self) -> list:
+
+    async def list_tools(self):
         """Get available tools."""
-        return await self.session.list_tools()
-    
-    async def read_resource(self, uri: str) -> str:
+        tools = await self.session.list_tools()
+        return tools
+
+    async def read_resource(self, uri):
         """Read a resource."""
-        return await self.session.read_resource(uri)
+        resource = await self.session.read_resource(uri)
+        return resource
 ```
 
 ### 5.5 Code Agent Orchestration
@@ -723,21 +986,22 @@ Integration with Tapestry's Actor/Regulator pattern.
 
 ```python
 from tapestry.agent.dev_environment import DevEnvironment
-from tapestry.containers.manager import ContainerManager, ContainerConfig
 
 
 class TapestryCodeAgent:
     """Orchestrates code tasks with Actor/Regulator oversight."""
     
-    def __init__(self, actor, regulator, container_manager: ContainerManager):
+    def __init__(self, actor, regulator, backend="local", config=None, fargate=None):
         self.actor = actor
         self.regulator = regulator
-        self.container_manager = container_manager
-        self.env: DevEnvironment | None = None
+        self.backend = backend
+        self.config = config or {"port": 8080}
+        self.fargate = fargate or {}
+        self.env = None
     
     async def execute_task(self, task: str, repo_url: str | None = None) -> str:
         """Execute a coding task with full oversight."""
-        self.env = DevEnvironment(self.container_manager)
+        self.env = DevEnvironment(config=self.config, backend=self.backend, fargate=self.fargate)
         await self.env.start()
         
         try:
@@ -810,9 +1074,9 @@ Workspace structure:
         formatted = []
         for r in results:
             if r.get("blocked"):
-                formatted.append(f"Tool {r['tool']} BLOCKED: {r['reason']}")
+                formatted.append(f"Tool {r.get('tool')} BLOCKED: {r.get('reason')}")
             else:
-                formatted.append(f"Tool {r['tool']} result: {r['result']}")
+                formatted.append(f"Tool {r.get('tool')} result: {r.get('result')}")
         return "\n".join(formatted)
     
     def log_execution(self, call, result, decision) -> None:
@@ -827,19 +1091,28 @@ Workspace structure:
 
 | Tool | Purpose |
 |------|---------|
-| `file_read` | Read file contents |
+| `file_read` | Read file contents (size-capped) |
 | `file_write` | Create/overwrite files |
 | `file_patch` | Apply targeted edits (find/replace) |
+| `file_delete` | Delete a file |
 | `file_list` | List directory contents |
 | `file_search` | Search files with ripgrep |
-| `run_command` | Execute shell commands |
-| `run_tests` | Run test suite |
-| `install_packages` | Install pip/npm packages |
+| `pip_install` | Install Python packages |
+| `pip_uninstall` | Uninstall Python packages |
+| `pip_list` | List installed packages |
+| `pip_freeze` | Installed packages in requirements format |
+| `run_command` | Execute shell command |
+| `run_python` | Execute Python code |
+| `git_init` | Initialize a repository |
 | `git_clone` | Clone repository |
 | `git_status` | Get repo status |
 | `git_diff` | View changes |
 | `git_commit` | Stage and commit |
 | `git_push` | Push to remote |
+| `python_version` | Python version string |
+
+Resources: `workspace://tree` (file tree), `workspace://git-log` (recent history).
+HTTP route: `GET /health` (readiness probe; 200 healthy / 503 unhealthy).
 
 ---
 
@@ -849,11 +1122,11 @@ Workspace structure:
 
 ```bash
 # Build the container image
-cd tapestry/containers/dev
-docker build -t tapestry-dev:latest .
+cd container
+podman build -t python-sandbox:latest -f Containerfile .
 
 # Test locally
-docker run -i tapestry-dev:latest
+podman run -p 8080:8080 python-sandbox:latest
 ```
 
 ### 7.2 Push to ECR (for Fargate)
@@ -861,36 +1134,37 @@ docker run -i tapestry-dev:latest
 ```bash
 # Authenticate
 aws ecr get-login-password --region us-east-1 | \
-  docker login --username AWS --password-stdin $ECR_REPO
+  podman login --username AWS --password-stdin $ECR_REPO
 
 # Tag and push
-docker tag tapestry-dev:latest $ECR_REPO/tapestry-dev:latest
-docker push $ECR_REPO/tapestry-dev:latest
+podman tag python-sandbox:latest $ECR_REPO/python-sandbox:latest
+podman push $ECR_REPO/python-sandbox:latest
 ```
 
 ### 7.3 Usage
 
 ```python
-# Prototype/MVP - Local Docker
-from tapestry.containers.manager import DockerManager
+# Prototype/MVP - Local Docker/Podman
 from tapestry.agent.code_agent import TapestryCodeAgent
 
-manager = DockerManager()
-agent = TapestryCodeAgent(actor, regulator, manager)
+agent = TapestryCodeAgent(actor, regulator, backend="local", config={"port": 8080})
 result = await agent.execute_task(
     "Fix the bug in auth.py",
     repo_url="https://github.com/user/project"
 )
 
 # GA - Fargate
-from tapestry.containers.manager import FargateManager
-
-manager = FargateManager(
-    cluster="tapestry-cluster",
-    subnet_ids=["subnet-xxx"],
-    security_group_ids=["sg-xxx"]
+agent = TapestryCodeAgent(
+    actor,
+    regulator,
+    backend="fargate",
+    config={"port": 8080},
+    fargate={
+        "cluster": "tapestry-cluster",
+        "subnet_ids": ["subnet-xxx"],
+        "security_group_ids": ["sg-xxx"],
+    },
 )
-agent = TapestryCodeAgent(actor, regulator, manager)
 result = await agent.execute_task(...)
 ```
 
@@ -948,15 +1222,16 @@ Execution results feed the Knowledge Engine:
 | Concern | Mitigation |
 |---------|------------|
 | Container escape | Docker isolation (Prototype/MVP), Fargate isolation (GA) |
-| Network exfiltration | `network_mode: none` by default |
+| Network exfiltration | Fargate `awsvpc` task with `assignPublicIp: DISABLED`, a private subnet (no NAT/internet route), and a restrictive-egress security group |
 | Filesystem access | All paths validated against `/workspace` |
-| Resource exhaustion | Memory/CPU limits on containers |
+| Resource exhaustion | CPU/memory limits set in the task definition |
 | Malicious code execution | Regulator gates all tool calls |
 
-For GA deployment, additional considerations:
-- VPC isolation for Fargate tasks
-- IAM roles with minimal permissions
-- CloudTrail logging for audit
+`manager.py` sets `assignPublicIp: DISABLED`; the caller supplies the locked-down subnets and security groups. For a Fargate deployment the task definition and networking must also provide:
+- Private subnets with no NAT route (or an egress-filtered path) so tools cannot reach the internet
+- A security group allowing only the MCP port (8080) inbound from the Tapestry client, with minimal egress
+- An execution role (ECR pull + CloudWatch Logs) and a least-privilege task role
+- `awslogs` log configuration for task output; CloudTrail for the ECS/API control plane
 
 ---
 
