@@ -38,7 +38,10 @@ def test_create_container_container_runtime_resource_flags():
     assert cmd[cmd.index("--memory") + 1] == "2G"
     assert cmd[cmd.index("--cpus") + 1] == "1"
     assert cmd[cmd.index("--publish") + 1] == "8080:8080"
-    assert cmd[-1] == config.image
+    assert config.image in cmd
+    image_index = cmd.index(config.image)
+    assert cmd[image_index + 1 :] == ["--workspace", "/workspace", "--port", "8080"]
+    assert "--env" not in cmd
 
 
 def test_create_container_docker_runtime_adds_shared_kernel_hardening():
@@ -59,9 +62,11 @@ def test_create_container_raises_on_nonzero_exit():
 
 
 def test_sandbox_session_destroys_after_success():
-    with patch("manager.create_container", return_value="cid"), patch("manager.start_container") as start, patch(
-        "manager.destroy_container"
-    ) as destroy:
+    with (
+        patch("manager.create_container", return_value="cid"),
+        patch("manager.start_container") as start,
+        patch("manager.destroy_container") as destroy,
+    ):
         with sandbox_session(ContainerConfig()) as container_id:
             assert container_id == "cid"
 
@@ -70,9 +75,11 @@ def test_sandbox_session_destroys_after_success():
 
 
 def test_sandbox_session_destroys_after_error():
-    with patch("manager.create_container", return_value="cid"), patch("manager.start_container"), patch(
-        "manager.destroy_container"
-    ) as destroy:
+    with (
+        patch("manager.create_container", return_value="cid"),
+        patch("manager.start_container"),
+        patch("manager.destroy_container") as destroy,
+    ):
         with pytest.raises(ValueError):
             with sandbox_session(ContainerConfig()):
                 raise ValueError("work failed")

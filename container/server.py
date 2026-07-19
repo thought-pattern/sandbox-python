@@ -7,9 +7,9 @@ tool with a JSON object of arguments. The same interface serves development and
 production; only the endpoint URL changes.
 """
 
+import argparse
 import inspect
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -17,7 +17,9 @@ import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-WORKSPACE = Path(os.environ.get("WORKSPACE", "/workspace"))
+DEFAULT_WORKSPACE = Path("/workspace")
+DEFAULT_PORT = 8080
+WORKSPACE = DEFAULT_WORKSPACE
 
 TOOLS = {}
 
@@ -155,9 +157,7 @@ def run_command(command, timeout=60):
 def run_python(script, timeout=60):
     """Execute Python code."""
     try:
-        result = subprocess.run(
-            [sys.executable, "-c", script], capture_output=True, text=True, cwd=WORKSPACE, timeout=timeout
-        )
+        result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, cwd=WORKSPACE, timeout=timeout)
         return {"stdout": result.stdout, "stderr": result.stderr, "exitCode": result.returncode}
     except subprocess.TimeoutExpired:
         return {"stdout": "", "stderr": f"Timed out after {timeout}s", "exitCode": -1}
@@ -171,9 +171,7 @@ def git_clone(repo_url, branch="main"):
             shutil.rmtree(item)
         else:
             item.unlink()
-    result = subprocess.run(
-        ["git", "clone", "--branch", branch, repo_url, "."], capture_output=True, text=True, cwd=WORKSPACE
-    )
+    result = subprocess.run(["git", "clone", "--branch", branch, repo_url, "."], capture_output=True, text=True, cwd=WORKSPACE)
     if result.returncode != 0:
         raise RuntimeError(result.stderr)
     return f"Cloned {repo_url} (branch: {branch})"
@@ -232,9 +230,7 @@ def build_manifest():
         parameters = []
         for param_name, param in inspect.signature(fn).parameters.items():
             required = param.default is inspect.Parameter.empty
-            parameters.append(
-                {"name": param_name, "required": required, "default": None if required else param.default}
-            )
+            parameters.append({"name": param_name, "required": required, "default": None if required else param.default})
         tools.append({"name": name, "description": (fn.__doc__ or "").strip(), "parameters": parameters})
     return {"tools": tools}
 
@@ -289,9 +285,19 @@ class ToolHandler(BaseHTTPRequestHandler):
         return
 
 
-def main():
-    port = int(os.environ.get("SANDBOX_PORT", "8080"))
-    ThreadingHTTPServer(("0.0.0.0", port), ToolHandler).serve_forever()
+def parse_args(argv=None):
+    """Parse explicit server settings supplied by the container manager."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--workspace", type=Path, default=DEFAULT_WORKSPACE)
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    global WORKSPACE
+    args = parse_args(argv)
+    WORKSPACE = args.workspace.resolve()
+    ThreadingHTTPServer(("0.0.0.0", args.port), ToolHandler).serve_forever()
 
 
 if __name__ == "__main__":

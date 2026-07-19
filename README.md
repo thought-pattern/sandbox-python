@@ -78,10 +78,10 @@ with sandbox_session(config, runtime="container") as container_id:
 ```python
 from manager import ContainerConfig, create_fargate_task, wait_for_fargate_task, get_fargate_endpoint
 
-config = ContainerConfig(port=8080)
+config = ContainerConfig(port=8080, aws=aws_config_from_config_yml)
 task_arn = create_fargate_task(config, cluster, subnet_ids, security_group_ids)
-wait_for_fargate_task(task_arn, cluster)
-endpoint = get_fargate_endpoint(task_arn, cluster, config.port)
+wait_for_fargate_task(task_arn, cluster, config)
+endpoint = get_fargate_endpoint(task_arn, cluster, config.port, config)
 ```
 
 ## Tests
@@ -92,9 +92,8 @@ python3 -m pytest tests/ -q
 
 Unit tests run anywhere; the build-and-run smoke test runs only when a container runtime (`container`, `docker`, or `podman`) is present and skips otherwise.
 
-## Environment Variables
+## Runtime Configuration
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SANDBOX_PORT` | 8080 | Server port |
-| `WORKSPACE` | /workspace | Working directory |
+The server accepts `--port` and `--workspace` command arguments. Tapestry reads
+their values from the `sandbox` section of its ignored local `config.yml`; the
+container does not read configuration from environment variables.

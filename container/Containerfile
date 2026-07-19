@@ -19,7 +19,6 @@ COPY server.py /opt/mcp/
 RUN mkdir /workspace \
     && chown -R sandbox:sandbox /workspace /opt/venv
 WORKDIR /workspace
-ENV WORKSPACE=/workspace
 
 USER sandbox
 

@@ -4,12 +4,10 @@ import subprocess
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
-import boto3
-
 try:
-    ecs = boto3.client("ecs")
-except Exception:
-    ecs = None
+    import boto3
+except ImportError:  # pragma: no cover - local runtimes do not need boto3
+    boto3 = None
 
 task_def_cache = {}
 
@@ -18,10 +16,11 @@ task_def_cache = {}
 class ContainerConfig:
     image: str = "python-sandbox:latest"
     workspace_mount: str = None
-    environment: dict = field(default_factory=dict)
+    workspace: str = "/workspace"
     memory_limit: str = "2g"
     cpu_limit: float = 1.0
     port: int = 8080
+    aws: dict = field(default_factory=dict)
 
 
 def parse_memory(mem):
@@ -52,15 +51,11 @@ def create_container(config, runtime="container"):
             config.memory_limit.upper(),
             "--cpus",
             str(int(config.cpu_limit)),
-            "--env",
-            f"SANDBOX_PORT={config.port}",
         ]
     )
-    for k, v in config.environment.items():
-        cmd.extend(["--env", f"{k}={v}"])
     if config.workspace_mount:
-        cmd.extend(["--volume", f"{config.workspace_mount}:/workspace"])
-    cmd.append(config.image)
+        cmd.extend(["--volume", f"{config.workspace_mount}:{config.workspace}"])
+    cmd.extend([config.image, "--workspace", config.workspace, "--port", str(config.port)])
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -98,15 +93,36 @@ def sandbox_session(config, runtime="container"):
         destroy_container(container_id, runtime=runtime)
 
 
+def create_ecs_client(config):
+    """Build an ECS client from explicit config values only."""
+    if boto3 is None:
+        return None
+    aws = config.aws or {}
+    access_key = aws.get("access_key_id", "")
+    secret_key = aws.get("secret_access_key", "")
+    region = aws.get("region", "")
+    if not (access_key and secret_key and region):
+        return None
+    kwargs = {
+        "region_name": region,
+        "aws_access_key_id": access_key,
+        "aws_secret_access_key": secret_key,
+    }
+    if aws.get("session_token"):
+        kwargs["aws_session_token"] = aws["session_token"]
+    return boto3.client("ecs", **kwargs)
+
+
 def create_fargate_task(config, cluster, subnet_ids, security_group_ids):
+    ecs = create_ecs_client(config)
     if ecs is None:
-        raise RuntimeError("AWS credentials not configured")
+        raise RuntimeError("Explicit AWS credentials are not configured")
 
     key = f"{config.image}:{config.memory_limit}:{config.cpu_limit}:{config.port}"
     if key in task_def_cache:
         task_def = task_def_cache[key]
     else:
-        task_def = register_task_def(config)
+        task_def = register_task_def(config, ecs)
         task_def_cache[key] = task_def
 
     resp = ecs.run_task(
@@ -120,13 +136,10 @@ def create_fargate_task(config, cluster, subnet_ids, security_group_ids):
     return resp["tasks"][0]["taskArn"]
 
 
-def register_task_def(config):
+def register_task_def(config, ecs=None):
+    ecs = ecs or create_ecs_client(config)
     if ecs is None:
-        raise RuntimeError("AWS credentials not configured")
-
-    env = [{"name": "SANDBOX_PORT", "value": str(config.port)}]
-    env.extend({"name": k, "value": v} for k, v in config.environment.items())
-
+        raise RuntimeError("Explicit AWS credentials are not configured")
     resp = ecs.register_task_definition(
         family="python-sandbox",
         networkMode="awsvpc",
@@ -138,7 +151,7 @@ def register_task_def(config):
                 "name": "sandbox",
                 "image": config.image,
                 "essential": True,
-                "environment": env,
+                "command": ["--workspace", config.workspace, "--port", str(config.port)],
                 "portMappings": [{"containerPort": config.port}],
             }
         ],
@@ -146,22 +159,25 @@ def register_task_def(config):
     return resp["taskDefinition"]["taskDefinitionArn"]
 
 
-def wait_for_fargate_task(task_arn, cluster):
+def wait_for_fargate_task(task_arn, cluster, config):
+    ecs = create_ecs_client(config)
     if ecs is None:
-        raise RuntimeError("AWS credentials not configured")
+        raise RuntimeError("Explicit AWS credentials are not configured")
     waiter = ecs.get_waiter("tasks_running")
     waiter.wait(cluster=cluster, tasks=[task_arn])
 
 
-def stop_fargate_task(task_arn, cluster):
+def stop_fargate_task(task_arn, cluster, config):
+    ecs = create_ecs_client(config)
     if ecs is None:
-        raise RuntimeError("AWS credentials not configured")
+        raise RuntimeError("Explicit AWS credentials are not configured")
     ecs.stop_task(cluster=cluster, task=task_arn)
 
 
-def get_fargate_endpoint(task_arn, cluster, port):
+def get_fargate_endpoint(task_arn, cluster, port, config):
+    ecs = create_ecs_client(config)
     if ecs is None:
-        raise RuntimeError("AWS credentials not configured")
+        raise RuntimeError("Explicit AWS credentials are not configured")
     resp = ecs.describe_tasks(cluster=cluster, tasks=[task_arn])
     task = resp["tasks"][0]
 

@@ -185,7 +185,7 @@ import subprocess
 from pathlib import Path
 from fastmcp import FastMCP
 
-WORKSPACE = Path(os.environ.get("WORKSPACE", "/workspace"))
+WORKSPACE = Path("/workspace")  # supplied by the manager's --workspace argument
 
 mcp = FastMCP("tapestry-dev")
 
@@ -411,7 +411,7 @@ def git_log() -> str:
 # ═══════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    transport = os.environ.get("MCP_TRANSPORT", "stdio")
+    transport = "stdio"
     
     if transport == "stdio":
         mcp.run(transport="stdio")
@@ -453,7 +453,6 @@ COPY server.py /opt/mcp/
 RUN mkdir /workspace
 WORKDIR /workspace
 
-ENV WORKSPACE=/workspace
 
 # MCP server on stdio
 ENTRYPOINT ["python", "/opt/mcp/server.py"]
