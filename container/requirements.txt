@@ -1,3 +1,4 @@
 # The tool server uses only the Python standard library; no third-party
 # dependencies. Task-time packages are installed into the venv at runtime
 # through the pip_install tool.
+pytest==8.4.2
