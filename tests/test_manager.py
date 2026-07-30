@@ -2,11 +2,18 @@
 
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from manager import ContainerConfig, create_container, parse_memory, sandbox_session
+from manager import (
+    ContainerConfig,
+    create_container,
+    create_container_command,
+    create_fargate_task,
+    parse_memory,
+    sandbox_session,
+)
 
 
 def test_parse_memory_gigabytes():
@@ -17,47 +24,80 @@ def test_parse_memory_megabytes():
     assert parse_memory("512m") == "512"
 
 
-def test_parse_memory_rejects_unitless():
+@pytest.mark.parametrize("value", ["1024", "0g", "1.5g", "-1m"])
+def test_parse_memory_rejects_invalid_values(value):
     with pytest.raises(ValueError):
-        parse_memory("1024")
+        parse_memory(value)
 
 
-def test_create_container_container_runtime_resource_flags():
-    config = ContainerConfig(memory_limit="2g", cpu_limit=1.0, port=8080)
-    completed = SimpleNamespace(returncode=0, stdout="cid\n", stderr="")
-    with patch("manager.subprocess.run", return_value=completed) as run:
-        container_id = create_container(config)
-
-    assert container_id == "cid"
-    cmd = run.call_args[0][0]
-    assert cmd[0] == "container"
-    # Apple's VM-isolated runtime neither exposes nor needs the shared-kernel flags.
-    assert "--security-opt" not in cmd
-    assert "--cap-drop" not in cmd
-    # container wants an uppercase memory suffix and an integer CPU count.
-    assert cmd[cmd.index("--memory") + 1] == "2G"
-    assert cmd[cmd.index("--cpus") + 1] == "1"
-    assert cmd[cmd.index("--publish") + 1] == "8080:8080"
-    assert config.image in cmd
-    image_index = cmd.index(config.image)
-    assert cmd[image_index + 1 :] == ["--workspace", "/workspace", "--port", "8080"]
-    assert "--env" not in cmd
+def test_config_allocates_loopback_port_and_session_token():
+    config = ContainerConfig()
+    assert 1 <= config.host_port <= 65535
+    assert config.host_bind == "127.0.0.1"
+    assert len(config.auth_token) >= 32
+    assert config.base_url == f"http://127.0.0.1:{config.host_port}"
 
 
-def test_create_container_docker_runtime_adds_shared_kernel_hardening():
-    completed = SimpleNamespace(returncode=0, stdout="cid\n", stderr="")
-    with patch("manager.subprocess.run", return_value=completed) as run:
-        create_container(ContainerConfig(), runtime="docker")
+def test_create_command_container_runtime_boundary():
+    config = ContainerConfig(
+        memory_limit="2g",
+        cpu_limit=1.0,
+        port=8080,
+        host_port=48080,
+        auth_token="a" * 43,
+    )
+    command = create_container_command(config)
 
-    cmd = run.call_args[0][0]
-    assert cmd[cmd.index("--security-opt") + 1] == "no-new-privileges"
-    assert cmd[cmd.index("--cap-drop") + 1] == "ALL"
+    assert command[0] == "container"
+    assert "--security-opt" not in command
+    assert "--cap-drop" not in command
+    assert command[command.index("--publish") + 1] == "127.0.0.1:48080:8080"
+    assert command[command.index("--memory") + 1] == "2G"
+    assert command[command.index("--cpus") + 1] == "1"
+    assert command[command.index("--user") + 1] == "root"
+    assert command[command.index("--auth-token") + 1] == "a" * 43
+    assert command[command.index("--egress-policy") + 1] == "deny"
+    assert "--env" not in command
+
+
+def test_create_command_docker_adds_shared_kernel_hardening():
+    config = ContainerConfig(host_port=48080, cpu_limit=0.5, auth_token="a" * 43)
+    command = create_container_command(config, runtime="docker")
+
+    assert command[command.index("--security-opt") + 1] == "no-new-privileges"
+    assert command[command.index("--cap-drop") + 1] == "ALL"
+    assert command[command.index("--cap-add") + 1] == "NET_ADMIN"
+    assert command[command.index("--pids-limit") + 1] == "256"
+    assert command[command.index("--cpus") + 1] == "0.5"
+
+
+def test_apple_runtime_rejects_fractional_cpu_limit():
+    config = ContainerConfig(host_port=48080, cpu_limit=0.5, auth_token="a" * 43)
+    with pytest.raises(ValueError, match="whole-number"):
+        create_container_command(config, runtime="container")
+
+
+def test_config_rejects_non_loopback_bind():
+    with pytest.raises(ValueError, match="host_bind"):
+        ContainerConfig(host_bind="0.0.0.0")
+
+
+def test_config_rejects_short_auth_token():
+    with pytest.raises(ValueError, match="auth_token"):
+        ContainerConfig(auth_token="short")
 
 
 def test_create_container_raises_on_nonzero_exit():
     completed = SimpleNamespace(returncode=1, stdout="", stderr="boom")
     with patch("manager.subprocess.run", return_value=completed):
         with pytest.raises(RuntimeError, match="boom"):
+            create_container(ContainerConfig())
+
+
+def test_create_container_rejects_empty_identifier():
+    completed = SimpleNamespace(returncode=0, stdout="", stderr="")
+    with patch("manager.subprocess.run", return_value=completed):
+        with pytest.raises(RuntimeError, match="no container identifier"):
             create_container(ContainerConfig())
 
 
@@ -74,23 +114,54 @@ def test_sandbox_session_destroys_after_success():
     destroy.assert_called_once_with("cid", runtime="container")
 
 
-def test_sandbox_session_destroys_after_error():
+def test_sandbox_session_preserves_body_error_and_notes_cleanup_failure():
     with (
         patch("manager.create_container", return_value="cid"),
         patch("manager.start_container"),
-        patch("manager.destroy_container") as destroy,
+        patch("manager.destroy_container", side_effect=RuntimeError("cleanup failed")),
     ):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="work failed") as caught:
             with sandbox_session(ContainerConfig()):
                 raise ValueError("work failed")
 
-    destroy.assert_called_once_with("cid", runtime="container")
+    assert any("cleanup also failed" in note for note in caught.value.__notes__)
 
 
-def test_containerfile_declares_non_root_user():
-    containerfile = Path(__file__).resolve().parent.parent / "container" / "Containerfile"
-    text = containerfile.read_text()
-    assert "USER sandbox" in text
-    assert "useradd" in text
-    assert "chown -R sandbox:sandbox" in text
-    assert "USER root" not in text
+def test_sandbox_session_surfaces_cleanup_failure_after_success():
+    with (
+        patch("manager.create_container", return_value="cid"),
+        patch("manager.start_container"),
+        patch("manager.destroy_container", side_effect=RuntimeError("cleanup failed")),
+    ):
+        with pytest.raises(RuntimeError, match="cleanup failed"):
+            with sandbox_session(ContainerConfig()):
+                pass
+
+
+def test_fargate_rejects_non_broker_policy():
+    with pytest.raises(RuntimeError, match="broker egress"):
+        create_fargate_task(ContainerConfig(egress_policy="deny"), "cluster", ["subnet"], ["sg"])
+
+
+def test_fargate_reports_run_task_failures():
+    ecs = MagicMock()
+    ecs.register_task_definition.return_value = {
+        "taskDefinition": {"taskDefinitionArn": "task-def"}
+    }
+    ecs.run_task.return_value = {"tasks": [], "failures": [{"reason": "capacity"}]}
+    config = ContainerConfig(egress_policy="broker")
+    with patch("manager.create_ecs_client", return_value=ecs):
+        with pytest.raises(RuntimeError, match="capacity"):
+            create_fargate_task(config, "cluster", ["subnet"], ["sg"])
+
+
+def test_containerfile_uses_privilege_dropping_entrypoint():
+    root = Path(__file__).resolve().parent.parent
+    containerfile = (root / "container" / "Containerfile").read_text()
+    entrypoint = (root / "container" / "entrypoint.py").read_text()
+
+    assert "USER root" in containerfile
+    assert "entrypoint.py" in containerfile
+    assert "os.setgid" in entrypoint
+    assert "os.setuid" in entrypoint
+    assert entrypoint.index("deny_egress()") < entrypoint.index("drop_privileges()")
