@@ -20,11 +20,11 @@ Tapestry client
   -> bounded process group inside /workspace
 ```
 
-The current MVP policy is fail-closed network isolation. Direct outbound flows
-are blocked by the guest firewall; package installation and remote Git tools
-return a structured `egress_denied` response. The future `broker` mode assumes
-the production task network permits traffic only to the controlled, audited
-broker. Selecting broker mode without that external enforcement is invalid.
+The current MVP supports fail-closed `deny` and controlled `broker` policies.
+Direct outbound flows are blocked by the guest firewall in both modes. Broker
+mode adds exactly one allowed destination: the external broker's explicit IPv4
+address and TCP port. Package installation and remote Git tools use that broker;
+other direct traffic remains unavailable.
 
 ## Security invariants
 
@@ -70,10 +70,11 @@ Process tools return `ok`, `stdout`, `stderr`, `exitCode`, `timedOut`,
 process; execution verification explicitly consumes the nonzero result so it
 can distinguish refutation from infrastructure failure.
 
-## Remaining production dependency
+## External broker
 
-The controlled egress broker is intentionally outside this container. It must
-provide destination policy, scoped credentials, request and response bounds,
-and an audit record. Fargate broker mode additionally requires private subnets
-and security groups whose only egress destination is that broker. Until this is
-deployed, Tapestry configuration accepts only `egress_policy: deny`.
+The controlled egress broker remains outside this container. The local broker
+provides destination/method policy, broker-held credential headers, request and
+response bounds, redirect validation, and hash-chained SQLite audit records.
+The sandbox receives only a per-session broker token. Fargate broker mode still
+requires private subnets and security groups whose only egress destination is
+the production broker; local MVP completion does not claim that AWS deployment.

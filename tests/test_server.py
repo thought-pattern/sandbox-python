@@ -15,6 +15,9 @@ TOKEN = "t" * 43
 @pytest.fixture(autouse=True)
 def isolated_workspace(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "WORKSPACE", tmp_path.resolve())
+    monkeypatch.setattr(server, "BROKER_URL", "")
+    monkeypatch.setattr(server, "BROKER_TOKEN", "")
+    monkeypatch.setattr(server, "BROKER_PACKAGE_DESTINATION", "pypi")
 
 
 @pytest.fixture
@@ -128,10 +131,7 @@ def test_process_timeout_terminates_group():
 
 
 def test_process_timeout_covers_descendant_holding_output_pipe():
-    script = (
-        "import subprocess, sys\n"
-        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(10)'])\n"
-    )
+    script = "import subprocess, sys\n" "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(10)'])\n"
     result = server.run_python(script, timeout=0.1)
     assert result["exitCode"] == -1
     assert result["timedOut"] is True
@@ -151,3 +151,59 @@ def test_network_tools_fail_closed_under_deny_policy(monkeypatch):
     with pytest.raises(server.ToolError) as caught:
         server.pip_install(["pytest"])
     assert caught.value.code == "egress_denied"
+
+
+def test_brokered_pip_uses_only_broker_index_and_redacts_token(monkeypatch):
+    token = "broker-secret-" + "x" * 32
+    calls = []
+    monkeypatch.setattr(server, "EGRESS_POLICY", "broker")
+    monkeypatch.setattr(server, "BROKER_URL", "http://192.168.64.9:8090")
+    monkeypatch.setattr(server, "BROKER_TOKEN", token)
+
+    def run(command, **kwargs):
+        calls.append(command)
+        return {
+            "ok": True,
+            "stdout": f"index={token}",
+            "stderr": "",
+            "exitCode": 0,
+            "timedOut": False,
+            "outputLimited": False,
+        }
+
+    monkeypatch.setattr(server, "_run_process", run)
+
+    result = server.pip_install(["pytest==8.0.0"])
+
+    command = calls[0]
+    index_url = command[command.index("--index-url") + 1]
+    assert index_url.startswith("http://broker-secret-")
+    assert index_url.endswith(":x@192.168.64.9:8090/v1/proxy/pypi/simple/")
+    assert "pypi.org" not in " ".join(command)
+    assert token not in result["stdout"]
+
+
+def test_broker_resolver_rejects_invalid_proxy_path(monkeypatch):
+    monkeypatch.setattr(server, "EGRESS_POLICY", "broker")
+    monkeypatch.setattr(server, "BROKER_URL", "http://192.168.64.9:8090")
+    monkeypatch.setattr(server, "BROKER_TOKEN", "b" * 43)
+    monkeypatch.setattr(server, "_broker_request", lambda *args: {"proxyPath": "https://evil.example/"})
+
+    with pytest.raises(server.ToolError) as caught:
+        server._resolve_broker_url("https://github.com/example/repo.git", "git")
+    assert caught.value.code == "broker_protocol"
+
+
+def test_configure_requires_broker_endpoint_and_token(tmp_path):
+    args = server.parse_args(
+        [
+            "--workspace",
+            str(tmp_path),
+            "--auth-token",
+            "a" * 43,
+            "--egress-policy",
+            "broker",
+        ]
+    )
+    with pytest.raises(ValueError, match="broker"):
+        server.configure(args)

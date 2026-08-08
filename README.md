@@ -13,9 +13,9 @@ with a bounded HTTP tool interface.
 - CPU, memory, request size, result size, tool concurrency, wall time, and
   process trees are bounded. Docker and podman also receive a PID limit,
   capability drop, and `no-new-privileges`.
-- Direct dependency and Git network operations fail with `egress_denied` while
-  the deny policy is active. `broker` is a production seam and is safe only
-  when the task network is externally restricted to an audited broker.
+- `deny` blocks all new outbound flows. `broker` permits new TCP flows only to
+  one explicit broker IPv4 address/port; package and Git crossings are then
+  destination-controlled and audited outside the sandbox.
 
 The authentication token is passed as an explicit manager argument, not read
 from environment variables or committed configuration.
@@ -85,8 +85,9 @@ an assertion failure remains evidence rather than a transport error.
 - Packages: `pip_install`, `pip_uninstall`, `pip_list`, `pip_freeze`
 - Git: `git_clone`, `git_status`, `git_diff`, `git_commit`, `git_push`
 
-Remote package installation, clone, and push remain unavailable under the MVP
-deny policy. Local operations continue to work.
+Remote package installation, clone, and push fail under `deny`. Under `broker`,
+they use authenticated destination-keyed broker paths and never receive an
+upstream credential. Local operations work under either policy.
 
 ## Verification
 
@@ -95,6 +96,7 @@ python3 -m pytest tests/test_manager.py tests/test_server.py -q
 python3 -m pytest tests/test_smoke.py -q
 ```
 
-The live smoke test builds the image, verifies unauthorized access is rejected,
-runs authenticated file and Python tools, proves an outbound socket is blocked,
-and confirms teardown.
+The live smoke and broker acceptance tests verify unauthorized access is
+rejected, authenticated file and Python tools work, direct outbound sockets are
+blocked, package and Git traffic crosses through only the broker, audit records
+are written, and every disposable container is removed.

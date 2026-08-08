@@ -145,11 +145,13 @@ def test_fargate_rejects_non_broker_policy():
 
 def test_fargate_reports_run_task_failures():
     ecs = MagicMock()
-    ecs.register_task_definition.return_value = {
-        "taskDefinition": {"taskDefinitionArn": "task-def"}
-    }
+    ecs.register_task_definition.return_value = {"taskDefinition": {"taskDefinitionArn": "task-def"}}
     ecs.run_task.return_value = {"tasks": [], "failures": [{"reason": "capacity"}]}
-    config = ContainerConfig(egress_policy="broker")
+    config = ContainerConfig(
+        egress_policy="broker",
+        broker_url="http://192.168.64.9:8090",
+        broker_token="b" * 43,
+    )
     with patch("manager.create_ecs_client", return_value=ecs):
         with pytest.raises(RuntimeError, match="capacity"):
             create_fargate_task(config, "cluster", ["subnet"], ["sg"])
@@ -164,4 +166,18 @@ def test_containerfile_uses_privilege_dropping_entrypoint():
     assert "entrypoint.py" in containerfile
     assert "os.setgid" in entrypoint
     assert "os.setuid" in entrypoint
-    assert entrypoint.index("deny_egress()") < entrypoint.index("drop_privileges()")
+    assert entrypoint.index("enforce_egress_policy()") < entrypoint.index("drop_privileges()")
+
+
+def test_broker_runtime_installs_firewall_and_passes_only_broker_endpoint():
+    config = ContainerConfig(
+        egress_policy="broker",
+        broker_url="http://192.168.64.9:8090",
+        broker_token="b" * 43,
+        host_port=48080,
+    )
+    command = create_container_command(config)
+
+    assert command[command.index("--user") + 1] == "root"
+    assert command[command.index("--broker-url") + 1] == "http://192.168.64.9:8090"
+    assert command[command.index("--broker-token") + 1] == "b" * 43

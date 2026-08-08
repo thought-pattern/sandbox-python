@@ -1,11 +1,13 @@
 """Container lifecycle management for the authenticated Python sandbox."""
 
+import ipaddress
 import logging
 import re
 import secrets
 import socket
 import subprocess
 import sys
+import urllib.parse
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
@@ -46,6 +48,9 @@ class ContainerConfig:
     max_tool_timeout: int = 300
     request_read_timeout: float = 10.0
     pids_limit: int = 256
+    broker_url: str = ""
+    broker_token: str = ""
+    broker_package_destination: str = "pypi"
     aws: dict = field(default_factory=dict)
 
     def __post_init__(self):
@@ -68,6 +73,22 @@ def validate_container_config(config):
         raise ValueError("MVP sandbox host_bind must be 127.0.0.1")
     if config.egress_policy not in ALLOWED_EGRESS_POLICIES:
         raise ValueError(f"unsupported egress policy: {config.egress_policy}")
+    if config.egress_policy == "broker":
+        parsed_broker = urllib.parse.urlsplit(config.broker_url)
+        if parsed_broker.scheme != "http" or not parsed_broker.hostname or parsed_broker.port is None:
+            raise ValueError("broker policy requires an explicit http broker_url and port")
+        try:
+            ipaddress.IPv4Address(parsed_broker.hostname)
+        except ipaddress.AddressValueError as err:
+            raise ValueError("broker_url host must be an explicit IPv4 address") from err
+        if parsed_broker.path not in ("", "/") or parsed_broker.query or parsed_broker.fragment or parsed_broker.username:
+            raise ValueError("broker_url must contain only scheme, IPv4 address, and port")
+        if len(config.broker_token) < 32:
+            raise ValueError("broker policy requires a broker_token of at least 32 characters")
+        if not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", config.broker_package_destination):
+            raise ValueError("broker_package_destination is invalid")
+    elif config.broker_url or config.broker_token:
+        raise ValueError("broker_url and broker_token require egress_policy='broker'")
     if len(config.auth_token) < 32:
         raise ValueError("auth_token must be at least 32 characters")
     if float(config.cpu_limit) <= 0:
@@ -98,7 +119,7 @@ def parse_memory(mem):
 
 def server_arguments(config, *, auth_token=None):
     """Return the explicit server arguments shared by every runtime."""
-    return [
+    arguments = [
         "--workspace",
         config.workspace,
         "--port",
@@ -118,6 +139,18 @@ def server_arguments(config, *, auth_token=None):
         "--request-read-timeout",
         str(config.request_read_timeout),
     ]
+    if config.egress_policy == "broker":
+        arguments.extend(
+            [
+                "--broker-url",
+                config.broker_url,
+                "--broker-token",
+                config.broker_token,
+                "--broker-package-destination",
+                config.broker_package_destination,
+            ]
+        )
+    return arguments
 
 
 def create_container_command(config, runtime="container"):
@@ -144,9 +177,9 @@ def create_container_command(config, runtime="container"):
                 str(config.pids_limit),
             ]
         )
-        if config.egress_policy == "deny":
+        if config.egress_policy in {"deny", "broker"}:
             command.extend(["--cap-add", "NET_ADMIN"])
-    if config.egress_policy == "deny":
+    if config.egress_policy in {"deny", "broker"}:
         command.extend(["--user", "root"])
     command.extend(
         [
