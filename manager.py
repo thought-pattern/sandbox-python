@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 try:
     import boto3
 except ImportError:  # pragma: no cover - local runtimes do not need boto3
-    boto3 = None
+    boto3 = {}
 
 LOGGER = logging.getLogger(__name__)
 RUNTIME_COMMAND_TIMEOUT = 60
@@ -33,7 +33,7 @@ def available_port(host="127.0.0.1"):
 @dataclass
 class ContainerConfig:
     image: str = "python-sandbox:latest"
-    workspace_mount: str = None
+    workspace_mount: str = ""
     workspace: str = "/workspace"
     memory_limit: str = "2g"
     cpu_limit: float = 1.0
@@ -44,6 +44,8 @@ class ContainerConfig:
     auth_token: str = field(default_factory=lambda: secrets.token_urlsafe(32))
     max_request_bytes: int = 1_048_576
     max_output_bytes: int = 1_048_576
+    max_file_bytes: int = 10_485_760
+    max_response_bytes: int = 12_582_912
     max_concurrent_requests: int = 4
     max_tool_timeout: int = 300
     request_read_timeout: float = 10.0
@@ -97,6 +99,8 @@ def validate_container_config(config):
     for name in (
         "max_request_bytes",
         "max_output_bytes",
+        "max_file_bytes",
+        "max_response_bytes",
         "max_concurrent_requests",
         "max_tool_timeout",
         "pids_limit",
@@ -105,6 +109,8 @@ def validate_container_config(config):
             raise ValueError(f"{name} must be positive")
     if float(config.request_read_timeout) <= 0:
         raise ValueError("request_read_timeout must be positive")
+    if config.max_response_bytes < 512:
+        raise ValueError("max_response_bytes must be at least 512")
 
 
 def parse_memory(mem):
@@ -117,7 +123,7 @@ def parse_memory(mem):
     return str(value * 1024 if unit.lower() == "g" else value)
 
 
-def server_arguments(config, *, auth_token=None):
+def server_arguments(config, *, auth_token=""):
     """Return the explicit server arguments shared by every runtime."""
     arguments = [
         "--workspace",
@@ -132,6 +138,10 @@ def server_arguments(config, *, auth_token=None):
         str(config.max_request_bytes),
         "--max-output-bytes",
         str(config.max_output_bytes),
+        "--max-file-bytes",
+        str(config.max_file_bytes),
+        "--max-response-bytes",
+        str(config.max_response_bytes),
         "--max-concurrent-requests",
         str(config.max_concurrent_requests),
         "--max-tool-timeout",
@@ -254,14 +264,14 @@ def sandbox_session(config, runtime="container"):
 
 def create_ecs_client(config):
     """Build an ECS client from explicit config values only."""
-    if boto3 is None:
-        return None
+    if not boto3:
+        return {}
     aws = config.aws or {}
     access_key = aws.get("access_key_id", "")
     secret_key = aws.get("secret_access_key", "")
     region = aws.get("region", "")
     if not (access_key and secret_key and region):
-        return None
+        return {}
     kwargs = {
         "region_name": region,
         "aws_access_key_id": access_key,
@@ -269,7 +279,8 @@ def create_ecs_client(config):
     }
     if aws.get("session_token"):
         kwargs["aws_session_token"] = aws["session_token"]
-    return boto3.client("ecs", **kwargs)
+    client = boto3.client("ecs", **kwargs)
+    return client
 
 
 def task_definition_key(config):
@@ -285,6 +296,8 @@ def task_definition_key(config):
             config.egress_policy,
             config.max_request_bytes,
             config.max_output_bytes,
+            config.max_file_bytes,
+            config.max_response_bytes,
             config.max_concurrent_requests,
             config.max_tool_timeout,
             config.request_read_timeout,
@@ -299,12 +312,12 @@ def create_fargate_task(config, cluster, subnet_ids, security_group_ids):
     if not subnet_ids or not security_group_ids:
         raise ValueError("Fargate requires explicit subnets and security groups")
     ecs = create_ecs_client(config)
-    if ecs is None:
+    if not ecs:
         raise RuntimeError("Explicit AWS credentials are not configured")
 
     key = task_definition_key(config)
-    task_def = task_def_cache.get(key)
-    if task_def is None:
+    task_def = task_def_cache.get(key, "")
+    if not task_def:
         task_def = register_task_def(config, ecs)
         task_def_cache[key] = task_def
 
@@ -335,9 +348,9 @@ def create_fargate_task(config, cluster, subnet_ids, security_group_ids):
     return tasks[0]["taskArn"]
 
 
-def register_task_def(config, ecs=None):
+def register_task_def(config, ecs={}):
     ecs = ecs or create_ecs_client(config)
-    if ecs is None:
+    if not ecs:
         raise RuntimeError("Explicit AWS credentials are not configured")
     placeholder_token = "task-runtime-token-not-valid-for-live-requests"
     response = ecs.register_task_definition(
@@ -361,7 +374,7 @@ def register_task_def(config, ecs=None):
 
 def wait_for_fargate_task(task_arn, cluster, config):
     ecs = create_ecs_client(config)
-    if ecs is None:
+    if not ecs:
         raise RuntimeError("Explicit AWS credentials are not configured")
     waiter = ecs.get_waiter("tasks_running")
     waiter.wait(cluster=cluster, tasks=[task_arn])
@@ -369,7 +382,7 @@ def wait_for_fargate_task(task_arn, cluster, config):
 
 def stop_fargate_task(task_arn, cluster, config):
     ecs = create_ecs_client(config)
-    if ecs is None:
+    if not ecs:
         raise RuntimeError("Explicit AWS credentials are not configured")
     ecs.stop_task(cluster=cluster, task=task_arn, reason="sandbox session complete")
 
@@ -387,7 +400,7 @@ def fargate_session(config, cluster, subnet_ids, security_group_ids):
 
 def get_fargate_endpoint(task_arn, cluster, port, config):
     ecs = create_ecs_client(config)
-    if ecs is None:
+    if not ecs:
         raise RuntimeError("Explicit AWS credentials are not configured")
     response = ecs.describe_tasks(cluster=cluster, tasks=[task_arn])
     tasks = response.get("tasks", [])

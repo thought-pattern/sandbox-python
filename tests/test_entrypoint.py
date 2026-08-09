@@ -10,7 +10,7 @@ import entrypoint
 def test_broker_policy_allows_only_broker_before_default_drop():
     calls = []
     with (
-        patch("entrypoint.shutil.which", side_effect=lambda name: "/sbin/iptables" if "iptables" in name else None),
+        patch("entrypoint.shutil.which", side_effect=lambda name: "/sbin/iptables" if "iptables" in name else ""),
         patch("entrypoint.run_firewall", side_effect=lambda binary, arguments: calls.append(arguments)),
         patch.object(entrypoint.Path, "exists", return_value=False),
     ):
@@ -30,3 +30,16 @@ def test_broker_policy_requires_explicit_http_ipv4_and_port(url):
         pytest.raises(RuntimeError, match="broker"),
     ):
         entrypoint.enforce_egress_policy(url)
+
+
+def test_main_forwards_process_command_line(monkeypatch):
+    arguments = ["entrypoint.py", "--egress-policy", "unrestricted", "--auth-token", "a" * 43]
+    monkeypatch.setattr(entrypoint.sys, "argv", arguments)
+    with (
+        patch("entrypoint.drop_privileges"),
+        patch("entrypoint.os.execv") as execute,
+    ):
+        entrypoint.main()
+
+    forwarded = execute.call_args.args[1]
+    assert forwarded[-4:] == arguments[-4:]

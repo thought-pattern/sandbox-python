@@ -32,8 +32,9 @@ other direct traffic remains unavailable.
 2. A fresh bearer token is generated for every sandbox session.
 3. The HTTP server and tool subprocesses run as the `sandbox` user.
 4. Direct egress is denied before the untrusted tool surface starts.
-5. Request bytes, output bytes, concurrency, timeout, CPU, and memory are
-   bounded; Docker/podman additionally bound process count.
+5. Request bytes, subprocess output, file reads, serialized responses,
+   concurrency, timeout, CPU, and memory are bounded; Docker/podman additionally
+   bound process count.
 6. Timeouts and output overruns terminate the complete process group.
 7. File writes and patches replace their target atomically.
 8. Cleanup failure is reported; it is not silently described as successful.
@@ -69,6 +70,13 @@ Process tools return `ok`, `stdout`, `stderr`, `exitCode`, `timedOut`,
 `outputLimited`, and `durationMs`. The normal Tapestry client raises on a failed
 process; execution verification explicitly consumes the nonzero result so it
 can distinguish refutation from infrastructure failure.
+
+The authenticated health endpoint is a readiness probe rather than a process
+liveness assertion. It verifies the workspace exists and is writable, reports
+free workspace capacity, and checks that Git, pip, and ripgrep are available.
+Local Git commands execute with interactive credential acquisition disabled.
+Dedicated `git_init`, `git_log`, and `workspace_tree` tools provide bounded,
+structured startup context without requiring shell parsing.
 
 ## External broker
 

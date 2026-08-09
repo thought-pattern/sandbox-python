@@ -57,6 +57,8 @@ def test_create_command_container_runtime_boundary():
     assert command[command.index("--user") + 1] == "root"
     assert command[command.index("--auth-token") + 1] == "a" * 43
     assert command[command.index("--egress-policy") + 1] == "deny"
+    assert command[command.index("--max-file-bytes") + 1] == "10485760"
+    assert command[command.index("--max-response-bytes") + 1] == "12582912"
     assert "--env" not in command
 
 
@@ -85,6 +87,11 @@ def test_config_rejects_non_loopback_bind():
 def test_config_rejects_short_auth_token():
     with pytest.raises(ValueError, match="auth_token"):
         ContainerConfig(auth_token="short")
+
+
+def test_config_rejects_response_limit_too_small_for_structured_error():
+    with pytest.raises(ValueError, match="max_response_bytes"):
+        ContainerConfig(max_response_bytes=511)
 
 
 def test_create_container_raises_on_nonzero_exit():

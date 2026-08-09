@@ -61,7 +61,7 @@ All calls require `Authorization: Bearer <session-token>`.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/health` | Authenticated liveness, API version, and egress policy |
+| `GET` | `/health` | Authenticated readiness, dependency, workspace, capacity, API, and egress state |
 | `GET` | `/tools` | Versioned, typed, self-describing manifest |
 | `POST` | `/tools/<name>` | Invoke a tool with a JSON argument object |
 
@@ -79,11 +79,19 @@ an assertion failure remains evidence rather than a transport error.
 ## Tools
 
 - Files: `file_read`, `file_write`, `file_patch`, `file_delete`, `file_list`,
-  `file_search`
+  `file_search`, `workspace_tree`
 - Python: `run_python`, `python_version`
 - Shell: `run_command`
 - Packages: `pip_install`, `pip_uninstall`, `pip_list`, `pip_freeze`
-- Git: `git_clone`, `git_status`, `git_diff`, `git_commit`, `git_push`
+- Git: `git_init`, `git_clone`, `git_status`, `git_diff`, `git_commit`,
+  `git_push`, `git_log`
+
+File reads and complete serialized HTTP responses have independent configurable
+byte limits. Oversized files fail before their contents are allocated, and an
+oversized serialized result is replaced with a structured
+`response_too_large` error. Git commands disable interactive credential
+prompts so unavailable credentials fail within the normal tool contract rather
+than consuming the tool timeout.
 
 Remote package installation, clone, and push fail under `deny`. Under `broker`,
 they use authenticated destination-keyed broker paths and never receive an

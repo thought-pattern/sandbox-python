@@ -11,6 +11,7 @@ import urllib.parse
 from pathlib import Path
 
 SERVER = Path(__file__).with_name("server.py")
+COMMAND_LINE_ARGUMENTS = []
 
 
 def parse_policy(argv):
@@ -37,8 +38,8 @@ def enforce_egress_policy(broker_url=""):
     if not ipv4:
         raise RuntimeError("deny egress policy requires iptables")
 
-    broker_host = None
-    broker_port = None
+    broker_host = ""
+    broker_port = 0
     if broker_url:
         parsed = urllib.parse.urlsplit(broker_url)
         if parsed.scheme != "http" or not parsed.hostname or parsed.port is None:
@@ -56,7 +57,7 @@ def enforce_egress_policy(broker_url=""):
             binary,
             ["-A", "OUTPUT", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
         )
-        if broker_host is not None:
+        if broker_host:
             run_firewall(
                 binary,
                 [
@@ -111,15 +112,16 @@ def drop_privileges(username="sandbox"):
     os.environ["HOME"] = account.pw_dir
 
 
-def main(argv=None):
-    argv = list(sys.argv[1:] if argv is None else argv)
-    policy = parse_policy(argv)
+def main(argv=COMMAND_LINE_ARGUMENTS):
+    selected_arguments = sys.argv[1:] if argv is COMMAND_LINE_ARGUMENTS else argv
+    arguments = list(selected_arguments)
+    policy = parse_policy(arguments)
     if policy.egress_policy == "deny":
         enforce_egress_policy()
     elif policy.egress_policy == "broker":
         enforce_egress_policy(policy.broker_url)
     drop_privileges()
-    os.execv(sys.executable, [sys.executable, str(SERVER), *argv])
+    os.execv(sys.executable, [sys.executable, str(SERVER), *arguments])
 
 
 if __name__ == "__main__":

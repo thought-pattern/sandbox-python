@@ -37,19 +37,30 @@ DEFAULT_WORKSPACE = Path("/workspace")
 DEFAULT_PORT = 8080
 DEFAULT_MAX_REQUEST_BYTES = 1_048_576
 DEFAULT_MAX_OUTPUT_BYTES = 1_048_576
+DEFAULT_MAX_FILE_BYTES = 10_485_760
+DEFAULT_MAX_RESPONSE_BYTES = 12_582_912
 DEFAULT_MAX_CONCURRENT_REQUESTS = 4
 DEFAULT_MAX_TOOL_TIMEOUT = 300
 DEFAULT_REQUEST_READ_TIMEOUT = 10.0
 DEFAULT_MAX_LIST_RESULTS = 5_000
 DEFAULT_MAX_SEARCH_RESULTS = 1_000
+DEFAULT_MAX_GIT_LOG_RESULTS = 100
+MIN_MAX_RESPONSE_BYTES = 512
 
 WORKSPACE = DEFAULT_WORKSPACE
 EGRESS_POLICY = "deny"
 MAX_OUTPUT_BYTES = DEFAULT_MAX_OUTPUT_BYTES
+MAX_FILE_BYTES = DEFAULT_MAX_FILE_BYTES
 MAX_TOOL_TIMEOUT = DEFAULT_MAX_TOOL_TIMEOUT
 BROKER_URL = ""
 BROKER_TOKEN = ""
 BROKER_PACKAGE_DESTINATION = "pypi"
+GIT_ENV = {
+    **os.environ,
+    "GIT_TERMINAL_PROMPT": "0",
+    "GCM_INTERACTIVE": "never",
+}
+COMMAND_LINE_ARGUMENTS = []
 
 TOOLS = {}
 FILE_LOCK = threading.RLock()
@@ -126,14 +137,16 @@ def _terminate_process_group(process):
             pass
 
 
-def _run_process(command, *, shell=False, timeout=60, cwd=None):
+def _run_process(command, *, shell=False, timeout=60, cwd="", environment={}):
     """Run a bounded process and return a structured camelCase result."""
     timeout = _bounded_timeout(timeout)
     started = time.monotonic()
+    process_environment = environment or os.environ
     process = subprocess.Popen(
         command,
         shell=shell,
         cwd=cwd or WORKSPACE,
+        env=process_environment,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         start_new_session=True,
@@ -189,6 +202,13 @@ def _run_process(command, *, shell=False, timeout=60, cwd=None):
         "outputLimited": output_limited,
         "durationMs": round((time.monotonic() - started) * 1000, 3),
     }
+
+
+def _run_git(arguments, timeout=30):
+    """Run Git without allowing an interactive credential prompt."""
+    command = ["git", *arguments]
+    result = _run_process(command, timeout=timeout, environment=GIT_ENV)
+    return result
 
 
 def _require_process_success(result, operation):
@@ -279,9 +299,18 @@ def _resolve_broker_url(external_url, operation):
 
 @tool
 def file_read(path: str):
-    """Read UTF-8 contents of a file."""
+    """Read bounded UTF-8 contents of a file."""
+    target = resolve_path(path)
     with FILE_LOCK:
-        return resolve_path(path).read_text(encoding="utf-8")
+        size = target.stat().st_size
+        if size > MAX_FILE_BYTES:
+            raise ToolError(
+                f"File exceeds the configured {MAX_FILE_BYTES}-byte read limit",
+                code="file_too_large",
+                status=413,
+            )
+        content = target.read_text(encoding="utf-8")
+    return content
 
 
 @tool
@@ -461,6 +490,22 @@ def _validate_git_atom(value, label):
 
 
 @tool
+def git_init(branch: str = "main"):
+    """Initialize a local Git repository with a validated initial branch."""
+    _validate_git_atom(branch, "branch")
+    validation = _run_git(["check-ref-format", "--branch", branch])
+    _require_process_success(validation, "git branch validation")
+    result = _run_git(["init", f"--initial-branch={branch}"])
+    _require_process_success(result, "git init")
+    output = {
+        "branch": branch,
+        "initialized": True,
+        "message": result["stdout"].strip(),
+    }
+    return output
+
+
+@tool
 def git_clone(repo_url: str, branch: str = "main"):
     """Stage a clone before replacing the workspace when egress is enabled."""
     _require_network("git_clone")
@@ -470,14 +515,14 @@ def git_clone(repo_url: str, branch: str = "main"):
     staging = WORKSPACE / f".tapestry-clone-{uuid4().hex}"
     with FILE_LOCK:
         try:
-            result = _run_process(
-                ["git", "clone", "--branch", branch, "--", clone_url, str(staging)],
+            result = _run_git(
+                ["clone", "--branch", branch, "--", clone_url, str(staging)],
                 timeout=MAX_TOOL_TIMEOUT,
             )
             result = _redact_broker_token(result)
             _require_process_success(result, "git clone")
             _require_process_success(
-                _run_process(["git", "-C", str(staging), "remote", "set-url", "origin", repo_url], timeout=30),
+                _run_git(["-C", str(staging), "remote", "set-url", "origin", repo_url], timeout=30),
                 "git remote sanitization",
             )
             for item in list(WORKSPACE.iterdir()):
@@ -497,11 +542,11 @@ def git_clone(repo_url: str, branch: str = "main"):
 def git_status():
     """Return the current repository branch and changes."""
     branch = _require_process_success(
-        _run_process(["git", "branch", "--show-current"], timeout=30),
+        _run_git(["branch", "--show-current"], timeout=30),
         "git branch",
     )
     status = _require_process_success(
-        _run_process(["git", "status", "--porcelain"], timeout=30),
+        _run_git(["status", "--porcelain"], timeout=30),
         "git status",
     )
     return {
@@ -514,7 +559,7 @@ def git_status():
 def git_diff(staged: bool = False):
     """Return a bounded repository diff."""
     command = ["git", "diff", "--staged"] if staged else ["git", "diff"]
-    result = _run_process(command, timeout=30)
+    result = _run_git(command[1:], timeout=30)
     if not result["ok"] and not result["outputLimited"]:
         _require_process_success(result, "git diff")
     return {
@@ -528,22 +573,22 @@ def git_commit(message: str):
     """Stage all workspace changes and commit them locally."""
     if not isinstance(message, str) or not message.strip():
         raise ToolError("message must be a non-empty string", code="bad_arguments", status=400)
-    _require_process_success(_run_process(["git", "add", "-A"], timeout=30), "git add")
+    _require_process_success(_run_git(["add", "-A"], timeout=30), "git add")
     result = _require_process_success(
-        _run_process(["git", "commit", "-m", message], timeout=60),
+        _run_git(["commit", "-m", message], timeout=60),
         "git commit",
     )
     return result["stdout"]
 
 
 @tool
-def git_push(remote: str = "origin", branch: str = None):
+def git_push(remote: str = "origin", branch: str = ""):
     """Push commits when a controlled egress path is enabled."""
     _require_network("git_push")
     _validate_git_atom(remote, "remote")
-    if branch is None:
+    if not branch:
         current = _require_process_success(
-            _run_process(["git", "branch", "--show-current"], timeout=30),
+            _run_git(["branch", "--show-current"], timeout=30),
             "git branch",
         )
         branch = current["stdout"].strip()
@@ -551,13 +596,56 @@ def git_push(remote: str = "origin", branch: str = None):
     push_target = remote
     if EGRESS_POLICY == "broker":
         remote_url = _require_process_success(
-            _run_process(["git", "remote", "get-url", remote], timeout=30),
+            _run_git(["remote", "get-url", remote], timeout=30),
             "git remote lookup",
         )["stdout"].strip()
         push_target = _resolve_broker_url(remote_url, "git")
-    result = _redact_broker_token(_run_process(["git", "push", "--", push_target, branch], timeout=MAX_TOOL_TIMEOUT))
+    result = _redact_broker_token(_run_git(["push", "--", push_target, branch], timeout=MAX_TOOL_TIMEOUT))
     _require_process_success(result, "git push")
     return {"remote": remote, "branch": branch, "pushed": True}
+
+
+@tool
+def git_log(limit: int = 20):
+    """Return bounded recent Git history as structured commit records."""
+    try:
+        requested_limit = int(limit)
+    except (TypeError, ValueError) as err:
+        raise ToolError("limit must be an integer", code="bad_arguments", status=400) from err
+    if requested_limit < 1:
+        raise ToolError("limit must be positive", code="bad_arguments", status=400)
+    bounded_limit = min(requested_limit, DEFAULT_MAX_GIT_LOG_RESULTS)
+    result = _run_git(
+        [
+            "log",
+            f"--max-count={bounded_limit + 1}",
+            "--format=%H%x00%h%x00%aI%x00%s",
+        ],
+        timeout=30,
+    )
+    _require_process_success(result, "git log")
+    lines = result["stdout"].splitlines()
+    truncated = len(lines) > bounded_limit
+    commits = []
+    for line in lines[:bounded_limit]:
+        commit_hash, short_hash, authored_at, subject = line.split("\x00", 3)
+        commits.append(
+            {
+                "hash": commit_hash,
+                "shortHash": short_hash,
+                "authoredAt": authored_at,
+                "subject": subject,
+            }
+        )
+    output = {"commits": commits, "truncated": truncated}
+    return output
+
+
+@tool
+def workspace_tree(depth: int = 3, max_results: int = 100):
+    """Return a bounded workspace file tree for initial task context."""
+    result = file_list(".", depth=depth, max_results=max_results)
+    return result
 
 
 @tool
@@ -603,14 +691,14 @@ def build_manifest():
             type_schema = _json_type(param.annotation)
             if isinstance(type_schema, str):
                 type_schema = {"type": type_schema}
-            parameters.append(
-                {
-                    "name": _camel_case(param_name),
-                    "required": required,
-                    "default": None if required else param.default,
-                    **type_schema,
-                }
-            )
+            descriptor = {
+                "name": _camel_case(param_name),
+                "required": required,
+                **type_schema,
+            }
+            if not required:
+                descriptor["default"] = param.default
+            parameters.append(descriptor)
         tools.append(
             {
                 "name": name,
@@ -624,6 +712,35 @@ def build_manifest():
         "egressPolicy": EGRESS_POLICY,
         "tools": tools,
     }
+
+
+def build_readiness_report():
+    """Return dependency, workspace, and capacity readiness information."""
+    required_tools = ("git", "pip", "rg")
+    tools = {name: bool(shutil.which(name)) for name in required_tools}
+    workspace_exists = WORKSPACE.is_dir()
+    workspace_writable = False
+    workspace_free_bytes = 0
+    if workspace_exists:
+        try:
+            with tempfile.NamedTemporaryFile(dir=WORKSPACE):
+                workspace_writable = True
+            workspace_free_bytes = shutil.disk_usage(WORKSPACE).free
+        except OSError:
+            workspace_writable = False
+    dependencies_ready = all(tools.values())
+    ready = workspace_exists and workspace_writable and dependencies_ready
+    status = "healthy" if ready else "unhealthy"
+    result = {
+        "status": status,
+        "checks": {
+            "workspaceExists": workspace_exists,
+            "workspaceWritable": workspace_writable,
+            "workspaceFreeBytes": workspace_free_bytes,
+            "tools": tools,
+        },
+    }
+    return result
 
 
 class ToolHTTPServer(ThreadingHTTPServer):
@@ -644,12 +761,14 @@ class ToolHTTPServer(ThreadingHTTPServer):
         *,
         auth_token,
         max_request_bytes=DEFAULT_MAX_REQUEST_BYTES,
+        max_response_bytes=DEFAULT_MAX_RESPONSE_BYTES,
         max_concurrent_requests=DEFAULT_MAX_CONCURRENT_REQUESTS,
         request_read_timeout=DEFAULT_REQUEST_READ_TIMEOUT,
     ):
         super().__init__(server_address, handler_class)
         self.auth_token = auth_token
         self.max_request_bytes = max_request_bytes
+        self.max_response_bytes = max_response_bytes
         self.request_slots = threading.BoundedSemaphore(max_concurrent_requests)
         self.request_read_timeout = request_read_timeout
 
@@ -663,9 +782,20 @@ class ToolHandler(BaseHTTPRequestHandler):
         super().setup()
         self.connection.settimeout(self.server.request_read_timeout)
 
-    def send_json(self, status, payload, *, request_id=None):
+    def send_json(self, status, payload, *, request_id=""):
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        self.send_response(status)
+        response_status = status
+        if len(body) > self.server.max_response_bytes:
+            response_status = 413
+            payload = {
+                "error": {
+                    "code": "response_too_large",
+                    "message": "Tool response exceeds the configured byte limit",
+                },
+                "requestId": request_id,
+            }
+            body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        self.send_response(response_status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
@@ -674,13 +804,15 @@ class ToolHandler(BaseHTTPRequestHandler):
             self.send_header("X-Tapestry-Request-ID", request_id)
         self.end_headers()
         self.wfile.write(body)
+        return response_status
 
-    def send_error_json(self, status, code, message, *, request_id=None):
-        self.send_json(
+    def send_error_json(self, status, code, message, *, request_id=""):
+        response_status = self.send_json(
             status,
             {"error": {"code": code, "message": str(message)}, "requestId": request_id},
             request_id=request_id,
         )
+        return response_status
 
     def authorized(self):
         header = self.headers.get("Authorization", "")
@@ -704,17 +836,13 @@ class ToolHandler(BaseHTTPRequestHandler):
         if not self.require_authorized(request_id):
             return
         if self.path == "/health":
-            self.send_json(
-                200,
-                {
-                    "status": "healthy",
-                    "python": sys.version,
-                    "apiVersion": API_VERSION,
-                    "egressPolicy": EGRESS_POLICY,
-                    "requestId": request_id,
-                },
-                request_id=request_id,
-            )
+            payload = build_readiness_report()
+            payload["python"] = sys.version
+            payload["apiVersion"] = API_VERSION
+            payload["egressPolicy"] = EGRESS_POLICY
+            payload["requestId"] = request_id
+            status = 200 if payload["status"] == "healthy" else 503
+            self.send_json(status, payload, request_id=request_id)
         elif self.path == "/tools":
             payload = build_manifest()
             payload["requestId"] = request_id
@@ -765,7 +893,7 @@ class ToolHandler(BaseHTTPRequestHandler):
         try:
             arguments = self.read_arguments(request_id)
             result = fn(**arguments)
-            self.send_json(200, {"result": result, "requestId": request_id}, request_id=request_id)
+            status = self.send_json(200, {"result": result, "requestId": request_id}, request_id=request_id)
         except ToolError as err:
             status = err.status
             self.send_error_json(err.status, err.code, err, request_id=request_id)
@@ -790,7 +918,7 @@ class ToolHandler(BaseHTTPRequestHandler):
         return
 
 
-def parse_args(argv=None):
+def parse_args(argv=COMMAND_LINE_ARGUMENTS):
     """Parse explicit server settings supplied by the container manager."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workspace", type=Path, default=DEFAULT_WORKSPACE)
@@ -799,6 +927,8 @@ def parse_args(argv=None):
     parser.add_argument("--egress-policy", choices=("deny", "broker", "unrestricted"), default="deny")
     parser.add_argument("--max-request-bytes", type=int, default=DEFAULT_MAX_REQUEST_BYTES)
     parser.add_argument("--max-output-bytes", type=int, default=DEFAULT_MAX_OUTPUT_BYTES)
+    parser.add_argument("--max-file-bytes", type=int, default=DEFAULT_MAX_FILE_BYTES)
+    parser.add_argument("--max-response-bytes", type=int, default=DEFAULT_MAX_RESPONSE_BYTES)
     parser.add_argument("--max-concurrent-requests", type=int, default=DEFAULT_MAX_CONCURRENT_REQUESTS)
     parser.add_argument("--max-tool-timeout", type=int, default=DEFAULT_MAX_TOOL_TIMEOUT)
     parser.add_argument("--request-read-timeout", type=float, default=DEFAULT_REQUEST_READ_TIMEOUT)
@@ -810,14 +940,23 @@ def parse_args(argv=None):
 
 def configure(args):
     """Apply validated process-wide settings before accepting requests."""
-    global WORKSPACE, EGRESS_POLICY, MAX_OUTPUT_BYTES, MAX_TOOL_TIMEOUT, BROKER_URL, BROKER_TOKEN, BROKER_PACKAGE_DESTINATION
+    global WORKSPACE, EGRESS_POLICY, MAX_OUTPUT_BYTES, MAX_FILE_BYTES, MAX_TOOL_TIMEOUT, BROKER_URL, BROKER_TOKEN, BROKER_PACKAGE_DESTINATION
     if len(args.auth_token) < 32:
         raise ValueError("auth token must be at least 32 characters")
     if not 1 <= args.port <= 65535:
         raise ValueError("port must be between 1 and 65535")
-    for name in ("max_request_bytes", "max_output_bytes", "max_concurrent_requests", "max_tool_timeout"):
+    for name in (
+        "max_request_bytes",
+        "max_output_bytes",
+        "max_file_bytes",
+        "max_response_bytes",
+        "max_concurrent_requests",
+        "max_tool_timeout",
+    ):
         if getattr(args, name) < 1:
             raise ValueError(f"{name} must be positive")
+    if args.max_response_bytes < MIN_MAX_RESPONSE_BYTES:
+        raise ValueError(f"max_response_bytes must be at least {MIN_MAX_RESPONSE_BYTES}")
     if args.request_read_timeout <= 0:
         raise ValueError("request_read_timeout must be positive")
     if args.egress_policy == "broker":
@@ -834,21 +973,24 @@ def configure(args):
     WORKSPACE.mkdir(parents=True, exist_ok=True)
     EGRESS_POLICY = args.egress_policy
     MAX_OUTPUT_BYTES = args.max_output_bytes
+    MAX_FILE_BYTES = args.max_file_bytes
     MAX_TOOL_TIMEOUT = args.max_tool_timeout
     BROKER_URL = args.broker_url
     BROKER_TOKEN = args.broker_token
     BROKER_PACKAGE_DESTINATION = args.broker_package_destination
 
 
-def main(argv=None):
+def main(argv=COMMAND_LINE_ARGUMENTS):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    args = parse_args(argv)
+    selected_arguments = sys.argv[1:] if argv is COMMAND_LINE_ARGUMENTS else argv
+    args = parse_args(selected_arguments)
     configure(args)
     server = ToolHTTPServer(
         ("0.0.0.0", args.port),
         ToolHandler,
         auth_token=args.auth_token,
         max_request_bytes=args.max_request_bytes,
+        max_response_bytes=args.max_response_bytes,
         max_concurrent_requests=args.max_concurrent_requests,
         request_read_timeout=args.request_read_timeout,
     )

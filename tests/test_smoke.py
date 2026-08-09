@@ -13,17 +13,21 @@ import pytest
 
 from manager import ContainerConfig, sandbox_session
 
-CONTAINER_RUNTIME = shutil.which("container") or shutil.which("docker") or shutil.which("podman")
+CONTAINER_RUNTIME = shutil.which("container") or shutil.which("docker") or shutil.which("podman") or ""
+NO_PAYLOAD = {}
 
 
-def request_json(url, token, *, method="GET", payload=None, timeout=2):
-    body = json.dumps(payload).encode() if payload is not None else None
+def request_json(url, token, *, method="GET", payload=NO_PAYLOAD, timeout=2):
     headers = {"Authorization": f"Bearer {token}"}
-    if body is not None:
+    if payload is NO_PAYLOAD:
+        request = urllib.request.Request(url, headers=headers, method=method)
+    else:
+        body = json.dumps(payload).encode()
         headers["Content-Type"] = "application/json"
-    request = urllib.request.Request(url, data=body, headers=headers, method=method)
+        request = urllib.request.Request(url, data=body, headers=headers, method=method)
     with urllib.request.urlopen(request, timeout=timeout) as response:
-        return response.status, json.loads(response.read())
+        result = (response.status, json.loads(response.read()))
+        return result
 
 
 def wait_for_health(base_url, token, attempts=30):
@@ -34,10 +38,10 @@ def wait_for_health(base_url, token, attempts=30):
                 return payload
         except (OSError, ValueError):
             time.sleep(0.25)
-    return None
+    return {}
 
 
-@pytest.mark.skipif(CONTAINER_RUNTIME is None, reason="no supported container runtime available")
+@pytest.mark.skipif(not CONTAINER_RUNTIME, reason="no supported container runtime available")
 def test_image_builds_and_serves_authenticated_bounded_tools():
     runtime = Path(CONTAINER_RUNTIME).name
     context = Path(__file__).resolve().parent.parent / "container"
@@ -51,7 +55,7 @@ def test_image_builds_and_serves_authenticated_bounded_tools():
     config = ContainerConfig(image="python-sandbox:test", port=8080)
     with sandbox_session(config, runtime=runtime):
         health = wait_for_health(config.base_url, config.auth_token)
-        assert health is not None
+        assert health
         assert health["egressPolicy"] == "deny"
 
         with pytest.raises(urllib.error.HTTPError) as unauthorized:
