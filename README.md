@@ -1,7 +1,8 @@
 # sandbox-python
 
-The MVP Tapestry Workspace: an authenticated, disposable Python 3.12 container
-with a bounded HTTP tool interface.
+`sandbox-python` provides an authenticated, disposable Python 3.12 execution
+environment through a bounded HTTP API. The subproject contains the container
+image, tool server, lifecycle manager, and verification suite.
 
 ## Boundary
 
@@ -27,7 +28,7 @@ sandbox-python/
 ├── container/
 │   ├── Containerfile
 │   ├── entrypoint.py       # firewall, privilege drop, server exec
-│   ├── requirements.txt    # intentionally empty
+│   ├── requirements.txt    # image dependencies
 │   └── server.py           # authenticated standard-library HTTP server
 ├── manager.py              # Apple container/Docker/podman and Fargate lifecycle
 └── tests/                  # boundary, API, lifecycle, and live smoke tests
@@ -72,9 +73,8 @@ includes a request identifier. Expected failures use a structured error:
 {"error":{"code":"egress_denied","message":"..."},"requestId":"..."}
 ```
 
-Shell and Python tools return an explicit process result. The general client
-raises on a nonzero process result by default; proof verification opts out so
-an assertion failure remains evidence rather than a transport error.
+Shell and Python tools return an explicit process result so clients can
+distinguish command failure from a transport or service failure.
 
 ## Tools
 
@@ -103,8 +103,3 @@ upstream credential. Local operations work under either policy.
 python3 -m pytest tests/test_manager.py tests/test_server.py -q
 python3 -m pytest tests/test_smoke.py -q
 ```
-
-The live smoke and broker acceptance tests verify unauthorized access is
-rejected, authenticated file and Python tools work, direct outbound sockets are
-blocked, package and Git traffic crosses through only the broker, audit records
-are written, and every disposable container is removed.
