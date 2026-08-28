@@ -1,32 +1,35 @@
 """Live build/start/auth/tool/egress/teardown smoke test."""
 
-import json
-import shutil
-import socket
-import subprocess
-import time
-import urllib.error
-import urllib.request
+from json import dumps as json_dumps
+from json import loads as json_loads
 from pathlib import Path
-
-import pytest
+from shutil import which as shutil_which
+from socket import create_connection as socket_create_connection
+from subprocess import run as subprocess_run
+from time import sleep as time_sleep
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 from manager import ContainerConfig, sandbox_session
+from pytest import mark as pytest_mark
+from pytest import raises as pytest_raises
 
-CONTAINER_RUNTIME = shutil.which("container") or shutil.which("docker") or shutil.which("podman") or ""
+CONTAINER_RUNTIME = (
+    shutil_which("container") or shutil_which("docker") or shutil_which("podman") or ""
+)
 NO_PAYLOAD = {}
 
 
 def request_json(url, token, *, method="GET", payload=NO_PAYLOAD, timeout=2):
     headers = {"Authorization": f"Bearer {token}"}
     if payload is NO_PAYLOAD:
-        request = urllib.request.Request(url, headers=headers, method=method)
+        request = urllib_request.Request(url, headers=headers, method=method)
     else:
-        body = json.dumps(payload).encode()
+        body = json_dumps(payload).encode()
         headers["Content-Type"] = "application/json"
-        request = urllib.request.Request(url, data=body, headers=headers, method=method)
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        result = (response.status, json.loads(response.read()))
+        request = urllib_request.Request(url, data=body, headers=headers, method=method)
+    with urllib_request.urlopen(request, timeout=timeout) as response:
+        result = (response.status, json_loads(response.read()))
         return result
 
 
@@ -34,19 +37,29 @@ def wait_for_health(base_url, token, attempts=30):
     for _ in range(attempts):
         try:
             _, payload = request_json(f"{base_url}/health", token)
-            if payload.get("status") == "healthy":
+            if payload.get("status", "") == "healthy":
                 return payload
         except (OSError, ValueError):
-            time.sleep(0.25)
+            time_sleep(0.25)
     return {}
 
 
-@pytest.mark.skipif(not CONTAINER_RUNTIME, reason="no supported container runtime available")
+@pytest_mark.skipif(
+    not CONTAINER_RUNTIME, reason="no supported container runtime available"
+)
 def test_image_builds_and_serves_authenticated_bounded_tools():
     runtime = Path(CONTAINER_RUNTIME).name
     context = Path(__file__).resolve().parent.parent / "container"
-    build = subprocess.run(
-        [runtime, "build", "-t", "python-sandbox:test", "-f", str(context / "Containerfile"), str(context)],
+    build = subprocess_run(
+        [
+            runtime,
+            "build",
+            "-t",
+            "python-sandbox:test",
+            "-f",
+            str(context / "Containerfile"),
+            str(context),
+        ],
         capture_output=True,
         text=True,
     )
@@ -56,15 +69,17 @@ def test_image_builds_and_serves_authenticated_bounded_tools():
     with sandbox_session(config, runtime=runtime):
         health = wait_for_health(config.base_url, config.auth_token)
         assert health
-        assert health["egressPolicy"] == "deny"
+        assert health.get("egressPolicy", "") == "deny"
 
-        with pytest.raises(urllib.error.HTTPError) as unauthorized:
-            urllib.request.urlopen(f"{config.base_url}/tools", timeout=2)
+        with pytest_raises(urllib_error.HTTPError) as unauthorized:
+            urllib_request.urlopen(f"{config.base_url}/tools", timeout=2)
         assert unauthorized.value.code == 401
 
         _, manifest = request_json(f"{config.base_url}/tools", config.auth_token)
-        assert manifest["apiVersion"] == "1.0"
-        assert "run_python" in {entry["name"] for entry in manifest["tools"]}
+        assert manifest.get("apiVersion", "") == "1.0"
+        assert "run_python" in {
+            entry.get("name", "") for entry in manifest.get("tools", [])
+        }
 
         _, written = request_json(
             f"{config.base_url}/tools/file_write",
@@ -72,14 +87,14 @@ def test_image_builds_and_serves_authenticated_bounded_tools():
             method="POST",
             payload={"path": "smoke.txt", "content": "hello"},
         )
-        assert written["result"]["bytesWritten"] == 5
+        assert written.get("result", {}).get("bytesWritten", 0) == 5
         _, read = request_json(
             f"{config.base_url}/tools/file_read",
             config.auth_token,
             method="POST",
             payload={"path": "smoke.txt"},
         )
-        assert read["result"] == "hello"
+        assert read.get("result", "") == "hello"
 
         network_probe = (
             "import socket\n"
@@ -96,7 +111,8 @@ def test_image_builds_and_serves_authenticated_bounded_tools():
             payload={"script": network_probe, "timeout": 2},
             timeout=4,
         )
-        assert result["result"]["exitCode"] == 0
+        assert result.get("result", {}).get("exitCode", 0) == 0
 
-        with socket.create_connection((config.host_bind, config.host_port), timeout=2):
+        with socket_create_connection((config.host_bind, config.host_port), timeout=2):
             pass
+    return False

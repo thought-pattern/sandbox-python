@@ -7,29 +7,53 @@ while request size, concurrency, wall time, process trees, and captured output
 are bounded so one tool call cannot exhaust the service.
 """
 
-import argparse
-import hmac
-import inspect
-import json
-import logging
-import os
-import re
-import selectors
-import shutil
-import signal
-import subprocess
-import sys
-import tempfile
-import threading
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
+from argparse import ArgumentParser as argparse_ArgumentParser
+from hmac import compare_digest as hmac_compare_digest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from inspect import Parameter as inspect_Parameter
+from inspect import signature as inspect_signature
+from json import dumps as json_dumps
+from json import loads as json_loads
+from logging import INFO as logging_INFO
+from logging import basicConfig as logging_basicConfig
+from logging import getLogger as logging_getLogger
+from os import environ as os_environ
+from os import fdopen as os_fdopen
+from os import fsync as os_fsync
+from os import killpg as os_killpg
+from os import read as os_read
 from pathlib import Path
+from re import compile as re_compile
+from re import fullmatch as re_fullmatch
+from re import sub as re_sub
+from selectors import EVENT_READ as selectors_EVENT_READ
+from selectors import DefaultSelector as selectors_DefaultSelector
+from shutil import disk_usage as shutil_disk_usage
+from shutil import move as shutil_move
+from shutil import rmtree as shutil_rmtree
+from shutil import which as shutil_which
+from signal import SIGKILL as signal_SIGKILL
+from signal import SIGTERM as signal_SIGTERM
 from socketserver import TCPServer
+from subprocess import PIPE as subprocess_PIPE
+from subprocess import Popen as subprocess_Popen
+from subprocess import TimeoutExpired as subprocess_TimeoutExpired
+from sys import argv as sys_argv
+from sys import executable as sys_executable
+from sys import version as sys_version
+from tempfile import NamedTemporaryFile as tempfile_NamedTemporaryFile
+from tempfile import mkstemp as tempfile_mkstemp
+from threading import BoundedSemaphore as threading_BoundedSemaphore
+from threading import RLock as threading_RLock
+from time import monotonic as time_monotonic
+from time import sleep as time_sleep
 from typing import get_args, get_origin
+from urllib import error as urllib_error
+from urllib import parse as urllib_parse
+from urllib import request as urllib_request
 from uuid import uuid4
+
+_DEFAULT_ARGUMENT_DICT = {}
 
 API_VERSION = "1.0"
 PROTOCOL_NAME = "tapestry.workspace.http"
@@ -56,15 +80,15 @@ BROKER_URL = ""
 BROKER_TOKEN = ""
 BROKER_PACKAGE_DESTINATION = "pypi"
 GIT_ENV = {
-    **os.environ,
+    **os_environ,
     "GIT_TERMINAL_PROMPT": "0",
     "GCM_INTERACTIVE": "never",
 }
 COMMAND_LINE_ARGUMENTS = []
 
 TOOLS = {}
-FILE_LOCK = threading.RLock()
-LOGGER = logging.getLogger("tapestry.workspace.server")
+FILE_LOCK = threading_RLock()
+LOGGER = logging_getLogger("tapestry.workspace.server")
 
 
 class ToolError(RuntimeError):
@@ -93,67 +117,80 @@ def resolve_path(path):
 def _atomic_write_text(target, content):
     """Replace a text file atomically after fully writing its new content."""
     target.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(prefix=".tapestry-write-", dir=target.parent)
+    descriptor, temporary_name = tempfile_mkstemp(
+        prefix=".tapestry-write-", dir=target.parent
+    )
     temporary = Path(temporary_name)
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        with os_fdopen(descriptor, "w", encoding="utf-8") as handle:
             handle.write(content)
             handle.flush()
-            os.fsync(handle.fileno())
+            os_fsync(handle.fileno())
         temporary.replace(target)
     except Exception:
         temporary.unlink(missing_ok=True)
         raise
+    return False
 
 
 def _bounded_timeout(timeout):
     try:
         value = float(timeout)
     except (TypeError, ValueError) as err:
-        raise ToolError("timeout must be numeric", code="invalid_timeout", status=400) from err
+        raise ToolError(
+            "timeout must be numeric", code="invalid_timeout", status=400
+        ) from err
     if value <= 0:
-        raise ToolError("timeout must be greater than zero", code="invalid_timeout", status=400)
-    return min(value, float(MAX_TOOL_TIMEOUT))
+        raise ToolError(
+            "timeout must be greater than zero", code="invalid_timeout", status=400
+        )
+    _return_value = min(value, float(MAX_TOOL_TIMEOUT))
+    return _return_value
 
 
 def _terminate_process_group(process):
     """Terminate a tool process and every descendant in its process group."""
     try:
-        os.killpg(process.pid, signal.SIGTERM)
+        os_killpg(process.pid, signal_SIGTERM)
         if process.poll() is None:
             process.wait(timeout=0.25)
         else:
-            time.sleep(0.05)
-    except (ProcessLookupError, subprocess.TimeoutExpired, ChildProcessError):
+            time_sleep(0.05)
+    except (ProcessLookupError, subprocess_TimeoutExpired, ChildProcessError):
         pass
     try:
-        os.killpg(process.pid, signal.SIGKILL)
+        os_killpg(process.pid, signal_SIGKILL)
     except ProcessLookupError:
         pass
     if process.poll() is None:
         try:
             process.wait(timeout=0.25)
-        except subprocess.TimeoutExpired:
+        except subprocess_TimeoutExpired:
             pass
+    return False
 
 
-def _run_process(command, *, shell=False, timeout=60, cwd="", environment={}):
+def _run_process(
+    command, *, shell=False, timeout=60, cwd="", environment=_DEFAULT_ARGUMENT_DICT
+):
     """Run a bounded process and return a structured camelCase result."""
+    if environment is _DEFAULT_ARGUMENT_DICT:
+        environment = _DEFAULT_ARGUMENT_DICT.copy()
     timeout = _bounded_timeout(timeout)
-    started = time.monotonic()
-    process_environment = environment or os.environ
-    process = subprocess.Popen(
+    started = time_monotonic()
+    process_environment = environment or os_environ
+    process = subprocess_Popen(
         command,
         shell=shell,
         cwd=cwd or WORKSPACE,
         env=process_environment,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=subprocess_PIPE,
+        stderr=subprocess_PIPE,
         start_new_session=True,
     )
-    selector = selectors.DefaultSelector()
-    selector.register(process.stdout, selectors.EVENT_READ, "stdout")
-    selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+    selector = selectors_DefaultSelector()
+    selector.register(process.stdout, selectors_EVENT_READ, "stdout")
+    selector.register(process.stderr, selectors_EVENT_READ, "stderr")
     buffers = {"stdout": bytearray(), "stderr": bytearray()}
     captured = 0
     timed_out = False
@@ -162,19 +199,19 @@ def _run_process(command, *, shell=False, timeout=60, cwd="", environment={}):
 
     try:
         while selector.get_map():
-            remaining_time = deadline - time.monotonic()
+            remaining_time = deadline - time_monotonic()
             if remaining_time <= 0:
                 timed_out = True
                 _terminate_process_group(process)
                 break
             events = selector.select(timeout=min(0.1, remaining_time))
             for key, _ in events:
-                chunk = os.read(key.fileobj.fileno(), 65_536)
+                chunk = os_read(key.fileobj.fileno(), 65_536)
                 if not chunk:
                     selector.unregister(key.fileobj)
                     continue
                 available = max(0, MAX_OUTPUT_BYTES - captured)
-                buffers[key.data].extend(chunk[:available])
+                buffers.get(key.data, []).extend(chunk[:available])
                 captured += min(len(chunk), available)
                 if len(chunk) > available:
                     output_limited = True
@@ -193,15 +230,16 @@ def _run_process(command, *, shell=False, timeout=60, cwd="", environment={}):
     elif output_limited:
         return_code = -2
 
-    return {
+    _return_value = {
         "ok": return_code == 0,
-        "stdout": buffers["stdout"].decode("utf-8", errors="replace"),
-        "stderr": buffers["stderr"].decode("utf-8", errors="replace"),
+        "stdout": buffers.get("stdout", b"").decode("utf-8", errors="replace"),
+        "stderr": buffers.get("stderr", b"").decode("utf-8", errors="replace"),
         "exitCode": return_code,
         "timedOut": timed_out,
         "outputLimited": output_limited,
-        "durationMs": round((time.monotonic() - started) * 1000, 3),
+        "durationMs": round((time_monotonic() - started) * 1000, 3),
     }
+    return _return_value
 
 
 def _run_git(arguments, timeout=30):
@@ -212,17 +250,18 @@ def _run_git(arguments, timeout=30):
 
 
 def _require_process_success(result, operation):
-    if result["ok"]:
+    if result.get("ok", False):
         return result
-    if result["timedOut"]:
+    if result.get("timedOut", False):
         code = "timeout"
-    elif result["outputLimited"]:
+    elif result.get("outputLimited", False):
         code = "output_limit"
     else:
         code = "process_failed"
-    detail = (result.get("stderr") or result.get("stdout") or "").strip()
+    detail = (result.get("stderr", False) or result.get("stdout", False) or "").strip()
     raise ToolError(
-        f"{operation} failed with exit code {result['exitCode']}" + (f": {detail}" if detail else ""),
+        f"{operation} failed with exit code {result.get('exitCode', False)}"
+        + (f": {detail}" if detail else ""),
         code=code,
     )
 
@@ -234,6 +273,7 @@ def _require_network(operation):
             code="egress_denied",
             status=403,
         )
+    return False
 
 
 def _redact_broker_token(result):
@@ -241,7 +281,7 @@ def _redact_broker_token(result):
     if not BROKER_TOKEN:
         return result
     for name in ("stdout", "stderr"):
-        value = result.get(name)
+        value = result.get(name, False)
         if isinstance(value, str):
             result[name] = value.replace(BROKER_TOKEN, "[broker-token-redacted]")
     return result
@@ -250,9 +290,13 @@ def _redact_broker_token(result):
 def _broker_request(path, payload):
     """Call one authenticated broker control endpoint with bounded JSON."""
     if EGRESS_POLICY != "broker" or not BROKER_URL or not BROKER_TOKEN:
-        raise ToolError("controlled egress broker is not configured", code="broker_unavailable", status=503)
-    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    request = urllib.request.Request(
+        raise ToolError(
+            "controlled egress broker is not configured",
+            code="broker_unavailable",
+            status=503,
+        )
+    body = json_dumps(payload, separators=(",", ":")).encode("utf-8")
+    request = urllib_request.Request(
         f"{BROKER_URL.rstrip('/')}{path}",
         data=body,
         headers={
@@ -263,38 +307,56 @@ def _broker_request(path, payload):
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=min(float(MAX_TOOL_TIMEOUT), 30.0)) as response:
-            result = json.loads(response.read(MAX_OUTPUT_BYTES + 1))
-    except urllib.error.HTTPError as err:
+        with urllib_request.urlopen(
+            request, timeout=min(float(MAX_TOOL_TIMEOUT), 30.0)
+        ) as response:
+            result = json_loads(response.read(MAX_OUTPUT_BYTES + 1))
+    except urllib_error.HTTPError as err:
         try:
-            detail = json.loads(err.read(MAX_OUTPUT_BYTES + 1)).get("error", {})
+            detail = json_loads(err.read(MAX_OUTPUT_BYTES + 1)).get("error", {})
         except Exception:
             detail = {}
         raise ToolError(
-            str(detail.get("message") or "egress broker rejected the request"),
-            code=str(detail.get("code") or "broker_rejected"),
+            str(detail.get("message", "") or "egress broker rejected the request"),
+            code=str(detail.get("code", "") or "broker_rejected"),
             status=err.code,
         ) from err
     except Exception as err:
-        raise ToolError("egress broker is unavailable", code="broker_unavailable", status=503) from err
+        raise ToolError(
+            "egress broker is unavailable", code="broker_unavailable", status=503
+        ) from err
     if not isinstance(result, dict):
-        raise ToolError("egress broker returned an invalid response", code="broker_protocol", status=502)
+        raise ToolError(
+            "egress broker returned an invalid response",
+            code="broker_protocol",
+            status=502,
+        )
     return result
 
 
 def _broker_proxy_url(proxy_path):
     """Add the ephemeral broker token as URL basic-auth userinfo for pip/Git."""
     if not isinstance(proxy_path, str) or not proxy_path.startswith("/v1/proxy/"):
-        raise ToolError("egress broker returned an invalid proxy path", code="broker_protocol", status=502)
-    parsed = urllib.parse.urlsplit(BROKER_URL)
-    token = urllib.parse.quote(BROKER_TOKEN, safe="")
+        raise ToolError(
+            "egress broker returned an invalid proxy path",
+            code="broker_protocol",
+            status=502,
+        )
+    parsed = urllib_parse.urlsplit(BROKER_URL)
+    token = urllib_parse.quote(BROKER_TOKEN, safe="")
     host = f"{parsed.hostname}:{parsed.port}"
-    return urllib.parse.urlunsplit((parsed.scheme, f"{token}:x@{host}", proxy_path, "", ""))
+    _return_value = urllib_parse.urlunsplit(
+        (parsed.scheme, f"{token}:x@{host}", proxy_path, "", "")
+    )
+    return _return_value
 
 
 def _resolve_broker_url(external_url, operation):
-    result = _broker_request("/v1/resolve", {"url": external_url, "operation": operation})
-    return _broker_proxy_url(result.get("proxyPath"))
+    result = _broker_request(
+        "/v1/resolve", {"url": external_url, "operation": operation}
+    )
+    _return_value = _broker_proxy_url(result.get("proxyPath", False))
+    return _return_value
 
 
 @tool
@@ -321,7 +383,11 @@ def file_write(path: str, content: str):
     target = resolve_path(path)
     with FILE_LOCK:
         _atomic_write_text(target, content)
-    return {"path": str(target.relative_to(WORKSPACE)), "bytesWritten": len(content.encode("utf-8"))}
+    _return_value = {
+        "path": str(target.relative_to(WORKSPACE)),
+        "bytesWritten": len(content.encode("utf-8")),
+    }
+    return _return_value
 
 
 @tool
@@ -334,16 +400,30 @@ def file_patch(path: str, patches: list):
         content = target.read_text(encoding="utf-8")
         for patch in patches:
             if not isinstance(patch, dict) or "old" not in patch or "new" not in patch:
-                raise ToolError("each patch requires old and new strings", code="bad_arguments", status=400)
-            old = patch["old"]
-            new = patch["new"]
+                raise ToolError(
+                    "each patch requires old and new strings",
+                    code="bad_arguments",
+                    status=400,
+                )
+            old = patch.get("old", False)
+            new = patch.get("new", False)
             if not isinstance(old, str) or not isinstance(new, str) or not old:
-                raise ToolError("patch old/new values must be strings and old must not be empty", code="bad_arguments", status=400)
+                raise ToolError(
+                    "patch old/new values must be strings and old must not be empty",
+                    code="bad_arguments",
+                    status=400,
+                )
             if old not in content:
-                raise ToolError(f"Not found: {old[:50]}...", code="patch_target_missing")
+                raise ToolError(
+                    f"Not found: {old[:50]}...", code="patch_target_missing"
+                )
             content = content.replace(old, new, 1)
         _atomic_write_text(target, content)
-    return {"path": str(target.relative_to(WORKSPACE)), "patchesApplied": len(patches)}
+    _return_value = {
+        "path": str(target.relative_to(WORKSPACE)),
+        "patchesApplied": len(patches),
+    }
+    return _return_value
 
 
 @tool
@@ -352,11 +432,14 @@ def file_delete(path: str):
     target = resolve_path(path)
     with FILE_LOCK:
         target.unlink(missing_ok=False)
-    return {"path": str(target.relative_to(WORKSPACE)), "deleted": True}
+    _return_value = {"path": str(target.relative_to(WORKSPACE)), "deleted": True}
+    return _return_value
 
 
 @tool
-def file_list(path: str = ".", depth: int = 2, max_results: int = DEFAULT_MAX_LIST_RESULTS):
+def file_list(
+    path: str = ".", depth: int = 2, max_results: int = DEFAULT_MAX_LIST_RESULTS
+):
     """List a bounded number of files beneath a workspace directory."""
     target = resolve_path(path)
     depth = max(0, min(int(depth), 64))
@@ -374,46 +457,52 @@ def file_list(path: str = ".", depth: int = 2, max_results: int = DEFAULT_MAX_LI
         if len(files) >= max_results:
             truncated = True
             break
-    return {"files": sorted(files), "truncated": truncated}
+    _return_value = {"files": sorted(files), "truncated": truncated}
+    return _return_value
 
 
 @tool
-def file_search(pattern: str, path: str = ".", max_results: int = DEFAULT_MAX_SEARCH_RESULTS):
+def file_search(
+    pattern: str, path: str = ".", max_results: int = DEFAULT_MAX_SEARCH_RESULTS
+):
     """Search files with ripgrep and return bounded structured matches."""
     target = resolve_path(path)
     max_results = max(1, min(int(max_results), DEFAULT_MAX_SEARCH_RESULTS))
     result = _run_process(["rg", "--json", pattern, str(target)], timeout=30)
-    if result["exitCode"] not in (0, 1, -2):
+    if result.get("exitCode", ()) not in (0, 1, -2):
         _require_process_success(result, "file search")
     matches = []
-    for line in result["stdout"].splitlines():
+    for line in result.get("stdout", "").splitlines():
         if not line:
             continue
         try:
-            data = json.loads(line)
+            data = json_loads(line)
         except ValueError:
-            if result["outputLimited"]:
+            if result.get("outputLimited", False):
                 break
             raise
-        if data.get("type") != "match":
+        if data.get("type", "") != "match":
             continue
         match = data.get("data", {})
         matches.append(
             {
-                "file": str(Path(match["path"]["text"]).relative_to(WORKSPACE)),
-                "line": match["line_number"],
-                "content": match["lines"]["text"].strip(),
+                "file": str(
+                    Path(match.get("path", {}).get("text", "")).relative_to(WORKSPACE)
+                ),
+                "line": match.get("line_number", False),
+                "content": match.get("lines", {}).get("text", "").strip(),
             }
         )
         if len(matches) >= max_results:
             break
-    return {
+    _return_value = {
         "matches": matches,
-        "truncated": len(matches) >= max_results or result["outputLimited"],
+        "truncated": len(matches) >= max_results or result.get("outputLimited", False),
     }
+    return _return_value
 
 
-PACKAGE_PATTERN = re.compile(r"^[a-zA-Z0-9_.-]+([=<>!~\[\]][a-zA-Z0-9._,<>=!~\[\]]*)?$")
+PACKAGE_PATTERN = re_compile(r"^[a-zA-Z0-9_.-]+([=<>!~\[\]][a-zA-Z0-9._,<>=!~\[\]]*)?$")
 
 
 @tool
@@ -421,34 +510,55 @@ def pip_install(packages: list):
     """Install packages when a controlled egress path is enabled."""
     _require_network("pip_install")
     if not isinstance(packages, list) or not packages:
-        raise ToolError("packages must be a non-empty list", code="bad_arguments", status=400)
+        raise ToolError(
+            "packages must be a non-empty list", code="bad_arguments", status=400
+        )
     for package in packages:
         if not isinstance(package, str) or not PACKAGE_PATTERN.fullmatch(package):
-            raise ToolError(f"Invalid package: {package}", code="bad_arguments", status=400)
+            raise ToolError(
+                f"Invalid package: {package}", code="bad_arguments", status=400
+            )
     command = ["pip", "install", "--no-cache-dir"]
     if EGRESS_POLICY == "broker":
-        index_path = f"/v1/proxy/{urllib.parse.quote(BROKER_PACKAGE_DESTINATION, safe='')}/simple/"
+        index_path = f"/v1/proxy/{urllib_parse.quote(BROKER_PACKAGE_DESTINATION, safe='')}/simple/"
         index_url = _broker_proxy_url(index_path)
-        broker_host = urllib.parse.urlsplit(BROKER_URL).hostname
-        command.extend(["--index-url", index_url, "--trusted-host", broker_host, "--disable-pip-version-check"])
-    result = _redact_broker_token(_run_process([*command, *packages], timeout=MAX_TOOL_TIMEOUT))
-    return _require_process_success(
+        broker_host = urllib_parse.urlsplit(BROKER_URL).hostname
+        command.extend(
+            [
+                "--index-url",
+                index_url,
+                "--trusted-host",
+                broker_host,
+                "--disable-pip-version-check",
+            ]
+        )
+    result = _redact_broker_token(
+        _run_process([*command, *packages], timeout=MAX_TOOL_TIMEOUT)
+    )
+    _return_value = _require_process_success(
         result,
         "pip install",
     )
+    return _return_value
 
 
 @tool
 def pip_uninstall(packages: list):
     """Uninstall packages from the sandbox virtual environment."""
     if not isinstance(packages, list) or not packages:
-        raise ToolError("packages must be a non-empty list", code="bad_arguments", status=400)
-    if any(not isinstance(package, str) or not re.fullmatch(r"[a-zA-Z0-9_.-]+", package) for package in packages):
+        raise ToolError(
+            "packages must be a non-empty list", code="bad_arguments", status=400
+        )
+    if any(
+        not isinstance(package, str) or not re_fullmatch(r"[a-zA-Z0-9_.-]+", package)
+        for package in packages
+    ):
         raise ToolError("Invalid package name", code="bad_arguments", status=400)
-    return _require_process_success(
+    _return_value = _require_process_success(
         _run_process(["pip", "uninstall", "-y", *packages], timeout=60),
         "pip uninstall",
     )
+    return _return_value
 
 
 @tool
@@ -458,35 +568,51 @@ def pip_list():
         _run_process(["pip", "list", "--format=json"], timeout=30),
         "pip list",
     )
-    return json.loads(result["stdout"])
+    _return_value = json_loads(result.get("stdout", False))
+    return _return_value
 
 
 @tool
 def pip_freeze():
     """Return installed packages in requirements-file form."""
-    result = _require_process_success(_run_process(["pip", "freeze"], timeout=30), "pip freeze")
-    return result["stdout"]
+    result = _require_process_success(
+        _run_process(["pip", "freeze"], timeout=30), "pip freeze"
+    )
+    _return_value = result.get("stdout", "")
+    return _return_value
 
 
 @tool
-def run_command(command: str, timeout: float = 60):
+def run_command(command: str, timeout: float = 60.0):
     """Execute a bounded shell command in the workspace."""
     if not isinstance(command, str) or not command.strip():
-        raise ToolError("command must be a non-empty string", code="bad_arguments", status=400)
-    return _run_process(command, shell=True, timeout=timeout)
+        raise ToolError(
+            "command must be a non-empty string", code="bad_arguments", status=400
+        )
+    _return_value = _run_process(command, shell=True, timeout=timeout)
+    return _return_value
 
 
 @tool
-def run_python(script: str, timeout: float = 60):
+def run_python(script: str, timeout: float = 60.0):
     """Execute bounded Python code in the workspace."""
     if not isinstance(script, str) or not script.strip():
-        raise ToolError("script must be a non-empty string", code="bad_arguments", status=400)
-    return _run_process([sys.executable, "-c", script], timeout=timeout)
+        raise ToolError(
+            "script must be a non-empty string", code="bad_arguments", status=400
+        )
+    _return_value = _run_process([sys_executable, "-c", script], timeout=timeout)
+    return _return_value
 
 
 def _validate_git_atom(value, label):
-    if not isinstance(value, str) or not value or value.startswith("-") or "\x00" in value:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value.startswith("-")
+        or "\x00" in value
+    ):
         raise ToolError(f"Invalid Git {label}", code="bad_arguments", status=400)
+    return False
 
 
 @tool
@@ -500,7 +626,7 @@ def git_init(branch: str = "main"):
     output = {
         "branch": branch,
         "initialized": True,
-        "message": result["stdout"].strip(),
+        "message": result.get("stdout", "").strip(),
     }
     return output
 
@@ -511,7 +637,9 @@ def git_clone(repo_url: str, branch: str = "main"):
     _require_network("git_clone")
     _validate_git_atom(repo_url, "repository URL")
     _validate_git_atom(branch, "branch")
-    clone_url = _resolve_broker_url(repo_url, "git") if EGRESS_POLICY == "broker" else repo_url
+    clone_url = (
+        _resolve_broker_url(repo_url, "git") if EGRESS_POLICY == "broker" else repo_url
+    )
     staging = WORKSPACE / f".tapestry-clone-{uuid4().hex}"
     with FILE_LOCK:
         try:
@@ -522,18 +650,21 @@ def git_clone(repo_url: str, branch: str = "main"):
             result = _redact_broker_token(result)
             _require_process_success(result, "git clone")
             _require_process_success(
-                _run_git(["-C", str(staging), "remote", "set-url", "origin", repo_url], timeout=30),
+                _run_git(
+                    ["-C", str(staging), "remote", "set-url", "origin", repo_url],
+                    timeout=30,
+                ),
                 "git remote sanitization",
             )
             for item in list(WORKSPACE.iterdir()):
                 if item == staging:
                     continue
-                shutil.rmtree(item) if item.is_dir() else item.unlink()
+                shutil_rmtree(item) if item.is_dir() else item.unlink()
             for item in list(staging.iterdir()):
-                shutil.move(str(item), WORKSPACE / item.name)
+                shutil_move(str(item), WORKSPACE / item.name)
             staging.rmdir()
         except Exception:
-            shutil.rmtree(staging, ignore_errors=True)
+            shutil_rmtree(staging, ignore_errors=True)
             raise
     return {"repository": repo_url, "branch": branch, "cloned": True}
 
@@ -549,10 +680,11 @@ def git_status():
         _run_git(["status", "--porcelain"], timeout=30),
         "git status",
     )
-    return {
-        "branch": branch["stdout"].strip(),
-        "changes": [line for line in status["stdout"].splitlines() if line],
+    _return_value = {
+        "branch": branch.get("stdout", "").strip(),
+        "changes": [line for line in status.get("stdout", "").splitlines() if line],
     }
+    return _return_value
 
 
 @tool
@@ -560,25 +692,29 @@ def git_diff(staged: bool = False):
     """Return a bounded repository diff."""
     command = ["git", "diff", "--staged"] if staged else ["git", "diff"]
     result = _run_git(command[1:], timeout=30)
-    if not result["ok"] and not result["outputLimited"]:
+    if not result.get("ok", False) and not result.get("outputLimited", False):
         _require_process_success(result, "git diff")
-    return {
-        "diff": result["stdout"],
-        "truncated": result["outputLimited"],
+    _return_value = {
+        "diff": result.get("stdout", False),
+        "truncated": result.get("outputLimited", False),
     }
+    return _return_value
 
 
 @tool
 def git_commit(message: str):
     """Stage all workspace changes and commit them locally."""
     if not isinstance(message, str) or not message.strip():
-        raise ToolError("message must be a non-empty string", code="bad_arguments", status=400)
+        raise ToolError(
+            "message must be a non-empty string", code="bad_arguments", status=400
+        )
     _require_process_success(_run_git(["add", "-A"], timeout=30), "git add")
     result = _require_process_success(
         _run_git(["commit", "-m", message], timeout=60),
         "git commit",
     )
-    return result["stdout"]
+    _return_value = result.get("stdout", "")
+    return _return_value
 
 
 @tool
@@ -591,16 +727,22 @@ def git_push(remote: str = "origin", branch: str = ""):
             _run_git(["branch", "--show-current"], timeout=30),
             "git branch",
         )
-        branch = current["stdout"].strip()
+        branch = current.get("stdout", "").strip()
     _validate_git_atom(branch, "branch")
     push_target = remote
     if EGRESS_POLICY == "broker":
-        remote_url = _require_process_success(
-            _run_git(["remote", "get-url", remote], timeout=30),
-            "git remote lookup",
-        )["stdout"].strip()
+        remote_url = (
+            _require_process_success(
+                _run_git(["remote", "get-url", remote], timeout=30),
+                "git remote lookup",
+            )
+            .get("stdout", "")
+            .strip()
+        )
         push_target = _resolve_broker_url(remote_url, "git")
-    result = _redact_broker_token(_run_git(["push", "--", push_target, branch], timeout=MAX_TOOL_TIMEOUT))
+    result = _redact_broker_token(
+        _run_git(["push", "--", push_target, branch], timeout=MAX_TOOL_TIMEOUT)
+    )
     _require_process_success(result, "git push")
     return {"remote": remote, "branch": branch, "pushed": True}
 
@@ -611,7 +753,9 @@ def git_log(limit: int = 20):
     try:
         requested_limit = int(limit)
     except (TypeError, ValueError) as err:
-        raise ToolError("limit must be an integer", code="bad_arguments", status=400) from err
+        raise ToolError(
+            "limit must be an integer", code="bad_arguments", status=400
+        ) from err
     if requested_limit < 1:
         raise ToolError("limit must be positive", code="bad_arguments", status=400)
     bounded_limit = min(requested_limit, DEFAULT_MAX_GIT_LOG_RESULTS)
@@ -624,7 +768,7 @@ def git_log(limit: int = 20):
         timeout=30,
     )
     _require_process_success(result, "git log")
-    lines = result["stdout"].splitlines()
+    lines = result.get("stdout", "").splitlines()
     truncated = len(lines) > bounded_limit
     commits = []
     for line in lines[:bounded_limit]:
@@ -651,7 +795,7 @@ def workspace_tree(depth: int = 3, max_results: int = 100):
 @tool
 def python_version():
     """Get the Python version string."""
-    return sys.version
+    return sys_version
 
 
 def _json_type(annotation):
@@ -664,21 +808,24 @@ def _json_type(annotation):
         return schema
     if origin is dict or annotation is dict:
         return {"type": "object"}
-    return {
+    _return_value = {
         str: "string",
         int: "integer",
         float: "number",
         bool: "boolean",
     }.get(annotation, "any")
+    return _return_value
 
 
 def _camel_case(name):
     first, *rest = name.split("_")
-    return first + "".join(part.capitalize() for part in rest)
+    _return_value = first + "".join(part.capitalize() for part in rest)
+    return _return_value
 
 
 def _snake_case(name):
-    return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+    _return_value = re_sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+    return _return_value
 
 
 def build_manifest():
@@ -686,8 +833,8 @@ def build_manifest():
     tools = []
     for name, fn in TOOLS.items():
         parameters = []
-        for param_name, param in inspect.signature(fn).parameters.items():
-            required = param.default is inspect.Parameter.empty
+        for param_name, param in inspect_signature(fn).parameters.items():
+            required = param.default is inspect_Parameter.empty
             type_schema = _json_type(param.annotation)
             if isinstance(type_schema, str):
                 type_schema = {"type": type_schema}
@@ -717,15 +864,15 @@ def build_manifest():
 def build_readiness_report():
     """Return dependency, workspace, and capacity readiness information."""
     required_tools = ("git", "pip", "rg")
-    tools = {name: bool(shutil.which(name)) for name in required_tools}
+    tools = {name: bool(shutil_which(name)) for name in required_tools}
     workspace_exists = WORKSPACE.is_dir()
     workspace_writable = False
     workspace_free_bytes = 0
     if workspace_exists:
         try:
-            with tempfile.NamedTemporaryFile(dir=WORKSPACE):
+            with tempfile_NamedTemporaryFile(dir=WORKSPACE):
                 workspace_writable = True
-            workspace_free_bytes = shutil.disk_usage(WORKSPACE).free
+            workspace_free_bytes = shutil_disk_usage(WORKSPACE).free
         except OSError:
             workspace_writable = False
     dependencies_ready = all(tools.values())
@@ -753,6 +900,7 @@ class ToolHTTPServer(ThreadingHTTPServer):
         TCPServer.server_bind(self)
         self.server_name = self.server_address[0]
         self.server_port = self.server_address[1]
+        return False
 
     def __init__(
         self,
@@ -769,7 +917,7 @@ class ToolHTTPServer(ThreadingHTTPServer):
         self.auth_token = auth_token
         self.max_request_bytes = max_request_bytes
         self.max_response_bytes = max_response_bytes
-        self.request_slots = threading.BoundedSemaphore(max_concurrent_requests)
+        self.request_slots = threading_BoundedSemaphore(max_concurrent_requests)
         self.request_read_timeout = request_read_timeout
 
 
@@ -781,9 +929,10 @@ class ToolHandler(BaseHTTPRequestHandler):
     def setup(self):
         super().setup()
         self.connection.settimeout(self.server.request_read_timeout)
+        return False
 
     def send_json(self, status, payload, *, request_id=""):
-        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        body = json_dumps(payload, separators=(",", ":")).encode("utf-8")
         response_status = status
         if len(body) > self.server.max_response_bytes:
             response_status = 413
@@ -794,7 +943,7 @@ class ToolHandler(BaseHTTPRequestHandler):
                 },
                 "requestId": request_id,
             }
-            body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            body = json_dumps(payload, separators=(",", ":")).encode("utf-8")
         self.send_response(response_status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -817,93 +966,153 @@ class ToolHandler(BaseHTTPRequestHandler):
     def authorized(self):
         header = self.headers.get("Authorization", "")
         expected = f"Bearer {self.server.auth_token}"
-        return hmac.compare_digest(header, expected)
+        _return_value = hmac_compare_digest(header, expected)
+        return _return_value
 
     def require_authorized(self, request_id):
         if self.authorized():
             return True
-        self.send_error_json(401, "unauthorized", "A valid sandbox session token is required", request_id=request_id)
+        self.send_error_json(
+            401,
+            "unauthorized",
+            "A valid sandbox session token is required",
+            request_id=request_id,
+        )
         return False
 
     def request_id(self):
         supplied = self.headers.get("X-Tapestry-Request-ID", "").strip()
-        if supplied and len(supplied) <= 128 and re.fullmatch(r"[A-Za-z0-9._:-]+", supplied):
+        if (
+            supplied
+            and len(supplied) <= 128
+            and re_fullmatch(r"[A-Za-z0-9._:-]+", supplied)
+        ):
             return supplied
         return uuid4().hex
 
     def do_GET(self):
         request_id = self.request_id()
         if not self.require_authorized(request_id):
-            return
+            return False
         if self.path == "/health":
             payload = build_readiness_report()
-            payload["python"] = sys.version
+            payload["python"] = sys_version
             payload["apiVersion"] = API_VERSION
             payload["egressPolicy"] = EGRESS_POLICY
             payload["requestId"] = request_id
-            status = 200 if payload["status"] == "healthy" else 503
+            status = 200 if payload.get("status", "") == "healthy" else 503
             self.send_json(status, payload, request_id=request_id)
         elif self.path == "/tools":
             payload = build_manifest()
             payload["requestId"] = request_id
             self.send_json(200, payload, request_id=request_id)
         else:
-            self.send_error_json(404, "not_found", f"no such path: {self.path}", request_id=request_id)
+            self.send_error_json(
+                404, "not_found", f"no such path: {self.path}", request_id=request_id
+            )
+        return False
 
     def read_arguments(self, request_id):
-        if self.headers.get("Transfer-Encoding"):
-            raise ToolError("Transfer-Encoding is not supported", code="unsupported_transfer_encoding", status=400)
+        if self.headers.get("Transfer-Encoding", False):
+            raise ToolError(
+                "Transfer-Encoding is not supported",
+                code="unsupported_transfer_encoding",
+                status=400,
+            )
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError as err:
-            raise ToolError("Content-Length must be an integer", code="invalid_content_length", status=400) from err
+            raise ToolError(
+                "Content-Length must be an integer",
+                code="invalid_content_length",
+                status=400,
+            ) from err
         if length < 0:
-            raise ToolError("Content-Length must not be negative", code="invalid_content_length", status=400)
+            raise ToolError(
+                "Content-Length must not be negative",
+                code="invalid_content_length",
+                status=400,
+            )
         if length > self.server.max_request_bytes:
-            raise ToolError("Request body exceeds the configured limit", code="request_too_large", status=413)
+            raise ToolError(
+                "Request body exceeds the configured limit",
+                code="request_too_large",
+                status=413,
+            )
         if length and self.headers.get_content_type() != "application/json":
-            raise ToolError("Content-Type must be application/json", code="unsupported_media_type", status=415)
+            raise ToolError(
+                "Content-Type must be application/json",
+                code="unsupported_media_type",
+                status=415,
+            )
         raw = self.rfile.read(length) if length else b""
         try:
-            arguments = json.loads(raw) if raw else {}
+            arguments = json_loads(raw) if raw else {}
         except (UnicodeDecodeError, ValueError) as err:
-            raise ToolError(f"invalid JSON body: {err}", code="invalid_json", status=400) from err
+            raise ToolError(
+                f"invalid JSON body: {err}", code="invalid_json", status=400
+            ) from err
         if not isinstance(arguments, dict):
-            raise ToolError("request body must be a JSON object of arguments", code="bad_arguments", status=400)
-        return {_snake_case(key): value for key, value in arguments.items()}
+            raise ToolError(
+                "request body must be a JSON object of arguments",
+                code="bad_arguments",
+                status=400,
+            )
+        _return_value = {_snake_case(key): value for key, value in arguments.items()}
+        return _return_value
 
     def do_POST(self):
         request_id = self.request_id()
         if not self.require_authorized(request_id):
-            return
+            return False
         if not self.path.startswith("/tools/"):
-            self.send_error_json(404, "not_found", f"no such path: {self.path}", request_id=request_id)
-            return
+            self.send_error_json(
+                404, "not_found", f"no such path: {self.path}", request_id=request_id
+            )
+            return False
         name = self.path[len("/tools/") :]
-        fn = TOOLS.get(name)
-        if fn is None:
-            self.send_error_json(404, "unknown_tool", f"no such tool: {name}", request_id=request_id)
-            return
+        fn = TOOLS.get(name, False)
+        if fn is False:
+            self.send_error_json(
+                404, "unknown_tool", f"no such tool: {name}", request_id=request_id
+            )
+            return False
         if not self.server.request_slots.acquire(blocking=False):
-            self.send_error_json(429, "busy", "sandbox tool concurrency limit reached", request_id=request_id)
-            return
+            self.send_error_json(
+                429,
+                "busy",
+                "sandbox tool concurrency limit reached",
+                request_id=request_id,
+            )
+            return False
 
-        started = time.monotonic()
+        started = time_monotonic()
         status = 200
         try:
             arguments = self.read_arguments(request_id)
             result = fn(**arguments)
-            status = self.send_json(200, {"result": result, "requestId": request_id}, request_id=request_id)
+            status = self.send_json(
+                200, {"result": result, "requestId": request_id}, request_id=request_id
+            )
         except ToolError as err:
             status = err.status
             self.send_error_json(err.status, err.code, err, request_id=request_id)
         except TypeError as err:
             status = 400
-            self.send_error_json(400, "bad_arguments", f"bad arguments for {name}: {err}", request_id=request_id)
+            self.send_error_json(
+                400,
+                "bad_arguments",
+                f"bad arguments for {name}: {err}",
+                request_id=request_id,
+            )
         except Exception:
             status = 500
-            LOGGER.exception("Unhandled tool error request_id=%s tool=%s", request_id, name)
-            self.send_error_json(500, "internal_error", "tool execution failed", request_id=request_id)
+            LOGGER.exception(
+                "Unhandled tool error request_id=%s tool=%s", request_id, name
+            )
+            self.send_error_json(
+                500, "internal_error", "tool execution failed", request_id=request_id
+            )
         finally:
             self.server.request_slots.release()
             LOGGER.info(
@@ -911,36 +1120,60 @@ class ToolHandler(BaseHTTPRequestHandler):
                 request_id,
                 name,
                 status,
-                (time.monotonic() - started) * 1000,
+                (time_monotonic() - started) * 1000,
             )
+        return False
 
     def log_message(self, format, *args):
-        return
+        return False
 
 
 def parse_args(argv=COMMAND_LINE_ARGUMENTS):
     """Parse explicit server settings supplied by the container manager."""
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse_ArgumentParser(description=__doc__)
     parser.add_argument("--workspace", type=Path, default=DEFAULT_WORKSPACE)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--auth-token", required=True)
-    parser.add_argument("--egress-policy", choices=("deny", "broker", "unrestricted"), default="deny")
-    parser.add_argument("--max-request-bytes", type=int, default=DEFAULT_MAX_REQUEST_BYTES)
-    parser.add_argument("--max-output-bytes", type=int, default=DEFAULT_MAX_OUTPUT_BYTES)
+    parser.add_argument(
+        "--egress-policy", choices=("deny", "broker", "unrestricted"), default="deny"
+    )
+    parser.add_argument(
+        "--max-request-bytes", type=int, default=DEFAULT_MAX_REQUEST_BYTES
+    )
+    parser.add_argument(
+        "--max-output-bytes", type=int, default=DEFAULT_MAX_OUTPUT_BYTES
+    )
     parser.add_argument("--max-file-bytes", type=int, default=DEFAULT_MAX_FILE_BYTES)
-    parser.add_argument("--max-response-bytes", type=int, default=DEFAULT_MAX_RESPONSE_BYTES)
-    parser.add_argument("--max-concurrent-requests", type=int, default=DEFAULT_MAX_CONCURRENT_REQUESTS)
-    parser.add_argument("--max-tool-timeout", type=int, default=DEFAULT_MAX_TOOL_TIMEOUT)
-    parser.add_argument("--request-read-timeout", type=float, default=DEFAULT_REQUEST_READ_TIMEOUT)
+    parser.add_argument(
+        "--max-response-bytes", type=int, default=DEFAULT_MAX_RESPONSE_BYTES
+    )
+    parser.add_argument(
+        "--max-concurrent-requests", type=int, default=DEFAULT_MAX_CONCURRENT_REQUESTS
+    )
+    parser.add_argument(
+        "--max-tool-timeout", type=int, default=DEFAULT_MAX_TOOL_TIMEOUT
+    )
+    parser.add_argument(
+        "--request-read-timeout", type=float, default=DEFAULT_REQUEST_READ_TIMEOUT
+    )
     parser.add_argument("--broker-url", default="")
     parser.add_argument("--broker-token", default="")
     parser.add_argument("--broker-package-destination", default="pypi")
-    return parser.parse_args(argv)
+    _return_value = parser.parse_args(argv)
+    return _return_value
 
 
 def configure(args):
     """Apply validated process-wide settings before accepting requests."""
-    global WORKSPACE, EGRESS_POLICY, MAX_OUTPUT_BYTES, MAX_FILE_BYTES, MAX_TOOL_TIMEOUT, BROKER_URL, BROKER_TOKEN, BROKER_PACKAGE_DESTINATION
+    global \
+        WORKSPACE, \
+        EGRESS_POLICY, \
+        MAX_OUTPUT_BYTES, \
+        MAX_FILE_BYTES, \
+        MAX_TOOL_TIMEOUT, \
+        BROKER_URL, \
+        BROKER_TOKEN, \
+        BROKER_PACKAGE_DESTINATION
     if len(args.auth_token) < 32:
         raise ValueError("auth token must be at least 32 characters")
     if not 1 <= args.port <= 65535:
@@ -956,16 +1189,26 @@ def configure(args):
         if getattr(args, name) < 1:
             raise ValueError(f"{name} must be positive")
     if args.max_response_bytes < MIN_MAX_RESPONSE_BYTES:
-        raise ValueError(f"max_response_bytes must be at least {MIN_MAX_RESPONSE_BYTES}")
+        raise ValueError(
+            f"max_response_bytes must be at least {MIN_MAX_RESPONSE_BYTES}"
+        )
     if args.request_read_timeout <= 0:
         raise ValueError("request_read_timeout must be positive")
     if args.egress_policy == "broker":
-        parsed_broker = urllib.parse.urlsplit(args.broker_url)
-        if parsed_broker.scheme != "http" or not parsed_broker.hostname or parsed_broker.port is None:
-            raise ValueError("broker policy requires an explicit HTTP broker URL and port")
+        parsed_broker = urllib_parse.urlsplit(args.broker_url)
+        if (
+            parsed_broker.scheme != "http"
+            or not parsed_broker.hostname
+            or parsed_broker.port is None
+        ):
+            raise ValueError(
+                "broker policy requires an explicit HTTP broker URL and port"
+            )
         if len(args.broker_token) < 32:
-            raise ValueError("broker policy requires a broker token of at least 32 characters")
-        if not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", args.broker_package_destination):
+            raise ValueError(
+                "broker policy requires a broker token of at least 32 characters"
+            )
+        if not re_fullmatch(r"[a-z][a-z0-9_-]{0,63}", args.broker_package_destination):
             raise ValueError("broker package destination is invalid")
     elif args.broker_url or args.broker_token:
         raise ValueError("broker URL and token require egress_policy=broker")
@@ -978,11 +1221,14 @@ def configure(args):
     BROKER_URL = args.broker_url
     BROKER_TOKEN = args.broker_token
     BROKER_PACKAGE_DESTINATION = args.broker_package_destination
+    return False
 
 
 def main(argv=COMMAND_LINE_ARGUMENTS):
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    selected_arguments = sys.argv[1:] if argv is COMMAND_LINE_ARGUMENTS else argv
+    logging_basicConfig(
+        level=logging_INFO, format="%(asctime)s %(levelname)s %(message)s"
+    )
+    selected_arguments = sys_argv[1:] if argv is COMMAND_LINE_ARGUMENTS else argv
     args = parse_args(selected_arguments)
     configure(args)
     server = ToolHTTPServer(
@@ -995,6 +1241,7 @@ def main(argv=COMMAND_LINE_ARGUMENTS):
         request_read_timeout=args.request_read_timeout,
     )
     server.serve_forever()
+    return False
 
 
 if __name__ == "__main__":

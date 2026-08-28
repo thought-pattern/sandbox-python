@@ -1,8 +1,8 @@
 """Make the submodule importable so tests can import manager and server directly."""
 
-import sys
 from pathlib import Path
+from sys import path as sys_path
 
 root = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(root))
-sys.path.insert(0, str(root / "container"))
+sys_path.insert(0, str(root))
+sys_path.insert(0, str(root / "container"))
