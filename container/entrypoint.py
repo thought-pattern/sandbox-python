@@ -23,31 +23,23 @@ COMMAND_LINE_ARGUMENTS = []
 
 def parse_policy(argv):
     parser = argparse_ArgumentParser(add_help=False)
-    parser.add_argument(
-        "--egress-policy", choices=("deny", "broker", "unrestricted"), default="deny"
-    )
+    parser.add_argument("--egress-policy", choices=("deny", "broker", "unrestricted"), default="deny")
     parser.add_argument("--broker-url", default="")
-    _return_value = parser.parse_known_args(argv)[0]
-    return _return_value
+    computed_return_value = parser.parse_known_args(argv)[0]
+    return computed_return_value
 
 
 def run_firewall(binary, arguments):
     result = subprocess_run([binary, *arguments], capture_output=True, text=True)
     if result.returncode != 0:
-        raise RuntimeError(
-            f"{binary} {' '.join(arguments)} failed: {result.stderr.strip()}"
-        )
+        raise RuntimeError(f"{binary} {' '.join(arguments)} failed: {result.stderr.strip()}")
     return False
 
 
 def enforce_egress_policy(broker_url=""):
     """Allow loopback, replies, and optionally one broker; reject other egress."""
-    # Apple's container VM currently exposes the legacy xtables kernel API but
-    # not nf_tables. Debian's unqualified iptables command selects nft, so
-    # prefer the legacy frontend and retain the generic names as a fallback for
-    # Docker/podman hosts whose images omit the alternatives.
-    ipv4 = shutil_which("iptables-legacy") or shutil_which("iptables")
-    ipv6 = shutil_which("ip6tables-legacy") or shutil_which("ip6tables")
+    ipv4 = shutil_which("iptables")
+    ipv6 = shutil_which("ip6tables")
     if not ipv4:
         raise RuntimeError("deny egress policy requires iptables")
 
@@ -56,9 +48,7 @@ def enforce_egress_policy(broker_url=""):
     if broker_url:
         parsed = urllib_parse.urlsplit(broker_url)
         if parsed.scheme != "http" or not parsed.hostname or parsed.port is None:
-            raise RuntimeError(
-                "broker policy requires an explicit http broker URL and port"
-            )
+            raise RuntimeError("broker policy requires an explicit http broker URL and port")
         try:
             broker_host = str(ipaddress_IPv4Address(parsed.hostname))
         except ipaddress_AddressValueError as err:
@@ -108,37 +98,19 @@ def enforce_egress_policy(broker_url=""):
 
     interfaces = Path("/proc/net/if_inet6")
     has_external_ipv6 = interfaces.exists() and any(
-        line.split()[-1] != "lo"
-        for line in interfaces.read_text().splitlines()
-        if line.split()
+        line.split()[-1] != "lo" for line in interfaces.read_text().splitlines() if line.split()
     )
     if not has_external_ipv6:
         return False
-    if ipv6:
-        try:
-            apply_rules(ipv6)
-            return False
-        except RuntimeError:
-            # Apple's current guest kernel assigns link-local IPv6 but omits
-            # the ip6tables filter table. Disable IPv6 at the kernel boundary
-            # rather than silently leaving an unfiltered route.
-            pass
-    Path("/proc/sys/net/ipv6/conf/all/disable_ipv6").write_text("1")
-    Path("/proc/sys/net/ipv6/conf/default/disable_ipv6").write_text("1")
-    if interfaces.exists() and any(
-        line.split()[-1] != "lo"
-        for line in interfaces.read_text().splitlines()
-        if line.split()
-    ):
-        raise RuntimeError("could not enforce deny policy for IPv6")
+    if not ipv6:
+        raise RuntimeError("deny egress policy requires ip6tables when IPv6 is active")
+    apply_rules(ipv6)
     return False
 
 
 def drop_privileges(username="sandbox"):
     if os_geteuid() != 0:
-        raise RuntimeError(
-            "sandbox entrypoint must start as root so it can install the network boundary"
-        )
+        raise RuntimeError("sandbox entrypoint must start as root so it can install the network boundary")
     account = pwd_getpwnam(username)
     os_setgroups([])
     os_setgid(account.pw_gid)

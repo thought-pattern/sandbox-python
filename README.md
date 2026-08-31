@@ -11,9 +11,9 @@ image, tool server, lifecycle manager, and verification suite.
 - The entrypoint installs a deny-by-default IPv4/IPv6 OUTPUT policy while
   privileged, then drops permanently to the non-root `sandbox` user before the
   HTTP server or any tool code starts.
-- CPU, memory, request size, result size, tool concurrency, wall time, and
-  process trees are bounded. Docker and podman also receive a PID limit,
-  capability drop, and `no-new-privileges`.
+- CPU, memory, request size, result size, tool concurrency, wall time, process
+  trees, and process count are bounded. Docker receives a capability drop and
+  `no-new-privileges`.
 - `deny` blocks all new outbound flows. `broker` permits new TCP flows only to
   one explicit broker IPv4 address/port; package and Git crossings are then
   destination-controlled and audited outside the sandbox.
@@ -30,7 +30,6 @@ sandbox-python/
 │   ├── entrypoint.py       # firewall, privilege drop, server exec
 │   ├── requirements.txt    # image dependencies
 │   └── server.py           # authenticated standard-library HTTP server
-├── manager.py              # Apple container/Docker/podman and Fargate lifecycle
 └── tests/                  # boundary, API, lifecycle, and live smoke tests
 ```
 
@@ -39,22 +38,26 @@ sandbox-python/
 Use the manager rather than publishing the image manually:
 
 ```python
-from manager import ContainerConfig, sandbox_session
+from tapestry.workspace.sandbox_manager import ContainerConfig, sandbox_session
 
-config = ContainerConfig(image="python-sandbox:latest")
-with sandbox_session(config, runtime="container"):
+config = ContainerConfig(
+    image="python-sandbox:latest",
+    port=8080,
+    workspace="/workspace",
+    memory_limit="2g",
+    cpu_limit=1.0,
+)
+with sandbox_session(config):
     print(config.base_url)
     # Supply config.auth_token as Authorization: Bearer <token>.
 ```
 
-Build the image with Apple's runtime:
+Build the image with Docker:
 
 ```bash
-container build -t python-sandbox:latest \
+docker build -t python-sandbox:latest \
   -f container/Containerfile container
 ```
-
-`docker` and `podman` are supported by the same manager.
 
 ## HTTP interface
 

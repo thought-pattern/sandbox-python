@@ -2,8 +2,7 @@
 
 **Status:** MVP implementation  
 **Interface:** authenticated HTTP, API version 1.0  
-**Runtimes:** Apple container, Docker, podman; Fargate contract present but not
-production-validated
+**Runtime:** Docker in development
 
 ## Design
 
@@ -33,8 +32,7 @@ other direct traffic remains unavailable.
 3. The HTTP server and tool subprocesses run as the `sandbox` user.
 4. Direct egress is denied before the untrusted tool surface starts.
 5. Request bytes, subprocess output, file reads, serialized responses,
-   concurrency, timeout, CPU, and memory are bounded; Docker/podman additionally
-   bound process count.
+   concurrency, timeout, CPU, memory, and process count are bounded.
 6. Timeouts and output overruns terminate the complete process group.
 7. File writes and patches replace their target atomically.
 8. Cleanup failure is reported; it is not silently described as successful.
@@ -48,9 +46,9 @@ port, loopback bind, per-session token, resource bounds, and egress policy.
 it. If work and cleanup both fail, the original work failure is preserved and
 annotated with the cleanup failure.
 
-Apple's runtime requires whole-number CPU allocations. Docker and podman retain
-fractional CPU limits and add `--cap-drop ALL`, `no-new-privileges`, a PID limit,
-and only the temporary `NET_ADMIN` capability needed by the root entrypoint.
+Docker applies fractional CPU limits, `--cap-drop ALL`,
+`no-new-privileges`, a PID limit, and only the temporary `NET_ADMIN` capability
+needed by the root entrypoint.
 After firewall setup, the entrypoint clears groups and changes permanently to
 the non-root user.
 
@@ -83,6 +81,4 @@ structured startup context without requiring shell parsing.
 The controlled egress broker remains outside this container. The local broker
 provides destination/method policy, broker-held credential headers, request and
 response bounds, redirect validation, and hash-chained SQLite audit records.
-The sandbox receives only a per-session broker token. Fargate broker mode still
-requires private subnets and security groups whose only egress destination is
-the production broker; local MVP completion does not claim that AWS deployment.
+The sandbox receives only a per-session broker token.

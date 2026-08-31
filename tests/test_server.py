@@ -1,6 +1,6 @@
 """Tests for the authenticated sandbox HTTP tool server."""
 
-from importlib import import_module as _import_module
+from importlib import import_module as imported_import_module
 from json import dumps as json_dumps
 from json import loads as json_loads
 from threading import Thread as threading_Thread
@@ -11,7 +11,7 @@ from pytest import fixture as pytest_fixture
 from pytest import mark as pytest_mark
 from pytest import raises as pytest_raises
 
-server = _import_module("server")
+server = imported_import_module("server")
 
 TOKEN = "t" * 43
 NO_PAYLOAD = {}
@@ -30,7 +30,7 @@ def isolated_workspace(tmp_path, monkeypatch):
 def http_server(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "WORKSPACE", tmp_path.resolve())
     monkeypatch.setattr(server, "EGRESS_POLICY", "deny")
-    monkeypatch.setattr(server.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(server, "shutil_which", lambda name: f"/usr/bin/{name}")
     instance = server.ToolHTTPServer(
         ("127.0.0.1", 0),
         server.ToolHandler,
@@ -65,7 +65,6 @@ def request_json(url, *, token=TOKEN, method="GET", payload=NO_PAYLOAD):
 def test_resolve_path_allows_within_workspace():
     target = server.resolve_path("sub/file.py")
     assert target.is_relative_to(server.WORKSPACE)
-    return False
 
 
 @pytest_mark.parametrize("path", ["../etc/passwd", "/etc/passwd"])
@@ -73,7 +72,6 @@ def test_resolve_path_rejects_escape(path):
     with pytest_raises(server.ToolError) as caught:
         server.resolve_path(path)
     assert caught.value.code == "path_escape"
-    return False
 
 
 def test_manifest_is_versioned_typed_and_camel_case():
@@ -81,18 +79,13 @@ def test_manifest_is_versioned_typed_and_camel_case():
     tools = {tool.get("name", ""): tool for tool in manifest.get("tools", [])}
     assert manifest.get("apiVersion", "") == "1.0"
     assert manifest.get("protocol", "") == "tapestry.workspace.http"
-    parameters = {
-        parameter.get("name", ""): parameter
-        for parameter in tools.get("file_list", {}).get("parameters", [])
-    }
+    parameters = {parameter.get("name", ""): parameter for parameter in tools.get("file_list", {}).get("parameters", [])}
     assert parameters.get("maxResults", {}).get("type", "") == "integer"
     assert parameters.get("maxResults", {}).get("required", False) is False
     assert "default" not in {
-        parameter.get("name", ""): parameter
-        for parameter in tools.get("file_read", {}).get("parameters", [])
+        parameter.get("name", ""): parameter for parameter in tools.get("file_read", {}).get("parameters", [])
     }.get("path", "")
     assert {"git_init", "git_log", "workspace_tree"}.issubset(tools)
-    return False
 
 
 def test_tool_round_trip_is_atomic_and_counts_bytes(tmp_path, monkeypatch):
@@ -100,7 +93,6 @@ def test_tool_round_trip_is_atomic_and_counts_bytes(tmp_path, monkeypatch):
     result = server.file_write("notes/todo.txt", "héllo")
     assert result.get("bytesWritten", False) == len("héllo".encode())
     assert server.file_read("notes/todo.txt") == "héllo"
-    return False
 
 
 def test_file_read_rejects_oversized_file(tmp_path, monkeypatch):
@@ -113,14 +105,12 @@ def test_file_read_rejects_oversized_file(tmp_path, monkeypatch):
 
     assert caught.value.code == "file_too_large"
     assert caught.value.status == 413
-    return False
 
 
 def test_http_requires_authentication(http_server):
     with pytest_raises(urllib_error.HTTPError) as caught:
         request_json(f"{http_server}/health", token="")
     assert caught.value.code == 401
-    return False
 
 
 def test_authenticated_health_and_manifest(http_server):
@@ -132,7 +122,6 @@ def test_authenticated_health_and_manifest(http_server):
     assert health.get("checks", {}).get("workspaceWritable", False) is True
     assert all(health.get("checks", {}).get("tools", {}).values())
     assert manifest.get("apiVersion", "") == "1.0"
-    return False
 
 
 def test_readiness_reports_missing_dependency(tmp_path, monkeypatch):
@@ -142,12 +131,11 @@ def test_readiness_reports_missing_dependency(tmp_path, monkeypatch):
         location = "" if name == "rg" else f"/usr/bin/{name}"
         return location
 
-    monkeypatch.setattr(server.shutil, "which", find_tool)
+    monkeypatch.setattr(server, "shutil_which", find_tool)
     report = server.build_readiness_report()
 
     assert report.get("status", "") == "unhealthy"
     assert report.get("checks", {}).get("tools", {}).get("rg", False) is False
-    return False
 
 
 def test_http_tool_accepts_camel_case_arguments(http_server):
@@ -158,7 +146,6 @@ def test_http_tool_accepts_camel_case_arguments(http_server):
     )
     assert status == 200
     assert payload.get("result", {}) == {"files": [], "truncated": False}
-    return False
 
 
 def test_http_rejects_large_request(http_server):
@@ -169,13 +156,12 @@ def test_http_rejects_large_request(http_server):
             payload={"script": "x" * 200},
         )
     assert caught.value.code == 413
-    return False
 
 
 def test_http_rejects_large_response(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "WORKSPACE", tmp_path.resolve())
     monkeypatch.setattr(server, "MAX_FILE_BYTES", 4_096)
-    monkeypatch.setattr(server.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(server, "shutil_which", lambda name: f"/usr/bin/{name}")
     (tmp_path / "large.txt").write_text("x" * 2_000)
     instance = server.ToolHTTPServer(
         ("127.0.0.1", 0),
@@ -202,7 +188,6 @@ def test_http_rejects_large_response(tmp_path, monkeypatch):
         instance.shutdown()
         instance.server_close()
         thread.join(timeout=2)
-    return False
 
 
 def test_process_result_preserves_nonzero_exit():
@@ -210,7 +195,6 @@ def test_process_result_preserves_nonzero_exit():
     assert result.get("ok", False) is False
     assert result.get("exitCode", 0) == 7
     assert result.get("timedOut", False) is False
-    return False
 
 
 def test_process_timeout_terminates_group():
@@ -218,7 +202,6 @@ def test_process_timeout_terminates_group():
     assert result.get("ok", False) is False
     assert result.get("exitCode", False) == -1
     assert result.get("timedOut", False) is True
-    return False
 
 
 def test_process_timeout_covers_descendant_holding_output_pipe():
@@ -226,7 +209,6 @@ def test_process_timeout_covers_descendant_holding_output_pipe():
     result = server.run_python(script, timeout=0.1)
     assert result.get("exitCode", False) == -1
     assert result.get("timedOut", False) is True
-    return False
 
 
 def test_process_output_is_bounded(monkeypatch):
@@ -236,18 +218,13 @@ def test_process_output_is_bounded(monkeypatch):
     assert result.get("exitCode", False) == -2
     assert result.get("outputLimited", False) is True
     assert len(result.get("stdout", "").encode()) <= 64
-    return False
 
 
 def test_git_init_log_and_workspace_tree(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "WORKSPACE", tmp_path.resolve())
     initialized = server.git_init("feature/test")
-    server._require_process_success(
-        server._run_git(["config", "user.email", "sandbox@example.test"]), "git config"
-    )
-    server._require_process_success(
-        server._run_git(["config", "user.name", "Sandbox Test"]), "git config"
-    )
+    server.require_process_success(server.run_git(["config", "user.email", "sandbox@example.test"]), "git config")
+    server.require_process_success(server.run_git(["config", "user.name", "Sandbox Test"]), "git config")
     server.file_write("src/example.py", "print('ok')\n")
     server.git_commit("Add example")
 
@@ -259,7 +236,6 @@ def test_git_init_log_and_workspace_tree(tmp_path, monkeypatch):
     assert history.get("commits", [])[0].get("subject", "") == "Add example"
     assert history.get("truncated", False) is False
     assert "src/example.py" in tree.get("files", [])
-    return False
 
 
 def test_git_processes_disable_interactive_credentials(monkeypatch):
@@ -279,13 +255,12 @@ def test_git_processes_disable_interactive_credentials(monkeypatch):
         }
         return result
 
-    monkeypatch.setattr(server, "_run_process", run_process)
-    server._run_git(["status"])
+    monkeypatch.setattr(server, "internal_run_process", run_process)
+    server.run_git(["status"])
 
     assert captured.get("command", []) == ["git", "status"]
     assert captured.get("environment", {}).get("GIT_TERMINAL_PROMPT", "") == "0"
     assert captured.get("environment", {}).get("GCM_INTERACTIVE", "") == "never"
-    return False
 
 
 def test_network_tools_fail_closed_under_deny_policy(monkeypatch):
@@ -293,7 +268,6 @@ def test_network_tools_fail_closed_under_deny_policy(monkeypatch):
     with pytest_raises(server.ToolError) as caught:
         server.pip_install(["pytest"])
     assert caught.value.code == "egress_denied"
-    return False
 
 
 def test_brokered_pip_uses_only_broker_index_and_redacts_token(monkeypatch):
@@ -305,7 +279,7 @@ def test_brokered_pip_uses_only_broker_index_and_redacts_token(monkeypatch):
 
     def run(command, **kwargs):
         calls.append(command)
-        _return_value = {
+        computed_return_value = {
             "ok": True,
             "stdout": f"index={token}",
             "stderr": "",
@@ -313,9 +287,9 @@ def test_brokered_pip_uses_only_broker_index_and_redacts_token(monkeypatch):
             "timedOut": False,
             "outputLimited": False,
         }
-        return _return_value
+        return computed_return_value
 
-    monkeypatch.setattr(server, "_run_process", run)
+    monkeypatch.setattr(server, "internal_run_process", run)
 
     result = server.pip_install(["pytest==8.0.0"])
 
@@ -325,21 +299,17 @@ def test_brokered_pip_uses_only_broker_index_and_redacts_token(monkeypatch):
     assert index_url.endswith(":x@192.168.64.9:8090/v1/proxy/pypi/simple/")
     assert "pypi.org" not in " ".join(command)
     assert token not in result.get("stdout", False)
-    return False
 
 
 def test_broker_resolver_rejects_invalid_proxy_path(monkeypatch):
     monkeypatch.setattr(server, "EGRESS_POLICY", "broker")
     monkeypatch.setattr(server, "BROKER_URL", "http://192.168.64.9:8090")
     monkeypatch.setattr(server, "BROKER_TOKEN", "b" * 43)
-    monkeypatch.setattr(
-        server, "_broker_request", lambda *args: {"proxyPath": "https://evil.example/"}
-    )
+    monkeypatch.setattr(server, "broker_request", lambda *args: {"proxyPath": "https://evil.example/"})
 
     with pytest_raises(server.ToolError) as caught:
-        server._resolve_broker_url("https://github.com/example/repo.git", "git")
+        server.resolve_broker_url("https://github.com/example/repo.git", "git")
     assert caught.value.code == "broker_protocol"
-    return False
 
 
 def test_configure_requires_broker_endpoint_and_token(tmp_path):
@@ -355,4 +325,3 @@ def test_configure_requires_broker_endpoint_and_token(tmp_path):
     )
     with pytest_raises(ValueError, match="broker"):
         server.configure(args)
-    return False

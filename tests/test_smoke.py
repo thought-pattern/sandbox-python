@@ -10,13 +10,11 @@ from time import sleep as time_sleep
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
-from manager import ContainerConfig, sandbox_session
 from pytest import mark as pytest_mark
 from pytest import raises as pytest_raises
+from tapestry.workspace.sandbox_manager import ContainerConfig, sandbox_session
 
-CONTAINER_RUNTIME = (
-    shutil_which("container") or shutil_which("docker") or shutil_which("podman") or ""
-)
+DOCKER = shutil_which("docker") or ""
 NO_PAYLOAD = {}
 
 
@@ -44,15 +42,12 @@ def wait_for_health(base_url, token, attempts=30):
     return {}
 
 
-@pytest_mark.skipif(
-    not CONTAINER_RUNTIME, reason="no supported container runtime available"
-)
+@pytest_mark.skipif(not DOCKER, reason="Docker is unavailable")
 def test_image_builds_and_serves_authenticated_bounded_tools():
-    runtime = Path(CONTAINER_RUNTIME).name
     context = Path(__file__).resolve().parent.parent / "container"
     build = subprocess_run(
         [
-            runtime,
+            "docker",
             "build",
             "-t",
             "python-sandbox:test",
@@ -65,8 +60,14 @@ def test_image_builds_and_serves_authenticated_bounded_tools():
     )
     assert build.returncode == 0, build.stderr
 
-    config = ContainerConfig(image="python-sandbox:test", port=8080)
-    with sandbox_session(config, runtime=runtime):
+    config = ContainerConfig(
+        image="python-sandbox:test",
+        port=8080,
+        workspace="/workspace",
+        memory_limit="2g",
+        cpu_limit=1.0,
+    )
+    with sandbox_session(config):
         health = wait_for_health(config.base_url, config.auth_token)
         assert health
         assert health.get("egressPolicy", "") == "deny"
@@ -77,9 +78,7 @@ def test_image_builds_and_serves_authenticated_bounded_tools():
 
         _, manifest = request_json(f"{config.base_url}/tools", config.auth_token)
         assert manifest.get("apiVersion", "") == "1.0"
-        assert "run_python" in {
-            entry.get("name", "") for entry in manifest.get("tools", [])
-        }
+        assert "run_python" in {entry.get("name", "") for entry in manifest.get("tools", [])}
 
         _, written = request_json(
             f"{config.base_url}/tools/file_write",
@@ -115,4 +114,3 @@ def test_image_builds_and_serves_authenticated_bounded_tools():
 
         with socket_create_connection((config.host_bind, config.host_port), timeout=2):
             pass
-    return False
