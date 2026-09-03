@@ -60,9 +60,7 @@ def test_broker_inspection_reads_the_exact_docker_shape():
 
 
 def test_broker_inspection_rejects_an_alternate_shape():
-    result = CompletedProcess(
-        args=[], returncode=0, stdout=dumps({"networks": [{"address": "192.168.64.2"}]}), stderr=""
-    )
+    result = CompletedProcess(args=[], returncode=0, stdout=dumps({"networks": [{"address": "192.168.64.2"}]}), stderr="")
 
     with (
         patch("tapestry.workspace.broker_manager.run_docker", return_value=result),

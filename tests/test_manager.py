@@ -74,12 +74,26 @@ def test_create_command_is_the_exact_docker_boundary():
 
 def test_config_rejects_non_loopback_bind():
     with pytest_raises(ValueError, match="host_bind"):
-        ContainerConfig(**(BASE_CONFIG | {"host_bind": "0.0.0.0"}))
+        ContainerConfig(
+            image="python-sandbox:latest",
+            port=8080,
+            workspace="/workspace",
+            memory_limit="2g",
+            cpu_limit=1.0,
+            host_bind="0.0.0.0",
+        )
 
 
 def test_config_rejects_short_auth_token():
     with pytest_raises(ValueError, match="auth_token"):
-        ContainerConfig(**(BASE_CONFIG | {"auth_token": "short"}))
+        ContainerConfig(
+            image="python-sandbox:latest",
+            port=8080,
+            workspace="/workspace",
+            memory_limit="2g",
+            cpu_limit=1.0,
+            auth_token="short",
+        )
 
 
 def test_create_container_raises_on_nonzero_exit():

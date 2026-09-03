@@ -80,11 +80,11 @@ BROKER_TOKEN = ""
 BROKER_PACKAGE_DESTINATION = "pypi"
 GIT_ENV = {
     **os_environ,
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
     "GIT_TERMINAL_PROMPT": "0",
     "GCM_INTERACTIVE": "never",
 }
-COMMAND_LINE_ARGUMENTS = []
-
 TOOLS = {}
 FILE_LOCK = threading_RLock()
 LOGGER = logging_getLogger("tapestry.workspace.server")
@@ -175,7 +175,7 @@ def terminate_process_group(process):
     return False
 
 
-def internal_run_process(command, *, shell=False, timeout=60, cwd="", environment=DEFAULT_ARGUMENT_DICT):
+def internal_run_process(command, *, shell=False, timeout: float = 60.0, cwd="", environment=DEFAULT_ARGUMENT_DICT):
     """Run a bounded process and return a structured camelCase result."""
     if environment is DEFAULT_ARGUMENT_DICT:
         environment = DEFAULT_ARGUMENT_DICT.copy()
@@ -191,9 +191,18 @@ def internal_run_process(command, *, shell=False, timeout=60, cwd="", environmen
         stderr=subprocess_PIPE,
         start_new_session=True,
     )
+    stdout_stream = process.stdout
+    stderr_stream = process.stderr
+    if stdout_stream is None or stderr_stream is None:
+        terminate_process_group(process)
+        raise ToolError(
+            "tool process did not expose bounded output streams",
+            code="process_stream_unavailable",
+            status=500,
+        )
     selector = selectors_DefaultSelector()
-    selector.register(process.stdout, selectors_EVENT_READ, "stdout")
-    selector.register(process.stderr, selectors_EVENT_READ, "stderr")
+    selector.register(stdout_stream, selectors_EVENT_READ, "stdout")
+    selector.register(stderr_stream, selectors_EVENT_READ, "stderr")
     buffers = {"stdout": bytearray(), "stderr": bytearray()}
     captured = 0
     timed_out = False
@@ -209,12 +218,17 @@ def internal_run_process(command, *, shell=False, timeout=60, cwd="", environmen
                 break
             events = selector.select(timeout=min(0.1, remaining_time))
             for key, _ in events:
-                chunk = os_read(key.fileobj.fileno(), 65_536)
+                file_descriptor = key.fileobj
+                if not isinstance(file_descriptor, int):
+                    file_descriptor = file_descriptor.fileno()
+                chunk = os_read(file_descriptor, 65_536)
                 if not chunk:
                     selector.unregister(key.fileobj)
                     continue
                 available = max(0, MAX_OUTPUT_BYTES - captured)
-                buffers.get(key.data, []).extend(chunk[:available])
+                channel = str(key.data)
+                buffer = buffers.get(channel, bytearray())
+                buffer.extend(chunk[:available])
                 captured += min(len(chunk), available)
                 if len(chunk) > available:
                     output_limited = True
@@ -245,7 +259,7 @@ def internal_run_process(command, *, shell=False, timeout=60, cwd="", environmen
     return computed_return_value
 
 
-def run_git(arguments, timeout=30):
+def run_git(arguments, timeout: float = 30.0):
     """Run Git without allowing an interactive credential prompt."""
     command = ["git", *arguments]
     result = internal_run_process(command, timeout=timeout, environment=GIT_ENV)
@@ -504,7 +518,14 @@ def pip_install(packages: list):
     if EGRESS_POLICY == "broker":
         index_path = f"/v1/proxy/{urllib_parse.quote(BROKER_PACKAGE_DESTINATION, safe='')}/simple/"
         index_url = broker_proxy_url(index_path)
-        broker_host = urllib_parse.urlsplit(BROKER_URL).hostname
+        broker_host_value = urllib_parse.urlsplit(BROKER_URL).hostname
+        if not broker_host_value:
+            raise ToolError(
+                "configured broker URL has no host",
+                code="egress_configuration_error",
+                status=500,
+            )
+        broker_host = str(broker_host_value)
         command.extend(
             [
                 "--index-url",
@@ -758,7 +779,7 @@ def json_type(annotation):
     origin = getattr(annotation, "__origin__", False)
     if origin is list or annotation is list:
         arguments = getattr(annotation, "__args__", ())
-        schema = {"type": "array"}
+        schema: dict = {"type": "array"}
         if arguments:
             schema["items"] = {"type": json_type(arguments[0])}
         return schema
@@ -849,13 +870,22 @@ def build_readiness_report():
 class ToolHTTPServer(ThreadingHTTPServer):
     """Threaded server carrying immutable per-session boundary settings."""
 
+    server_name: str
+    server_port: int
     daemon_threads = True
 
     def server_bind(self):
         """Bind without HTTPServer's blocking reverse-DNS lookup."""
         TCPServer.server_bind(self)
-        self.server_name = self.server_address[0]
-        self.server_port = self.server_address[1]
+        bound_address = self.server_address
+        if not isinstance(bound_address, tuple) or len(bound_address) != 2:
+            raise RuntimeError("Workspace HTTP server did not bind an internet address")
+        bound_name = bound_address[0]
+        bound_port = bound_address[1]
+        if not isinstance(bound_name, str) or not isinstance(bound_port, int):
+            raise RuntimeError("Workspace HTTP server returned an invalid bound address")
+        self.server_name = bound_name
+        self.server_port = bound_port
         return False
 
     def __init__(
@@ -880,6 +910,7 @@ class ToolHTTPServer(ThreadingHTTPServer):
 class ToolHandler(BaseHTTPRequestHandler):
     """Authenticated request handler for health, manifest, and tool calls."""
 
+    server: ToolHTTPServer
     server_version = "TapestryWorkspace/1.0"
 
     def setup(self):
@@ -1066,7 +1097,7 @@ class ToolHandler(BaseHTTPRequestHandler):
         return False
 
 
-def parse_args(argv=COMMAND_LINE_ARGUMENTS):
+def parse_args(argv: list):
     """Parse explicit server settings supplied by the container manager."""
     parser = argparse_ArgumentParser(description=__doc__)
     parser.add_argument("--workspace", type=Path, default=DEFAULT_WORKSPACE)
@@ -1131,10 +1162,9 @@ def configure(args):
     return False
 
 
-def main(argv=COMMAND_LINE_ARGUMENTS):
+def main(argv: list):
     logging_basicConfig(level=logging_INFO, format="%(asctime)s %(levelname)s %(message)s")
-    selected_arguments = sys_argv[1:] if argv is COMMAND_LINE_ARGUMENTS else argv
-    args = parse_args(selected_arguments)
+    args = parse_args(argv)
     configure(args)
     server = ToolHTTPServer(
         ("0.0.0.0", args.port),
@@ -1150,4 +1180,4 @@ def main(argv=COMMAND_LINE_ARGUMENTS):
 
 
 if __name__ == "__main__":
-    main()
+    main(sys_argv[1:])
