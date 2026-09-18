@@ -1,116 +1,161 @@
-"""Live build/start/auth/tool/egress/teardown smoke test."""
+# Copyright 2025-2026 Jason E. Robinson.
+# SPDX-License-Identifier: Apache-2.0
 
-from json import dumps as json_dumps
-from json import loads as json_loads
+"""PDC-DEVELOP batch 211: actual HTTP tools and subprocesses without a container runtime."""
+
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from os import environ
 from pathlib import Path
-from shutil import which as shutil_which
-from socket import create_connection as socket_create_connection
-from subprocess import run as subprocess_run
-from time import sleep as time_sleep
-from urllib import error as urllib_error
-from urllib import request as urllib_request
+from sys import executable
+from threading import Thread
+from zipfile import ZipFile
 
-from pytest import mark as pytest_mark
-from pytest import raises as pytest_raises
-from tapestry.workspace.sandbox_manager import ContainerConfig, sandbox_session
+import server
+from pytest import fixture, raises
 
-DOCKER = shutil_which("docker") or ""
-NO_PAYLOAD = {}
+from tapestry.workspace.tool_client import WorkspaceClient, WorkspaceToolError
+
+TOKEN = "direct-interface-test-" + "t" * 32
 
 
-def request_json(url, token, *, method="GET", payload=NO_PAYLOAD, timeout=2):
-    headers = {"Authorization": f"Bearer {token}"}
-    if payload is NO_PAYLOAD:
-        request = urllib_request.Request(url, headers=headers, method=method)
-    else:
-        body = json_dumps(payload).encode()
-        headers["Content-Type"] = "application/json"
-        request = urllib_request.Request(url, data=body, headers=headers, method=method)
-    with urllib_request.urlopen(request, timeout=timeout) as response:
-        result = (response.status, json_loads(response.read()))
-        return result
+class ArtifactServer(ThreadingHTTPServer):
+    """Serve only fixture files; never forward requests to another destination."""
+
+    def __init__(self, directory):
+        self.directory = directory
+        self.paths = []
+        super().__init__(("127.0.0.1", 0), ArtifactHandler)
 
 
-def wait_for_health(base_url, token, attempts=30):
-    for _ in range(attempts):
+class ArtifactHandler(SimpleHTTPRequestHandler):
+    server: ArtifactServer
+
+    def __init__(self, request, address, owner):
+        super().__init__(request, address, owner, directory=str(owner.directory))
+
+    def do_GET(self):
+        self.server.paths.append(self.path)
+        super().do_GET()
+
+    def log_message(self, format, *arguments):
+        """Requests are retained by the fixture owner."""
+
+
+@fixture
+def direct_tools(tmp_path, monkeypatch):
+    """Use the real server configuration, HTTP handlers, client and subprocess owner."""
+    monkeypatch.setenv("PATH", f"{Path(executable).parent}:{environ.get('PATH', '')}")
+    for name in ("WORKSPACE", "EGRESS_POLICY", "MAX_OUTPUT_BYTES", "MAX_FILE_BYTES", "MAX_TOOL_TIMEOUT"):
+        monkeypatch.setattr(server, name, getattr(server, name))
+    args = server.parse_args(["--workspace", str(tmp_path / "work"), "--auth-token", TOKEN])
+    server.configure(args)
+    with server.ToolHTTPServer(("127.0.0.1", 0), server.ToolHandler, auth_token=TOKEN) as endpoint:
+        worker = Thread(target=endpoint.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        worker.start()
         try:
-            _, payload = request_json(f"{base_url}/health", token)
-            if payload.get("status", "") == "healthy":
-                return payload
-        except (OSError, ValueError):
-            time_sleep(0.25)
-    return {}
+            with WorkspaceClient(f"http://127.0.0.1:{endpoint.server_port}", TOKEN) as client:
+                yield client
+        finally:
+            endpoint.shutdown()
+            worker.join(timeout=5)
+            assert not worker.is_alive()
 
 
-@pytest_mark.skipif(not DOCKER, reason="Docker is unavailable")
-def test_image_builds_and_serves_authenticated_bounded_tools():
-    context = Path(__file__).resolve().parent.parent / "container"
-    build = subprocess_run(
-        [
-            "docker",
-            "build",
-            "-t",
-            "python-sandbox:test",
-            "-f",
-            str(context / "Containerfile"),
-            str(context),
-        ],
-        capture_output=True,
-        text=True,
-    )
-    assert build.returncode == 0, build.stderr
+@fixture
+def artifacts(tmp_path):
+    directory = tmp_path / "destinations"
+    directory.mkdir()
+    with ArtifactServer(directory) as endpoint:
+        worker = Thread(target=endpoint.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        worker.start()
+        try:
+            yield endpoint
+        finally:
+            endpoint.shutdown()
+            worker.join(timeout=5)
+            assert not worker.is_alive()
 
-    config = ContainerConfig(
-        image="python-sandbox:test",
-        port=8080,
-        workspace="/workspace",
-        memory_limit="2g",
-        cpu_limit=1.0,
-    )
-    with sandbox_session(config):
-        health = wait_for_health(config.base_url, config.auth_token)
-        assert health
-        assert health.get("egressPolicy", "") == "deny"
 
-        with pytest_raises(urllib_error.HTTPError) as unauthorized:
-            urllib_request.urlopen(f"{config.base_url}/tools", timeout=2)
-        assert unauthorized.value.code == 401
+def test_authenticated_direct_interface_runs_real_tools_and_preserves_failures(direct_tools):
+    assert direct_tools.health().get("egressPolicy", "") == "direct"
+    assert direct_tools.session.trust_env is False
+    with WorkspaceClient(direct_tools.base_url, "incorrect-identity") as unauthorized:
+        with raises(WorkspaceToolError) as rejected:
+            unauthorized.fetch_manifest()
+    assert rejected.value.status_code == 401
+    assert direct_tools.fetch_manifest().get("protocol", "") == "tapestry.workspace.http"
+    assert direct_tools.call_tool("file_write", {"path": "smoke.txt", "content": "hello"}).get("bytesWritten", 0) == 5
+    assert direct_tools.call_tool("file_read", {"path": "smoke.txt"}) == "hello"
+    result = direct_tools.call_tool("run_python", {"script": "print(6 * 7)", "timeout": 2})
+    assert result.get("exitCode", -1) == 0 and result.get("stdout", "").strip() == "42"
+    with raises(WorkspaceToolError) as failed:
+        direct_tools.call_tool("run_python", {"script": "raise SystemExit(7)", "timeout": 2})
+    assert failed.value.result.get("exitCode", -1) == 7
 
-        _, manifest = request_json(f"{config.base_url}/tools", config.auth_token)
-        assert manifest.get("apiVersion", "") == "1.0"
-        assert "run_python" in {entry.get("name", "") for entry in manifest.get("tools", [])}
 
-        _, written = request_json(
-            f"{config.base_url}/tools/file_write",
-            config.auth_token,
-            method="POST",
-            payload={"path": "smoke.txt", "content": "hello"},
+def test_pip_downloads_from_the_actual_index_without_forwarding(direct_tools, artifacts, tmp_path, monkeypatch):
+    """Install a local fixture wheel into an owned target, never the interpreter environment."""
+    package_directory = artifacts.directory / "packages"
+    package_directory.mkdir()
+    wheel = package_directory / "workspace_fixture-1.0-py3-none-any.whl"
+    with ZipFile(wheel, "w") as archive:
+        archive.writestr("workspace_fixture.py", "VALUE = 42\n")
+        archive.writestr(
+            "workspace_fixture-1.0.dist-info/METADATA", "Metadata-Version: 2.1\nName: workspace-fixture\nVersion: 1.0\n"
         )
-        assert written.get("result", {}).get("bytesWritten", 0) == 5
-        _, read = request_json(
-            f"{config.base_url}/tools/file_read",
-            config.auth_token,
-            method="POST",
-            payload={"path": "smoke.txt"},
+        archive.writestr(
+            "workspace_fixture-1.0.dist-info/WHEEL",
+            "Wheel-Version: 1.0\nGenerator: test-fixture\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
         )
-        assert read.get("result", "") == "hello"
+        archive.writestr("workspace_fixture-1.0.dist-info/RECORD", "")
+    index = artifacts.directory / "simple" / "workspace-fixture"
+    index.mkdir(parents=True)
+    (index / "index.html").write_text(f'<a href="../../packages/{wheel.name}">{wheel.name}</a>', encoding="utf-8")
+    target = tmp_path / "installed"
+    monkeypatch.setenv("PIP_CONFIG_FILE", "/dev/null")
+    monkeypatch.setenv("PIP_INDEX_URL", f"http://127.0.0.1:{artifacts.server_port}/simple/")
+    monkeypatch.setenv("PIP_TARGET", str(target))
+    monkeypatch.setenv("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+    for name in ("PIP_NO_INDEX", "PIP_EXTRA_INDEX_URL", "PIP_REQUIRE_VIRTUALENV", "PIP_REQUIRE_VENV"):
+        monkeypatch.delenv(name, raising=False)
+    result = direct_tools.call_tool("pip_install", {"packages": ["workspace-fixture==1.0"]}, timeout=30)
+    assert result.get("ok", False) and result.get("exitCode", -1) == 0
+    assert (target / "workspace_fixture.py").read_text() == "VALUE = 42\n"
+    assert "/simple/workspace-fixture/" in artifacts.paths
+    assert f"/packages/{wheel.name}" in artifacts.paths
+    assert all(not path.startswith("/v1/") for path in artifacts.paths)
 
-        network_probe = (
-            "import socket\n"
-            "try:\n"
-            " socket.create_connection(('1.1.1.1', 80), 0.5)\n"
-            " raise SystemExit(9)\n"
-            "except OSError:\n"
-            " raise SystemExit(0)\n"
-        )
-        _, result = request_json(
-            f"{config.base_url}/tools/run_python",
-            config.auth_token,
-            method="POST",
-            payload={"script": network_probe, "timeout": 2},
-            timeout=4,
-        )
-        assert result.get("result", {}).get("exitCode", 0) == 0
 
-        with socket_create_connection((config.host_bind, config.host_port), timeout=2):
-            pass
+def test_git_uses_original_http_destination_and_native_remote_with_real_process_results(direct_tools, artifacts):
+    seed = artifacts.directory / "seed"
+    origin = artifacts.directory / "origin.git"
+    server.require_process_success(server.run_git(["init", "--initial-branch=main", str(seed)]), "fixture init")
+    (seed / "sample.txt").write_text("initial\n", encoding="utf-8")
+    for arguments in (
+        ["-C", str(seed), "add", "sample.txt"],
+        ["-C", str(seed), "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-m", "initial"],
+        ["clone", "--bare", str(seed), str(origin)],
+        ["--git-dir", str(origin), "update-server-info"],
+    ):
+        server.require_process_success(server.run_git(arguments), "fixture setup")
+    destination = f"http://127.0.0.1:{artifacts.server_port}/origin.git"
+    cloned = direct_tools.call_tool("git_clone", {"repoUrl": destination, "branch": "main"})
+    assert cloned == {"repository": destination, "branch": "main", "cloned": True}
+    assert direct_tools.call_tool("file_read", {"path": "sample.txt"}) == "initial\n"
+    assert server.run_git(["remote", "get-url", "origin"]).get("stdout", "").strip() == destination
+    assert artifacts.paths and all(path.startswith("/origin.git/") for path in artifacts.paths)
+    for arguments in (
+        ["config", "user.name", "Fixture"],
+        ["config", "user.email", "fixture@example.test"],
+        ["remote", "set-url", "origin", str(origin)],
+    ):
+        server.require_process_success(server.run_git(arguments), "fixture remote")
+    direct_tools.call_tool("file_write", {"path": "sample.txt", "content": "changed\n"})
+    direct_tools.call_tool("git_commit", {"message": "changed"})
+    pushed = direct_tools.call_tool("git_push", {"remote": "origin", "branch": "main"})
+    assert pushed == {"remote": "origin", "branch": "main", "pushed": True}
+    assert server.run_git(["--git-dir", str(origin), "show", "main:sample.txt"]).get("stdout", "") == "changed\n"
+    with raises(WorkspaceToolError) as missing:
+        direct_tools.call_tool("git_clone", {"repoUrl": destination + "-missing", "branch": "main"})
+    assert missing.value.code == "process_failed"
+    assert direct_tools.call_tool("file_read", {"path": "sample.txt"}) == "changed\n"

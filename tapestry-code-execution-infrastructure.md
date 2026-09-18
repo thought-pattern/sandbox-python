@@ -13,24 +13,23 @@ workspace through a small, self-describing HTTP tool interface.
 ```text
 Tapestry client
   -> loopback/private authenticated HTTP
-  -> container entrypoint establishes network policy
+  -> direct tool endpoint
   -> entrypoint drops to non-root sandbox user
   -> bounded tool server
   -> bounded process group inside /workspace
 ```
 
-The current MVP supports fail-closed `deny` and controlled `broker` policies.
-Direct outbound flows are blocked by the guest firewall in both modes. Broker
-mode adds exactly one allowed destination: the external broker's explicit IPv4
-address and TCP port. Package installation and remote Git tools use that broker;
-other direct traffic remains unavailable.
+Networking defaults to `direct`; package and Git tools connect to actual
+destinations. Deployment owns the EC2/Fargate network boundary. The explicit
+local `deny` option supports offline execution. No intermediary rewrites or
+forwards requests, and Workspace has no SQLite storage dependency.
 
 ## Security invariants
 
 1. The host publish address is `127.0.0.1` in local development.
 2. A fresh bearer token is generated for every sandbox session.
 3. The HTTP server and tool subprocesses run as the `sandbox` user.
-4. Direct egress is denied before the untrusted tool surface starts.
+4. Network isolation is deployment-owned; direct startup adds no application firewall.
 5. Request bytes, subprocess output, file reads, serialized responses,
    concurrency, timeout, CPU, memory, and process count are bounded.
 6. Timeouts and output overruns terminate the complete process group.
@@ -40,16 +39,16 @@ other direct traffic remains unavailable.
 
 ## Runtime lifecycle
 
-`ContainerConfig` owns the image, internal port, dynamically selected host
-port, loopback bind, per-session token, resource bounds, and egress policy.
-`sandbox_session` creates and starts the container, yields it, then force-removes
+An owned native configuration carries image, requested port, loopback bind,
+resource bounds and networking mode. The session owns fresh identity and the
+observed endpoint. `sandbox_session` creates and starts one container, yields its endpoint, then force-removes
 it. If work and cleanup both fail, the original work failure is preserved and
 annotated with the cleanup failure.
 
 Docker applies fractional CPU limits, `--cap-drop ALL`,
-`no-new-privileges`, a PID limit, and only the temporary `NET_ADMIN` capability
-needed by the root entrypoint.
-After firewall setup, the entrypoint clears groups and changes permanently to
+`no-new-privileges`, a PID limit and the `SETGID`/`SETUID` capabilities needed to
+drop identity. Only explicit local offline mode adds `NET_ADMIN`.
+The entrypoint clears groups and changes permanently to
 the non-root user.
 
 ## API contract
@@ -76,9 +75,10 @@ Local Git commands execute with interactive credential acquisition disabled.
 Dedicated `git_init`, `git_log`, and `workspace_tree` tools provide bounded,
 structured startup context without requiring shell parsing.
 
-## External broker
+## Verification
 
-The controlled egress broker remains outside this container. The local broker
-provides destination/method policy, broker-held credential headers, request and
-response bounds, redirect validation, and hash-chained SQLite audit records.
-The sandbox receives only a per-session broker token.
+Tests consume the actual HTTP tool interface and run repository-controlled
+subprocess fixtures without Docker. Package/Git tests use disposable local
+destinations. The live developer-task harness consumes independent caller-provisioned
+execution and acceptance interfaces; it does not provision containers or execute
+model-authored code on the host.

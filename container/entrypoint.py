@@ -1,8 +1,6 @@
 """Configure the sandbox network boundary, drop privilege, and start the server."""
 
 from argparse import ArgumentParser as argparse_ArgumentParser
-from ipaddress import AddressValueError as ipaddress_AddressValueError
-from ipaddress import IPv4Address as ipaddress_IPv4Address
 from os import environ as os_environ
 from os import execv as os_execv
 from os import geteuid as os_geteuid
@@ -15,7 +13,6 @@ from shutil import which as shutil_which
 from subprocess import run as subprocess_run
 from sys import argv as sys_argv
 from sys import executable as sys_executable
-from urllib import parse as urllib_parse
 
 SERVER = Path(__file__).with_name("server.py")
 COMMAND_LINE_ARGUMENTS = []
@@ -23,8 +20,7 @@ COMMAND_LINE_ARGUMENTS = []
 
 def parse_policy(argv):
     parser = argparse_ArgumentParser(add_help=False)
-    parser.add_argument("--egress-policy", choices=("deny", "broker", "unrestricted"), default="deny")
-    parser.add_argument("--broker-url", default="")
+    parser.add_argument("--egress-policy", choices=("deny", "direct"), default="direct")
     computed_return_value = parser.parse_known_args(argv)[0]
     return computed_return_value
 
@@ -36,24 +32,12 @@ def run_firewall(binary, arguments):
     return False
 
 
-def enforce_egress_policy(broker_url=""):
-    """Allow loopback, replies, and optionally one broker; reject other egress."""
+def enforce_egress_policy():
+    """Apply the explicit local offline mode, allowing only loopback and replies."""
     ipv4 = shutil_which("iptables")
     ipv6 = shutil_which("ip6tables")
     if not ipv4:
         raise RuntimeError("deny egress policy requires iptables")
-
-    broker_host = ""
-    broker_port = 0
-    if broker_url:
-        parsed = urllib_parse.urlsplit(broker_url)
-        if parsed.scheme != "http" or not parsed.hostname or parsed.port is None:
-            raise RuntimeError("broker policy requires an explicit http broker URL and port")
-        try:
-            broker_host = str(ipaddress_IPv4Address(parsed.hostname))
-        except ipaddress_AddressValueError as err:
-            raise RuntimeError("broker URL must use an explicit IPv4 address") from err
-        broker_port = parsed.port
 
     def apply_rules(binary):
         run_firewall(binary, ["-F", "OUTPUT"])
@@ -71,26 +55,6 @@ def enforce_egress_policy(broker_url=""):
                 "ACCEPT",
             ],
         )
-        if broker_host:
-            run_firewall(
-                binary,
-                [
-                    "-A",
-                    "OUTPUT",
-                    "-p",
-                    "tcp",
-                    "-d",
-                    broker_host,
-                    "--dport",
-                    str(broker_port),
-                    "-m",
-                    "conntrack",
-                    "--ctstate",
-                    "NEW",
-                    "-j",
-                    "ACCEPT",
-                ],
-            )
         run_firewall(binary, ["-P", "OUTPUT", "DROP"])
         return False
 
@@ -110,7 +74,7 @@ def enforce_egress_policy(broker_url=""):
 
 def drop_privileges(username="sandbox"):
     if os_geteuid() != 0:
-        raise RuntimeError("sandbox entrypoint must start as root so it can install the network boundary")
+        raise RuntimeError("sandbox entrypoint must start as root so it can switch to the sandbox account")
     account = pwd_getpwnam(username)
     os_setgroups([])
     os_setgid(account.pw_gid)
@@ -125,8 +89,6 @@ def main(argv=COMMAND_LINE_ARGUMENTS):
     policy = parse_policy(arguments)
     if policy.egress_policy == "deny":
         enforce_egress_policy()
-    elif policy.egress_policy == "broker":
-        enforce_egress_policy(policy.broker_url)
     drop_privileges()
     os_execv(sys_executable, [sys_executable, str(SERVER), *arguments])
     return False

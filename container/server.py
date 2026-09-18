@@ -47,9 +47,6 @@ from threading import BoundedSemaphore as threading_BoundedSemaphore
 from threading import RLock as threading_RLock
 from time import monotonic as time_monotonic
 from time import sleep as time_sleep
-from urllib import error as urllib_error
-from urllib import parse as urllib_parse
-from urllib import request as urllib_request
 from uuid import uuid4
 
 DEFAULT_ARGUMENT_DICT = {}
@@ -71,13 +68,10 @@ DEFAULT_MAX_GIT_LOG_RESULTS = 100
 MIN_MAX_RESPONSE_BYTES = 512
 
 WORKSPACE = DEFAULT_WORKSPACE
-EGRESS_POLICY = "deny"
+EGRESS_POLICY = "direct"
 MAX_OUTPUT_BYTES = DEFAULT_MAX_OUTPUT_BYTES
 MAX_FILE_BYTES = DEFAULT_MAX_FILE_BYTES
 MAX_TOOL_TIMEOUT = DEFAULT_MAX_TOOL_TIMEOUT
-BROKER_URL = ""
-BROKER_TOKEN = ""
-BROKER_PACKAGE_DESTINATION = "pypi"
 GIT_ENV = {
     **os_environ,
     "GIT_CONFIG_NOSYSTEM": "1",
@@ -285,86 +279,11 @@ def require_process_success(result, operation):
 def require_network(operation):
     if EGRESS_POLICY == "deny":
         raise ToolError(
-            f"{operation} requires controlled egress, but this sandbox is deny-by-default",
+            f"{operation} requires networking, but this sandbox explicitly denies egress",
             code="egress_denied",
             status=403,
         )
     return False
-
-
-def redact_broker_token(result):
-    """Remove the session broker token from process output before returning it."""
-    if not BROKER_TOKEN:
-        return result
-    for name in ("stdout", "stderr"):
-        value = result.get(name, False)
-        if isinstance(value, str):
-            result[name] = value.replace(BROKER_TOKEN, "[broker-token-redacted]")
-    return result
-
-
-def broker_request(path, payload):
-    """Call one authenticated broker control endpoint with bounded JSON."""
-    if EGRESS_POLICY != "broker" or not BROKER_URL or not BROKER_TOKEN:
-        raise ToolError(
-            "controlled egress broker is not configured",
-            code="broker_unavailable",
-            status=503,
-        )
-    body = json_dumps(payload, separators=(",", ":")).encode("utf-8")
-    request = urllib_request.Request(
-        f"{BROKER_URL.rstrip('/')}{path}",
-        data=body,
-        headers={
-            "Authorization": f"Bearer {BROKER_TOKEN}",
-            "Content-Type": "application/json",
-            "X-Tapestry-Request-ID": str(uuid4()),
-        },
-        method="POST",
-    )
-    try:
-        with urllib_request.urlopen(request, timeout=min(float(MAX_TOOL_TIMEOUT), 30.0)) as response:
-            result = json_loads(response.read(MAX_OUTPUT_BYTES + 1))
-    except urllib_error.HTTPError as err:
-        try:
-            detail = json_loads(err.read(MAX_OUTPUT_BYTES + 1)).get("error", {})
-        except Exception:
-            detail = {}
-        raise ToolError(
-            str(detail.get("message", "") or "egress broker rejected the request"),
-            code=str(detail.get("code", "") or "broker_rejected"),
-            status=err.code,
-        ) from err
-    except Exception as err:
-        raise ToolError("egress broker is unavailable", code="broker_unavailable", status=503) from err
-    if not isinstance(result, dict):
-        raise ToolError(
-            "egress broker returned an invalid response",
-            code="broker_protocol",
-            status=502,
-        )
-    return result
-
-
-def broker_proxy_url(proxy_path):
-    """Add the ephemeral broker token as URL basic-auth userinfo for pip/Git."""
-    if not isinstance(proxy_path, str) or not proxy_path.startswith("/v1/proxy/"):
-        raise ToolError(
-            "egress broker returned an invalid proxy path",
-            code="broker_protocol",
-            status=502,
-        )
-    parsed = urllib_parse.urlsplit(BROKER_URL)
-    token = urllib_parse.quote(BROKER_TOKEN, safe="")
-    host = f"{parsed.hostname}:{parsed.port}"
-    computed_return_value = urllib_parse.urlunsplit((parsed.scheme, f"{token}:x@{host}", proxy_path, "", ""))
-    return computed_return_value
-
-
-def resolve_broker_url(external_url, operation):
-    result = broker_request("/v1/resolve", {"url": external_url, "operation": operation})
-    computed_return_value = broker_proxy_url(result.get("proxyPath", False))
-    return computed_return_value
 
 
 @tool
@@ -507,7 +426,7 @@ PACKAGE_PATTERN = re_compile(r"^[a-zA-Z0-9_.-]+([=<>!~\[\]][a-zA-Z0-9._,<>=!~\[\
 
 @tool
 def pip_install(packages: list):
-    """Install packages when a controlled egress path is enabled."""
+    """Install packages directly when networking is enabled."""
     require_network("pip_install")
     if not isinstance(packages, list) or not packages:
         raise ToolError("packages must be a non-empty list", code="bad_arguments", status=400)
@@ -515,27 +434,7 @@ def pip_install(packages: list):
         if not isinstance(package, str) or not PACKAGE_PATTERN.fullmatch(package):
             raise ToolError(f"Invalid package: {package}", code="bad_arguments", status=400)
     command = ["pip", "install", "--no-cache-dir"]
-    if EGRESS_POLICY == "broker":
-        index_path = f"/v1/proxy/{urllib_parse.quote(BROKER_PACKAGE_DESTINATION, safe='')}/simple/"
-        index_url = broker_proxy_url(index_path)
-        broker_host_value = urllib_parse.urlsplit(BROKER_URL).hostname
-        if not broker_host_value:
-            raise ToolError(
-                "configured broker URL has no host",
-                code="egress_configuration_error",
-                status=500,
-            )
-        broker_host = str(broker_host_value)
-        command.extend(
-            [
-                "--index-url",
-                index_url,
-                "--trusted-host",
-                broker_host,
-                "--disable-pip-version-check",
-            ]
-        )
-    result = redact_broker_token(internal_run_process([*command, *packages], timeout=MAX_TOOL_TIMEOUT))
+    result = internal_run_process([*command, *packages], timeout=MAX_TOOL_TIMEOUT)
     computed_return_value = require_process_success(
         result,
         "pip install",
@@ -622,23 +521,14 @@ def git_clone(repo_url: str, branch: str = "main"):
     require_network("git_clone")
     validate_git_atom(repo_url, "repository URL")
     validate_git_atom(branch, "branch")
-    clone_url = resolve_broker_url(repo_url, "git") if EGRESS_POLICY == "broker" else repo_url
     staging = WORKSPACE / f".tapestry-clone-{uuid4().hex}"
     with FILE_LOCK:
         try:
             result = run_git(
-                ["clone", "--branch", branch, "--", clone_url, str(staging)],
+                ["clone", "--branch", branch, "--", repo_url, str(staging)],
                 timeout=MAX_TOOL_TIMEOUT,
             )
-            result = redact_broker_token(result)
             require_process_success(result, "git clone")
-            require_process_success(
-                run_git(
-                    ["-C", str(staging), "remote", "set-url", "origin", repo_url],
-                    timeout=30,
-                ),
-                "git remote sanitization",
-            )
             for item in list(WORKSPACE.iterdir()):
                 if item == staging:
                     continue
@@ -700,7 +590,7 @@ def git_commit(message: str):
 
 @tool
 def git_push(remote: str = "origin", branch: str = ""):
-    """Push commits when a controlled egress path is enabled."""
+    """Push commits directly to the selected remote when networking is enabled."""
     require_network("git_push")
     validate_git_atom(remote, "remote")
     if not branch:
@@ -710,18 +600,7 @@ def git_push(remote: str = "origin", branch: str = ""):
         )
         branch = current.get("stdout", "").strip()
     validate_git_atom(branch, "branch")
-    push_target = remote
-    if EGRESS_POLICY == "broker":
-        remote_url = (
-            require_process_success(
-                run_git(["remote", "get-url", remote], timeout=30),
-                "git remote lookup",
-            )
-            .get("stdout", "")
-            .strip()
-        )
-        push_target = resolve_broker_url(remote_url, "git")
-    result = redact_broker_token(run_git(["push", "--", push_target, branch], timeout=MAX_TOOL_TIMEOUT))
+    result = run_git(["push", "--", remote, branch], timeout=MAX_TOOL_TIMEOUT)
     require_process_success(result, "git push")
     return {"remote": remote, "branch": branch, "pushed": True}
 
@@ -1103,7 +982,7 @@ def parse_args(argv: list):
     parser.add_argument("--workspace", type=Path, default=DEFAULT_WORKSPACE)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--auth-token", required=True)
-    parser.add_argument("--egress-policy", choices=("deny", "broker", "unrestricted"), default="deny")
+    parser.add_argument("--egress-policy", choices=("deny", "direct"), default="direct")
     parser.add_argument("--max-request-bytes", type=int, default=DEFAULT_MAX_REQUEST_BYTES)
     parser.add_argument("--max-output-bytes", type=int, default=DEFAULT_MAX_OUTPUT_BYTES)
     parser.add_argument("--max-file-bytes", type=int, default=DEFAULT_MAX_FILE_BYTES)
@@ -1111,9 +990,6 @@ def parse_args(argv: list):
     parser.add_argument("--max-concurrent-requests", type=int, default=DEFAULT_MAX_CONCURRENT_REQUESTS)
     parser.add_argument("--max-tool-timeout", type=int, default=DEFAULT_MAX_TOOL_TIMEOUT)
     parser.add_argument("--request-read-timeout", type=float, default=DEFAULT_REQUEST_READ_TIMEOUT)
-    parser.add_argument("--broker-url", default="")
-    parser.add_argument("--broker-token", default="")
-    parser.add_argument("--broker-package-destination", default="pypi")
     computed_return_value = parser.parse_args(argv)
     return computed_return_value
 
@@ -1121,7 +997,7 @@ def parse_args(argv: list):
 def configure(args):
     """Apply validated process-wide settings before accepting requests."""
     global WORKSPACE, EGRESS_POLICY, MAX_OUTPUT_BYTES, MAX_FILE_BYTES
-    global MAX_TOOL_TIMEOUT, BROKER_URL, BROKER_TOKEN, BROKER_PACKAGE_DESTINATION
+    global MAX_TOOL_TIMEOUT
     if len(args.auth_token) < 32:
         raise ValueError("auth token must be at least 32 characters")
     if not 1 <= args.port <= 65535:
@@ -1140,25 +1016,12 @@ def configure(args):
         raise ValueError(f"max_response_bytes must be at least {MIN_MAX_RESPONSE_BYTES}")
     if args.request_read_timeout <= 0:
         raise ValueError("request_read_timeout must be positive")
-    if args.egress_policy == "broker":
-        parsed_broker = urllib_parse.urlsplit(args.broker_url)
-        if parsed_broker.scheme != "http" or not parsed_broker.hostname or parsed_broker.port is None:
-            raise ValueError("broker policy requires an explicit HTTP broker URL and port")
-        if len(args.broker_token) < 32:
-            raise ValueError("broker policy requires a broker token of at least 32 characters")
-        if not re_fullmatch(r"[a-z][a-z0-9_-]{0,63}", args.broker_package_destination):
-            raise ValueError("broker package destination is invalid")
-    elif args.broker_url or args.broker_token:
-        raise ValueError("broker URL and token require egress_policy=broker")
     WORKSPACE = args.workspace.resolve()
     WORKSPACE.mkdir(parents=True, exist_ok=True)
     EGRESS_POLICY = args.egress_policy
     MAX_OUTPUT_BYTES = args.max_output_bytes
     MAX_FILE_BYTES = args.max_file_bytes
     MAX_TOOL_TIMEOUT = args.max_tool_timeout
-    BROKER_URL = args.broker_url
-    BROKER_TOKEN = args.broker_token
-    BROKER_PACKAGE_DESTINATION = args.broker_package_destination
     return False
 
 
