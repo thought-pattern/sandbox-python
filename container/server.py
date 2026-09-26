@@ -20,6 +20,8 @@ from logging import getLogger as logging_getLogger
 from os import environ as os_environ
 from os import fdopen as os_fdopen
 from os import fsync as os_fsync
+from os import getpid as os_getpid
+from os import kill as os_kill
 from os import killpg as os_killpg
 from os import read as os_read
 from pathlib import Path
@@ -46,10 +48,10 @@ from tempfile import mkstemp as tempfile_mkstemp
 from threading import BoundedSemaphore as threading_BoundedSemaphore
 from threading import RLock as threading_RLock
 from time import monotonic as time_monotonic
-from time import sleep as time_sleep
 from uuid import uuid4
 
 DEFAULT_ARGUMENT_DICT = {}
+INVOCATION_MARKER_VARIABLE = "TAPESTRY_TOOL_INVOCATION"
 
 API_VERSION = "1.0"
 PROTOCOL_NAME = "tapestry.workspace.http"
@@ -135,26 +137,66 @@ def bounded_timeout(timeout):
     return computed_return_value
 
 
-def terminate_process_group(process):
-    """Terminate a tool process and every descendant in its process group."""
+def invocation_process_ids(root_pid, marker):
+    """Collect a tool invocation's live processes by parent links and its inherited marker.
+
+    A descendant that calls setsid or is reparented after its parent exits leaves the original
+    process group and parent chain, but still inherits the invocation marker in its environment.
+    """
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return set()
+    marker_entry = f"{INVOCATION_MARKER_VARIABLE}={marker}".encode("utf-8")
+    parents = {}
+    marked = set()
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            stat = (entry / "stat").read_text(encoding="utf-8", errors="replace")
+            parents[pid] = int(stat[stat.rindex(")") + 2 :].split()[1])
+            if marker_entry in (entry / "environ").read_bytes().split(b"\0"):
+                marked.add(pid)
+        except (OSError, ValueError, IndexError):
+            continue
+    descendants = set()
+    frontier = [root_pid]
+    while frontier:
+        current = frontier.pop()
+        for pid, parent in parents.items():
+            if parent == current and pid not in descendants:
+                descendants.add(pid)
+                frontier.append(pid)
+    return (descendants | marked | {root_pid}) - {os_getpid()}
+
+
+def signal_invocation(process, marker, signal_number):
+    """Signal the invocation's process group and every collected invocation process."""
     try:
-        os_killpg(process.pid, signal_SIGTERM)
+        os_killpg(process.pid, signal_number)
     except ProcessLookupError:
-        return False
-    if process.poll() is not None:
-        time_sleep(0.05)
-        return False
+        pass
+    except PermissionError:
+        # Some kernels refuse a group signal once the reaped leader leaves only exited members.
+        if process.poll() is None:
+            raise
+    for pid in invocation_process_ids(process.pid, marker):
+        try:
+            os_kill(pid, signal_number)
+        except ProcessLookupError:
+            continue
+
+
+def terminate_process_group(process, marker):
+    """Terminate a tool invocation and all descendants, always escalating to SIGKILL."""
+    signal_invocation(process, marker, signal_SIGTERM)
     try:
         process.wait(timeout=0.25)
-        return False
-    except ChildProcessError:
-        return False
-    except subprocess_TimeoutExpired:
-        LOGGER.warning("tool process group %s did not stop after SIGTERM; sending SIGKILL", process.pid)
-    try:
-        os_killpg(process.pid, signal_SIGKILL)
-    except ProcessLookupError:
-        return False
+    except (ChildProcessError, subprocess_TimeoutExpired):
+        LOGGER.warning("tool invocation %s did not fully stop after SIGTERM; sending SIGKILL", process.pid)
+    # The leader may exit on SIGTERM while a descendant ignores it, so the kill never depends on the leader.
+    signal_invocation(process, marker, signal_SIGKILL)
     if process.poll() is None:
         try:
             process.wait(timeout=0.25)
@@ -175,7 +217,8 @@ def internal_run_process(command, *, shell=False, timeout: float = 60.0, cwd="",
         environment = DEFAULT_ARGUMENT_DICT.copy()
     timeout = bounded_timeout(timeout)
     started = time_monotonic()
-    process_environment = environment or os_environ
+    marker = uuid4().hex
+    process_environment = {**(environment or os_environ), INVOCATION_MARKER_VARIABLE: marker}
     process = subprocess_Popen(
         command,
         shell=shell,
@@ -188,7 +231,7 @@ def internal_run_process(command, *, shell=False, timeout: float = 60.0, cwd="",
     stdout_stream = process.stdout
     stderr_stream = process.stderr
     if stdout_stream is None or stderr_stream is None:
-        terminate_process_group(process)
+        terminate_process_group(process, marker)
         raise ToolError(
             "tool process did not expose bounded output streams",
             code="process_stream_unavailable",
@@ -208,9 +251,14 @@ def internal_run_process(command, *, shell=False, timeout: float = 60.0, cwd="",
             remaining_time = deadline - time_monotonic()
             if remaining_time <= 0:
                 timed_out = True
-                terminate_process_group(process)
+                terminate_process_group(process, marker)
                 break
-            events = selector.select(timeout=min(0.1, remaining_time))
+            leader_exited = process.poll() is not None
+            # After the direct child exits, drain what is already buffered and stop: a background
+            # descendant holding the pipe open must not turn a finished tool into a timeout.
+            events = selector.select(timeout=0 if leader_exited else min(0.1, remaining_time))
+            if leader_exited and not events:
+                break
             for key, _ in events:
                 file_descriptor = key.fileobj
                 if not isinstance(file_descriptor, int):
@@ -226,15 +274,14 @@ def internal_run_process(command, *, shell=False, timeout: float = 60.0, cwd="",
                 captured += min(len(chunk), available)
                 if len(chunk) > available:
                     output_limited = True
-                    terminate_process_group(process)
+                    terminate_process_group(process, marker)
                     break
             if output_limited:
                 break
     finally:
         selector.close()
 
-    if process.poll() is None:
-        terminate_process_group(process)
+    terminate_process_group(process, marker)
     return_code = process.wait()
     if timed_out:
         return_code = -1
@@ -389,7 +436,7 @@ def file_search(pattern: str, path: str = ".", max_results: int = DEFAULT_MAX_SE
     """Search files with ripgrep and return bounded structured matches."""
     target = resolve_path(path)
     max_results = max(1, min(int(max_results), DEFAULT_MAX_SEARCH_RESULTS))
-    result = internal_run_process(["rg", "--json", pattern, str(target)], timeout=30)
+    result = internal_run_process(["rg", "--json", "-e", pattern, "--", str(target)], timeout=30)
     if result.get("exitCode", ()) not in (0, 1, -2):
         require_process_success(result, "file search")
     matches = []
@@ -832,7 +879,7 @@ class ToolHandler(BaseHTTPRequestHandler):
     def authorized(self):
         header = self.headers.get("Authorization", "")
         expected = f"Bearer {self.server.auth_token}"
-        computed_return_value = hmac_compare_digest(header, expected)
+        computed_return_value = hmac_compare_digest(header.encode("utf-8"), expected.encode("utf-8"))
         return computed_return_value
 
     def require_authorized(self, request_id):
@@ -949,6 +996,21 @@ class ToolHandler(BaseHTTPRequestHandler):
         except ToolError as err:
             status = err.status
             self.send_error_json(err.status, err.code, err, request_id=request_id)
+        except FileNotFoundError:
+            status = 404
+            self.send_error_json(404, "not_found", "requested file or tool was not found", request_id=request_id)
+        except IsADirectoryError:
+            status = 400
+            self.send_error_json(400, "not_file", "expected a file", request_id=request_id)
+        except NotADirectoryError:
+            status = 400
+            self.send_error_json(400, "not_directory", "expected a directory", request_id=request_id)
+        except PermissionError:
+            status = 403
+            self.send_error_json(403, "permission_denied", "tool access was denied", request_id=request_id)
+        except OSError:
+            status = 422
+            self.send_error_json(422, "tool_io_error", "tool I/O failed", request_id=request_id)
         except TypeError as err:
             status = 400
             self.send_error_json(
@@ -957,6 +1019,9 @@ class ToolHandler(BaseHTTPRequestHandler):
                 f"bad arguments for {name}: {err}",
                 request_id=request_id,
             )
+        except ValueError:
+            status = 400
+            self.send_error_json(400, "bad_arguments", f"invalid arguments for {name}", request_id=request_id)
         except Exception:
             status = 500
             LOGGER.exception("Unhandled tool error request_id=%s tool=%s", request_id, name)
@@ -982,7 +1047,8 @@ def parse_args(argv: list):
     parser.add_argument("--workspace", type=Path, default=DEFAULT_WORKSPACE)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--auth-token", required=True)
-    parser.add_argument("--egress-policy", choices=("deny", "direct"), default="direct")
+    parser.add_argument("--egress-policy", choices=("allowlist", "deny", "direct"), default="direct")
+    parser.add_argument("--egress-allowlist", default="")
     parser.add_argument("--max-request-bytes", type=int, default=DEFAULT_MAX_REQUEST_BYTES)
     parser.add_argument("--max-output-bytes", type=int, default=DEFAULT_MAX_OUTPUT_BYTES)
     parser.add_argument("--max-file-bytes", type=int, default=DEFAULT_MAX_FILE_BYTES)
