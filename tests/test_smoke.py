@@ -3,8 +3,9 @@
 
 """PDC-DEVELOP batch 211: actual HTTP tools and subprocesses without a container runtime."""
 
+from hashlib import sha256
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
-from os import environ
+from os import environ, mkfifo
 from pathlib import Path
 from sys import executable
 from threading import Thread
@@ -100,6 +101,91 @@ def test_unhealthy_readiness_names_each_failed_check(direct_tools, monkeypatch):
     assert unhealthy.value.status_code == 503
     assert unhealthy.value.code == "unhealthy"
     assert "required tools not on PATH: rg" in str(unhealthy.value)
+
+
+def test_scoped_read_returns_provenance_and_rejects_escapes(direct_tools, tmp_path):
+    repository = server.WORKSPACE / "repository"
+    (repository / "package").mkdir(parents=True)
+    source = "VALUE = 'café'\n"
+    (repository / "package" / "module.py").write_text(source, encoding="utf-8")
+    read = direct_tools.call_tool("file_read_scoped", {"repository_root": "repository", "path": "package/module.py"})
+    assert read == {
+        "repository_root": str(repository),
+        "resolved_path": str(repository / "package" / "module.py"),
+        "relative_path": "package/module.py",
+        "content": source,
+        "content_sha256": sha256(source.encode("utf-8")).hexdigest(),
+        "byte_count": len(source.encode("utf-8")),
+    }
+    for path in ("../outside.py", "/etc/passwd", "package//module.py", "./package/module.py"):
+        with raises(WorkspaceToolError) as rejected:
+            direct_tools.call_tool("file_read_scoped", {"repository_root": "repository", "path": path})
+        assert rejected.value.code == "bad_arguments"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.py").write_text("SECRET = 1\n", encoding="utf-8")
+    (repository / "escape").symlink_to(outside)
+    (repository / "secret_link.py").symlink_to(outside / "secret.py")
+    for path in ("escape/secret.py", "secret_link.py"):
+        with raises(WorkspaceToolError) as escaped:
+            direct_tools.call_tool("file_read_scoped", {"repository_root": "repository", "path": path})
+        assert escaped.value.code == "path_escape"
+
+
+def test_scoped_read_enforces_byte_limit_encoding_and_regular_files(direct_tools):
+    repository = server.WORKSPACE / "repository"
+    (repository / "package").mkdir(parents=True)
+    (repository / "large.py").write_text("x" * 65, encoding="utf-8")
+    (repository / "latin1.py").write_bytes(b"caf\xe9\n")
+    mkfifo(repository / "pipe.py")
+    for arguments, code, status in (
+        ({"path": "large.py", "max_bytes": 64}, "file_too_large", 413),
+        ({"path": "latin1.py"}, "invalid_source_encoding", 422),
+        ({"path": "package"}, "not_file", 400),
+        ({"path": "pipe.py"}, "bad_arguments", 400),
+        ({"path": "missing.py"}, "not_found", 404),
+    ):
+        with raises(WorkspaceToolError) as rejected:
+            direct_tools.call_tool("file_read_scoped", {"repository_root": "repository", **arguments})
+        assert (rejected.value.code, rejected.value.status_code) == (code, status)
+
+
+def test_scoped_bytes_refuse_symlinks_swapped_in_after_resolution(tmp_path):
+    """Pass unresolved targets, as if a component became a symlink after resolve() checked it."""
+    repository = tmp_path.resolve() / "repository"
+    repository.mkdir()
+    outside = tmp_path.resolve() / "outside"
+    outside.mkdir()
+    (outside / "secret.py").write_text("SECRET = 1\n", encoding="utf-8")
+    (repository / "package").symlink_to(outside)
+    (repository / "module.py").symlink_to(outside / "secret.py")
+    for target in (repository / "package" / "secret.py", repository / "module.py"):
+        with raises(server.ToolError) as refused:
+            server.scoped_repository_bytes(repository, target, 1024)
+        assert refused.value.code == "path_escape"
+
+
+def test_scoped_search_returns_relative_python_leads_only(direct_tools):
+    repository = server.WORKSPACE / "repository"
+    (repository / "package").mkdir(parents=True)
+    (repository / "package" / "module.py").write_text("def target_symbol():\n    return 1\n", encoding="utf-8")
+    (repository / "notes.txt").write_text("target_symbol\n", encoding="utf-8")
+    found = direct_tools.call_tool("file_search_scoped", {"repository_root": "repository", "symbol": "target_symbol"})
+    assert found == {
+        "repository_root": str(repository),
+        "symbol": "target_symbol",
+        "matches": [{"relative_path": "package/module.py", "line": 1}],
+        "truncated": False,
+    }
+    for arguments, code in (
+        ({"symbol": "target symbol"}, "bad_arguments"),
+        ({"symbol": "target_symbol", "max_results": 65}, "bad_arguments"),
+        ({"repository_root": "missing", "symbol": "target_symbol"}, "path_missing"),
+        ({"repository_root": "..", "symbol": "target_symbol"}, "path_escape"),
+    ):
+        with raises(WorkspaceToolError) as rejected:
+            direct_tools.call_tool("file_search_scoped", {"repository_root": "repository", **arguments})
+        assert rejected.value.code == code
 
 
 def test_pip_downloads_from_the_actual_index_without_forwarding(direct_tools, artifacts, tmp_path, monkeypatch):

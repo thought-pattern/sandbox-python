@@ -2,7 +2,6 @@
 
 from argparse import ArgumentParser as argparse_ArgumentParser
 from ctypes import CDLL, get_errno
-from ipaddress import ip_address
 from os import environ as os_environ
 from os import execv as os_execv
 from os import geteuid as os_geteuid
@@ -12,20 +11,35 @@ from os import setuid as os_setuid
 from pathlib import Path
 from pwd import getpwnam as pwd_getpwnam
 from shutil import which as shutil_which
-from socket import AF_INET6, IPPROTO_TCP
-from socket import getaddrinfo as socket_getaddrinfo
 from subprocess import run as subprocess_run
 from sys import argv as sys_argv
 from sys import executable as sys_executable
 
 SERVER = Path(__file__).with_name("server.py")
 COMMAND_LINE_ARGUMENTS = []
+WEB_PORTS = ("80", "443")
+# Web egress never reaches private, loopback, link-local or multicast networks,
+# keeping cloud metadata and credential endpoints (169.254.169.254,
+# 169.254.170.2) and the host's local network out of reach.
+NON_PUBLIC_NETWORKS = {
+    "ipv4": (
+        "0.0.0.0/8",
+        "10.0.0.0/8",
+        "100.64.0.0/10",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "224.0.0.0/4",
+        "240.0.0.0/4",
+    ),
+    "ipv6": ("::1/128", "fc00::/7", "fe80::/10", "ff00::/8"),
+}
 
 
 def parse_policy(argv):
     parser = argparse_ArgumentParser(add_help=False)
-    parser.add_argument("--egress-policy", choices=("allowlist", "deny", "direct"), default="direct")
-    parser.add_argument("--egress-allowlist", default="")
+    parser.add_argument("--egress-policy", choices=("web", "deny", "direct"), default="direct")
     parser.add_argument("--egress-enforcement", choices=("container", "deployment"), default="container")
     computed_return_value = parser.parse_known_args(argv)[0]
     return computed_return_value
@@ -39,49 +53,27 @@ def run_firewall(binary, arguments):
 
 
 def nameserver_addresses():
-    """Read the resolvers the guest must reach to resolve allowlisted destinations."""
+    """Read the resolvers the guest must reach to resolve web destinations."""
     resolv = Path("/etc/resolv.conf")
     lines = resolv.read_text().splitlines() if resolv.exists() else []
     result = [line.split()[1] for line in lines if line.strip().startswith("nameserver") and len(line.split()) > 1]
     return result
 
 
-def allowlist_addresses(hosts):
-    """Resolve each allowlisted destination once, before privileges drop; unresolvable hosts fail closed."""
-    addresses = {"ipv4": set(), "ipv6": set()}
-    for host in hosts:
-        try:
-            records = socket_getaddrinfo(host, 443, proto=IPPROTO_TCP)
-        except OSError as err:
-            raise RuntimeError(f"allowlisted egress destination {host} does not resolve: {err}") from err
-        for family, _, _, _, address in records:
-            resolved = ip_address(address[0])
-            if not resolved.is_global or resolved.is_multicast:
-                raise RuntimeError(f"allowlisted egress destination {host} resolved outside the public network")
-            addresses["ipv6" if family == AF_INET6 else "ipv4"].add(address[0])
-    return addresses
-
-
-def enforce_egress_policy(allowed_hosts=()):
-    """Allow only loopback and replies, plus DNS and HTTP(S) to resolved allowlisted destinations."""
+def enforce_egress_policy(allow_web=False):
+    """Allow only loopback and replies, plus DNS and outbound TCP 80/443 to public addresses when web egress is on."""
     ipv4 = shutil_which("iptables")
     ipv6 = shutil_which("ip6tables")
     if not ipv4:
         raise RuntimeError("controlled egress policy requires iptables")
-    destinations = allowlist_addresses(allowed_hosts) if allowed_hosts else {"ipv4": set(), "ipv6": set()}
-    resolvers = nameserver_addresses() if allowed_hosts else []
+    resolvers = nameserver_addresses() if allow_web else []
 
     def apply_rules(binary):
         family = "ipv6" if binary == ipv6 else "ipv4"
         run_firewall(binary, ["-F", "OUTPUT"])
         run_firewall(binary, ["-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"])
-        for resolver in resolvers:
-            if (":" in resolver) == (family == "ipv6"):
-                for protocol in ("udp", "tcp"):
-                    run_firewall(binary, ["-A", "OUTPUT", "-p", protocol, "-d", resolver, "--dport", "53", "-j", "ACCEPT"])
-        for address in sorted(destinations.get(family, set())):
-            for port in ("443", "80"):
-                run_firewall(binary, ["-A", "OUTPUT", "-p", "tcp", "-d", address, "--dport", port, "-j", "ACCEPT"])
+        # Replies, including the tool server's responses to a private-network
+        # client, must pass before the non-public drops below.
         run_firewall(
             binary,
             [
@@ -95,6 +87,15 @@ def enforce_egress_policy(allowed_hosts=()):
                 "ACCEPT",
             ],
         )
+        for resolver in resolvers:
+            if (":" in resolver) == (family == "ipv6"):
+                for protocol in ("udp", "tcp"):
+                    run_firewall(binary, ["-A", "OUTPUT", "-p", protocol, "-d", resolver, "--dport", "53", "-j", "ACCEPT"])
+        if allow_web:
+            for network in NON_PUBLIC_NETWORKS.get(family, ()):
+                run_firewall(binary, ["-A", "OUTPUT", "-d", network, "-j", "DROP"])
+            for port in WEB_PORTS:
+                run_firewall(binary, ["-A", "OUTPUT", "-p", "tcp", "--dport", port, "-j", "ACCEPT"])
         run_firewall(binary, ["-P", "OUTPUT", "DROP"])
         return False
 
@@ -140,18 +141,15 @@ def main(argv=COMMAND_LINE_ARGUMENTS):
     arguments = list(selected_arguments)
     policy = parse_policy(arguments)
     if policy.egress_enforcement == "deployment":
-        if policy.egress_policy not in {"allowlist", "deny"}:
+        if policy.egress_policy not in {"web", "deny"}:
             raise RuntimeError("deployment-enforced Workspace requires controlled egress")
         verify_deployment_identity()
         os_execv(sys_executable, [sys_executable, str(SERVER), *arguments])
         return False
     if policy.egress_policy == "deny":
         enforce_egress_policy()
-    elif policy.egress_policy == "allowlist":
-        hosts = tuple(host for host in policy.egress_allowlist.split(",") if host)
-        if not hosts:
-            raise RuntimeError("allowlist egress policy requires at least one destination")
-        enforce_egress_policy(hosts)
+    elif policy.egress_policy == "web":
+        enforce_egress_policy(allow_web=True)
     drop_privileges()
     os_execv(sys_executable, [sys_executable, str(SERVER), *arguments])
     return False

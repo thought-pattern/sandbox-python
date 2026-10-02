@@ -20,8 +20,8 @@ Parameters:
     Default: pypi.org,files.pythonhosted.org
   EgressPolicy:
     Type: String
-    Default: allowlist
-    AllowedValues: [allowlist, deny]
+    Default: web
+    AllowedValues: [web, deny]
 Conditions:
   Offline: !Equals [!Ref EgressPolicy, deny]
 Resources:

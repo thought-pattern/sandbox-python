@@ -332,9 +332,9 @@ def require_process_success(result, operation):
         code = "output_limit"
     else:
         code = "process_failed"
-    detail = (result.get("stderr", False) or result.get("stdout", False) or "").strip()
+    detail = (result.get("stderr", "") or result.get("stdout", "")).strip()
     raise ToolError(
-        f"{operation} failed with exit code {result.get('exitCode', False)}" + (f": {detail}" if detail else ""),
+        f"{operation} failed with exit code {result.get('exitCode', -1)}" + (f": {detail}" if detail else ""),
         code=code,
     )
 
@@ -469,8 +469,8 @@ def file_patch(path: str, patches: list):
                     code="bad_arguments",
                     status=400,
                 )
-            old = patch.get("old", False)
-            new = patch.get("new", False)
+            old = patch.get("old", "")
+            new = patch.get("new", "")
             if not isinstance(old, str) or not isinstance(new, str) or not old:
                 raise ToolError(
                     "patch old/new values must be strings and old must not be empty",
@@ -589,7 +589,7 @@ def file_search(pattern: str, path: str = ".", max_results: int = DEFAULT_MAX_SE
         matches.append(
             {
                 "file": str(Path(match.get("path", {}).get("text", "")).relative_to(WORKSPACE)),
-                "line": match.get("line_number", False),
+                "line": match.get("line_number", 0),
                 "content": match.get("lines", {}).get("text", "").strip(),
             }
         )
@@ -690,7 +690,7 @@ def pip_list():
         internal_run_process(["pip", "list", "--format=json"], timeout=30),
         "pip list",
     )
-    computed_return_value = json_loads(result.get("stdout", False))
+    computed_return_value = json_loads(result.get("stdout", ""))
     return computed_return_value
 
 
@@ -795,7 +795,7 @@ def git_diff(staged: bool = False):
     if not result.get("ok", False) and not result.get("outputLimited", False):
         require_process_success(result, "git diff")
     computed_return_value = {
-        "diff": result.get("stdout", False),
+        "diff": result.get("stdout", ""),
         "truncated": result.get("outputLimited", False),
     }
     return computed_return_value
@@ -1112,7 +1112,7 @@ class ToolHandler(BaseHTTPRequestHandler):
         return False
 
     def read_arguments(self, request_id):
-        if self.headers.get("Transfer-Encoding", False):
+        if self.headers.get("Transfer-Encoding", ""):
             raise ToolError(
                 "Transfer-Encoding is not supported",
                 code="unsupported_transfer_encoding",
@@ -1239,8 +1239,7 @@ def parse_args(argv: list):
     parser.add_argument("--workspace", type=Path, default=DEFAULT_WORKSPACE)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--auth-token", required=True)
-    parser.add_argument("--egress-policy", choices=("allowlist", "deny", "direct"), default="direct")
-    parser.add_argument("--egress-allowlist", default="")
+    parser.add_argument("--egress-policy", choices=("web", "deny", "direct"), default="direct")
     parser.add_argument("--egress-enforcement", choices=("container", "deployment"), default="container")
     parser.add_argument("--max-request-bytes", type=int, default=DEFAULT_MAX_REQUEST_BYTES)
     parser.add_argument("--max-output-bytes", type=int, default=DEFAULT_MAX_OUTPUT_BYTES)

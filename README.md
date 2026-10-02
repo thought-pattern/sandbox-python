@@ -13,8 +13,11 @@ image, tool server, lifecycle manager, and verification suite.
 - CPU, memory, request size, result size, tool concurrency, wall time, process
   trees, and process count are bounded. Docker receives a capability drop and
   `no-new-privileges`.
-- Tapestry-managed sessions default to `allowlist` with direct connections to
-  configured destinations; the root entrypoint installs IPv4/IPv6 output rules.
+- Tapestry-managed sessions default to `web`; the root entrypoint installs
+  IPv4/IPv6 output rules that allow DNS and outbound TCP 80/443 to public
+  addresses, so destinations may change IP addresses during a session. On
+  Fargate, `web` opens TCP 80/443 in the security group and the DNS Firewall
+  limits name resolution to the configured `egress_allowlist`.
   This standalone server defaults to `direct` when started without the manager.
   The explicit `deny` option is offline. There is no forwarding service or
   Workspace SQLite dependency.
@@ -151,7 +154,8 @@ without rewriting. Local operations work under every policy.
 
 Tests run the actual HTTP server and package/Git subprocesses against local
 fixtures. They do not build images, require Docker or change installed project
-packages. The standalone mocked runtime-command tests have been removed.
+packages. They need `git`, `pip` and `rg` (ripgrep) on `PATH`, the same tools
+the image installs. The standalone mocked runtime-command tests have been removed.
 
 ```bash
 python3 -m pytest tests/test_smoke.py -q

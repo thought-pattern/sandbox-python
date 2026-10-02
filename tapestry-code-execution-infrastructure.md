@@ -19,9 +19,13 @@ Tapestry client
   -> bounded process group inside /workspace
 ```
 
-Tapestry-managed networking defaults to `allowlist`; package and Git tools
-connect directly to their actual destinations when listed. The root entrypoint
-installs IPv4/IPv6 output rules before dropping privileges. The standalone
+Tapestry-managed networking defaults to `web`; package and Git tools
+connect directly to their actual destinations. The root entrypoint installs
+IPv4/IPv6 output rules before dropping privileges: DNS to the configured
+resolvers and TCP 80/443 to public addresses, with private, loopback,
+link-local and multicast networks dropped. Rules match ports rather than
+startup-resolved addresses, so CDN and failover address changes keep working.
+The standalone
 server defaults to `direct` when started without the manager; explicit `deny`
 supports offline execution. Deployment owns the EC2/Fargate network boundary.
 No intermediary rewrites or forwards requests, and Workspace has no SQLite
@@ -32,7 +36,7 @@ storage dependency.
 1. The host publish address is `127.0.0.1` in local development.
 2. A fresh bearer token is generated for every sandbox session.
 3. The HTTP server and tool subprocesses run as the `sandbox` user.
-4. Deployment owns the EC2/Fargate boundary; managed allowlist and deny modes
+4. Deployment owns the EC2/Fargate boundary; managed web and deny modes
    install guest output rules, while explicit direct startup adds no guest firewall.
 5. Request bytes, subprocess output, file reads, serialized responses,
    concurrency, timeout, CPU, memory, and process count are bounded.
