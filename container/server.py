@@ -671,7 +671,7 @@ def pip_install(packages: list):
 
 @tool
 def pip_uninstall(packages: list):
-    """Uninstall packages from the sandbox virtual environment."""
+    """Uninstall packages that pip_install added at runtime."""
     if not isinstance(packages, list) or not packages:
         raise ToolError("packages must be a non-empty list", code="bad_arguments", status=400)
     if any(not isinstance(package, str) or not re_fullmatch(r"[a-zA-Z0-9_.-]+", package) for package in packages):
@@ -971,6 +971,16 @@ def build_readiness_report():
             "tools": tools,
         },
     }
+    if not ready:
+        problems = []
+        if not workspace_exists:
+            problems.append(f"workspace {WORKSPACE} does not exist")
+        elif not workspace_writable:
+            problems.append(f"workspace {WORKSPACE} is not writable")
+        missing = [name for name, found in tools.items() if not found]
+        if missing:
+            problems.append(f"required tools not on PATH: {', '.join(missing)}")
+        result["error"] = {"code": "unhealthy", "message": "sandbox is not ready: " + "; ".join(problems)}
     return result
 
 

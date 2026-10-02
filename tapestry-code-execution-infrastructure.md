@@ -75,6 +75,8 @@ can distinguish refutation from infrastructure failure.
 The authenticated health endpoint is a readiness probe rather than a process
 liveness assertion. It verifies the workspace exists and is writable, reports
 free workspace capacity, and checks that Git, pip, and ripgrep are available.
+An unhealthy report returns 503 with an `unhealthy` error whose message names
+each failed check.
 Local Git commands execute with interactive credential acquisition disabled.
 Dedicated `git_init`, `git_log`, and `workspace_tree` tools provide bounded,
 structured startup context without requiring shell parsing.

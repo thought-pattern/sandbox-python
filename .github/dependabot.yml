@@ -1,0 +1,15 @@
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/container"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "deps"
+
+  - package-ecosystem: "docker"
+    directory: "/container"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "deps"

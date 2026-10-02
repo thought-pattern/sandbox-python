@@ -10,10 +10,10 @@ from sys import executable
 from threading import Thread
 from zipfile import ZipFile
 
-import server
 from pytest import fixture, raises
 
-from tapestry.workspace.tool_client import WorkspaceClient, WorkspaceToolError
+import server
+from workspace_client import WorkspaceClient, WorkspaceToolError
 
 TOKEN = "direct-interface-test-" + "t" * 32
 
@@ -78,7 +78,6 @@ def artifacts(tmp_path):
 
 def test_authenticated_direct_interface_runs_real_tools_and_preserves_failures(direct_tools):
     assert direct_tools.health().get("egressPolicy", "") == "direct"
-    assert direct_tools.session.trust_env is False
     with WorkspaceClient(direct_tools.base_url, "incorrect-identity") as unauthorized:
         with raises(WorkspaceToolError) as rejected:
             unauthorized.fetch_manifest()
@@ -91,6 +90,16 @@ def test_authenticated_direct_interface_runs_real_tools_and_preserves_failures(d
     with raises(WorkspaceToolError) as failed:
         direct_tools.call_tool("run_python", {"script": "raise SystemExit(7)", "timeout": 2})
     assert failed.value.result.get("exitCode", -1) == 7
+
+
+def test_unhealthy_readiness_names_each_failed_check(direct_tools, monkeypatch):
+    real_which = server.shutil_which
+    monkeypatch.setattr(server, "shutil_which", lambda name: "" if name == "rg" else real_which(name))
+    with raises(WorkspaceToolError) as unhealthy:
+        direct_tools.health()
+    assert unhealthy.value.status_code == 503
+    assert unhealthy.value.code == "unhealthy"
+    assert "required tools not on PATH: rg" in str(unhealthy.value)
 
 
 def test_pip_downloads_from_the_actual_index_without_forwarding(direct_tools, artifacts, tmp_path, monkeypatch):

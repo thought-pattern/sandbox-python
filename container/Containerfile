@@ -1,4 +1,4 @@
-FROM python:3.12-slim-bookworm
+FROM docker.io/library/python:3.12-slim-bookworm
 
 RUN apt-get update && apt-get install -y \
     git \
@@ -6,19 +6,21 @@ RUN apt-get update && apt-get install -y \
     ripgrep \
     && rm -rf /var/lib/apt/lists/*
 
-# Non-root user with a writable virtualenv on PATH, so the sandbox runs
-# unprivileged while pip_install/pip_uninstall still work at runtime.
-RUN useradd --create-home --shell /usr/sbin/nologin sandbox \
-    && python -m venv /opt/venv
-ENV PATH=/opt/venv/bin:$PATH
+RUN useradd --create-home --shell /usr/sbin/nologin sandbox
 
 COPY requirements.txt /opt/tapestry/
 RUN pip install --no-cache-dir -r /opt/tapestry/requirements.txt
 
+# The container is disposable, so there is no virtualenv. The system Python
+# stays root-owned, so pip run by the sandbox user falls back to a user install
+# under its home directory. PIP_USER is deliberately unset: it would also turn
+# pip list/freeze into --user listings that hide build-time packages.
+ENV PATH=$PATH:/home/sandbox/.local/bin
+
 COPY server.py entrypoint.py /opt/tapestry/
 
 RUN mkdir /workspace \
-    && chown -R sandbox:sandbox /workspace /opt/venv
+    && chown -R sandbox:sandbox /workspace
 WORKDIR /workspace
 
 EXPOSE 8080
