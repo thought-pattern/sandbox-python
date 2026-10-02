@@ -1,0 +1,237 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Service-only disposable Workspace substrate in an engagement's dedicated Workspace VPC.
+Parameters:
+  WorkspaceVpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Dedicated Workspace VPC with private subnets, NAT and direct application reachability supplied by account placement.
+  WorkspaceSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+  WorkspaceRouteTableIds:
+    Type: CommaDelimitedList
+  WorkspaceVpcCidr:
+    Type: String
+  Image:
+    Type: String
+    AllowedPattern: '[0-9]{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com/.+@sha256:[a-f0-9]{64}'
+  RepositoryArn:
+    Type: String
+  AllowedDestinations:
+    Type: CommaDelimitedList
+    Default: pypi.org,files.pythonhosted.org
+  EgressPolicy:
+    Type: String
+    Default: allowlist
+    AllowedValues: [allowlist, deny]
+Conditions:
+  Offline: !Equals [!Ref EgressPolicy, deny]
+Resources:
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+  Logs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 30
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: {aws:SourceAccount: !Ref AWS::AccountId}
+              ArnLike: {aws:SourceArn: !Sub 'arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:*'}
+      Policies:
+        - PolicyName: WorkspaceImageAndLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action: [ecr:BatchCheckLayerAvailability, ecr:GetDownloadUrlForLayer, ecr:BatchGetImage]
+                Resource: !Ref RepositoryArn
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub '${Logs.Arn}:*'
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref WorkspaceVpcId
+      GroupDescription: Dedicated Workspace image-pull and log service endpoints
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref WorkspaceVpcCidr
+  EcrApiEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref WorkspaceVpcId
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ecr.api'
+      PrivateDnsEnabled: true
+      SubnetIds: !Ref WorkspaceSubnetIds
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: {AWS: !GetAtt ExecutionRole.Arn}
+            Action: [ecr:GetAuthorizationToken, ecr:BatchCheckLayerAvailability, ecr:GetDownloadUrlForLayer, ecr:BatchGetImage]
+            Resource: '*'
+  EcrRegistryEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref WorkspaceVpcId
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ecr.dkr'
+      PrivateDnsEnabled: true
+      SubnetIds: !Ref WorkspaceSubnetIds
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: {AWS: !GetAtt ExecutionRole.Arn}
+            Action: [ecr:GetAuthorizationToken, ecr:BatchCheckLayerAvailability, ecr:GetDownloadUrlForLayer, ecr:BatchGetImage]
+            Resource: '*'
+  LogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref WorkspaceVpcId
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.logs'
+      PrivateDnsEnabled: true
+      SubnetIds: !Ref WorkspaceSubnetIds
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: {AWS: !GetAtt ExecutionRole.Arn}
+            Action: [logs:CreateLogStream, logs:PutLogEvents]
+            Resource: !Sub '${Logs.Arn}:*'
+  S3ImageLayersEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref WorkspaceVpcId
+      VpcEndpointType: Gateway
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      RouteTableIds: !Ref WorkspaceRouteTableIds
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::prod-${AWS::Region}-starport-layer-bucket/*'
+  AllowedDnsDomains:
+    Type: AWS::Route53Resolver::FirewallDomainList
+    Properties:
+      Domains: !If
+        - Offline
+        - - !Sub 'api.ecr.${AWS::Region}.amazonaws.com'
+          - !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com'
+          - !Sub 'logs.${AWS::Region}.amazonaws.com'
+          - !Sub 'prod-${AWS::Region}-starport-layer-bucket.s3.${AWS::Region}.amazonaws.com'
+        - !Split
+          - ','
+          - !Join
+            - ','
+            - - !Join [',', !Ref AllowedDestinations]
+              - !Sub 'api.ecr.${AWS::Region}.amazonaws.com'
+              - !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com'
+              - !Sub 'logs.${AWS::Region}.amazonaws.com'
+              - !Sub 'prod-${AWS::Region}-starport-layer-bucket.s3.${AWS::Region}.amazonaws.com'
+  AllDnsDomains:
+    Type: AWS::Route53Resolver::FirewallDomainList
+    Properties:
+      Domains: ['*']
+  DnsRuleGroup:
+    Type: AWS::Route53Resolver::FirewallRuleGroup
+    Properties:
+      FirewallRules:
+        - Action: ALLOW
+          FirewallDomainListId: !Ref AllowedDnsDomains
+          FirewallDomainRedirectionAction: TRUST_REDIRECTION_DOMAIN
+          Priority: 100
+        - Action: BLOCK
+          BlockResponse: NXDOMAIN
+          FirewallDomainListId: !Ref AllDnsDomains
+          Priority: 200
+  DnsAssociation:
+    Type: AWS::Route53Resolver::FirewallRuleGroupAssociation
+    Properties:
+      VpcId: !Ref WorkspaceVpcId
+      FirewallRuleGroupId: !Ref DnsRuleGroup
+      Priority: 100
+      MutationProtection: ENABLED
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: '1024'
+      Memory: '2048'
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      RuntimePlatform: {CpuArchitecture: X86_64, OperatingSystemFamily: LINUX}
+      ContainerDefinitions:
+        - Name: workspace
+          Image: !Ref Image
+          Essential: true
+          User: '1000:1000'
+          EntryPoint: [python, /opt/tapestry/entrypoint.py]
+          Command: [--egress-enforcement, deployment]
+          LinuxParameters:
+            Capabilities: {Drop: [ALL]}
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref Logs
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: workspace
+  ControllerPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Attach to the engagement application role that owns disposable Workspace sessions.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: [ecs:DescribeTaskDefinition, ecs:DescribeTasks, ecs:ListTasks]
+            Resource: '*'
+          - Effect: Allow
+            Action: ecs:RunTask
+            Resource: !Ref TaskDefinition
+            Condition: {ArnEquals: {ecs:cluster: !GetAtt Cluster.Arn}}
+          - Effect: Allow
+            Action: ecs:StopTask
+            Resource: !Sub 'arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${Cluster}/*'
+          - Effect: Allow
+            Action: iam:PassRole
+            Resource: !GetAtt ExecutionRole.Arn
+            Condition: {StringEquals: {iam:PassedToService: ecs-tasks.amazonaws.com}}
+          - Effect: Allow
+            Action: [ec2:DescribeSubnets, ec2:DescribeSecurityGroups, ec2:DescribeVpcEndpoints, ec2:DescribeNetworkInterfaces, ec2:DescribePrefixLists, ec2:DescribeRouteTables]
+            Resource: '*'
+          - Effect: Allow
+            Action: [ec2:CreateSecurityGroup, ec2:CreateTags, ec2:DeleteSecurityGroup, ec2:AuthorizeSecurityGroupIngress, ec2:AuthorizeSecurityGroupEgress, ec2:RevokeSecurityGroupEgress]
+            Resource: '*'
+            Condition: {StringEquals: {aws:RequestedRegion: !Ref AWS::Region}}
+          - Effect: Allow
+            Action: [route53resolver:GetFirewallConfig, route53resolver:ListFirewallRuleGroupAssociations, route53resolver:ListFirewallRules, route53resolver:ListFirewallDomains]
+            Resource: '*'
+Outputs:
+  Cluster: {Value: !GetAtt Cluster.Arn}
+  TaskDefinition: {Value: !Ref TaskDefinition}
+  DnsRuleGroup: {Value: !Ref DnsRuleGroup}
+  EndpointIds:
+    Value: !Join [',', [!Ref EcrApiEndpoint, !Ref EcrRegistryEndpoint, !Ref LogsEndpoint, !Ref S3ImageLayersEndpoint]]
+  ControllerPolicy: {Value: !Ref ControllerPolicy}

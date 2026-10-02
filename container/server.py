@@ -8,6 +8,7 @@ are bounded so one tool call cannot exhaust the service.
 """
 
 from argparse import ArgumentParser as argparse_ArgumentParser
+from hashlib import sha256 as hashlib_sha256
 from hmac import compare_digest as hmac_compare_digest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from inspect import Parameter as inspect_Parameter
@@ -17,13 +18,19 @@ from json import loads as json_loads
 from logging import INFO as logging_INFO
 from logging import basicConfig as logging_basicConfig
 from logging import getLogger as logging_getLogger
+from math import isfinite
 from os import environ as os_environ
+from os import O_CLOEXEC, O_DIRECTORY, O_NOFOLLOW, O_NONBLOCK, O_RDONLY
+from os import close as os_close
 from os import fdopen as os_fdopen
 from os import fsync as os_fsync
+from os import fstat as os_fstat
 from os import getpid as os_getpid
 from os import kill as os_kill
 from os import killpg as os_killpg
 from os import read as os_read
+from os import open as os_open
+from os import scandir as os_scandir
 from pathlib import Path
 from re import compile as re_compile
 from re import fullmatch as re_fullmatch
@@ -37,6 +44,7 @@ from shutil import which as shutil_which
 from signal import SIGKILL as signal_SIGKILL
 from signal import SIGTERM as signal_SIGTERM
 from socketserver import TCPServer
+from stat import S_ISREG
 from subprocess import PIPE as subprocess_PIPE
 from subprocess import Popen as subprocess_Popen
 from subprocess import TimeoutExpired as subprocess_TimeoutExpired
@@ -65,12 +73,15 @@ DEFAULT_MAX_CONCURRENT_REQUESTS = 4
 DEFAULT_MAX_TOOL_TIMEOUT = 300
 DEFAULT_REQUEST_READ_TIMEOUT = 10.0
 DEFAULT_MAX_LIST_RESULTS = 5_000
+DEFAULT_MAX_LIST_ENTRIES = 10_000
+DEFAULT_LIST_TIMEOUT = 5.0
 DEFAULT_MAX_SEARCH_RESULTS = 1_000
 DEFAULT_MAX_GIT_LOG_RESULTS = 100
 MIN_MAX_RESPONSE_BYTES = 512
 
 WORKSPACE = DEFAULT_WORKSPACE
 EGRESS_POLICY = "direct"
+EGRESS_ENFORCEMENT = "container"
 MAX_OUTPUT_BYTES = DEFAULT_MAX_OUTPUT_BYTES
 MAX_FILE_BYTES = DEFAULT_MAX_FILE_BYTES
 MAX_TOOL_TIMEOUT = DEFAULT_MAX_TOOL_TIMEOUT
@@ -127,10 +138,15 @@ def atomic_write_text(target, content):
 
 
 def bounded_timeout(timeout):
+    """Admit a finite native positive tool timeout before acquiring a process."""
+    if type(timeout) not in (int, float):
+        raise ToolError("timeout must be a native number", code="invalid_timeout", status=400)
     try:
         value = float(timeout)
-    except (TypeError, ValueError) as err:
-        raise ToolError("timeout must be numeric", code="invalid_timeout", status=400) from err
+    except OverflowError as err:
+        raise ToolError("timeout must be finite", code="invalid_timeout", status=400) from err
+    if not isfinite(value):
+        raise ToolError("timeout must be finite", code="invalid_timeout", status=400)
     if value <= 0:
         raise ToolError("timeout must be greater than zero", code="invalid_timeout", status=400)
     computed_return_value = min(value, float(MAX_TOOL_TIMEOUT))
@@ -338,15 +354,89 @@ def file_read(path: str):
     """Read bounded UTF-8 contents of a file."""
     target = resolve_path(path)
     with FILE_LOCK:
-        size = target.stat().st_size
-        if size > MAX_FILE_BYTES:
-            raise ToolError(
-                f"File exceeds the configured {MAX_FILE_BYTES}-byte read limit",
-                code="file_too_large",
-                status=413,
-            )
-        content = target.read_text(encoding="utf-8")
+        content = workspace_file_text(target)
     return content
+
+
+def workspace_file_text(target) -> str:
+    """Read bounded regular-file bytes through the canonical descriptor owner."""
+    try:
+        source = scoped_repository_bytes(WORKSPACE, target, MAX_FILE_BYTES)
+    except ToolError as err:
+        if err.code == "bad_arguments":
+            raise ToolError("Expected a regular file", code="not_file", status=400) from err
+        raise
+    if len(source) > MAX_FILE_BYTES:
+        raise ToolError("File exceeds its byte allowance", code="file_too_large", status=413)
+    try:
+        return source.decode("utf-8")
+    except UnicodeDecodeError as err:
+        raise ToolError("File is not UTF-8", code="invalid_source_encoding", status=422) from err
+
+
+@tool
+def file_read_scoped(repository_root: str, path: str, max_bytes: int = 262144):
+    """Read exact UTF-8 bytes beneath one resolved repository root with provenance."""
+    if type(repository_root) is not str or not repository_root or type(path) is not str or not path:
+        raise ToolError("Scoped read requires repository root and relative path", code="bad_arguments", status=400)
+    if type(max_bytes) is not int or not 0 < max_bytes <= 262144:
+        raise ToolError("Scoped read byte limit is invalid", code="bad_arguments", status=400)
+    parts = path.split("/")
+    if Path(path).is_absolute() or any(part in {"", ".", ".."} for part in parts):
+        raise ToolError("Scoped read path must be canonical and relative", code="bad_arguments", status=400)
+    root = resolve_path(repository_root)
+    target = (root / path).resolve()
+    if not root.is_dir() or not target.is_relative_to(root):
+        raise ToolError("Scoped read escaped its repository root", code="path_escape", status=400)
+    with FILE_LOCK:
+        source = scoped_repository_bytes(root, target, min(max_bytes, MAX_FILE_BYTES))
+    if len(source) > min(max_bytes, MAX_FILE_BYTES):
+        raise ToolError("Scoped source changed beyond its byte allowance", code="file_too_large", status=413)
+    try:
+        content = source.decode("utf-8")
+    except UnicodeDecodeError as err:
+        raise ToolError("Scoped source is not UTF-8", code="invalid_source_encoding", status=422) from err
+    return {
+        "repository_root": str(root),
+        "resolved_path": str(target),
+        "relative_path": str(target.relative_to(root)),
+        "content": content,
+        "content_sha256": hashlib_sha256(source).hexdigest(),
+        "byte_count": len(source),
+    }
+
+
+def scoped_repository_bytes(root: Path, target: Path, byte_limit: int) -> bytes:
+    """Open canonical path components by descriptor so later symlink swaps cannot escape."""
+    directory = os_open("/", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+    try:
+        relative = target.relative_to(root)
+        if not relative.name:
+            raise ToolError("Scoped source is not a regular file", code="bad_arguments", status=400)
+        for component in (*root.parts[1:], *relative.parts[:-1]):
+            try:
+                child = os_open(component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC, dir_fd=directory)
+            except PermissionError:
+                raise
+            except OSError as err:
+                raise ToolError("Scoped repository directory changed or is unavailable", code="path_escape", status=400) from err
+            os_close(directory)
+            directory = child
+        try:
+            descriptor = os_open(relative.name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, dir_fd=directory)
+        except (FileNotFoundError, PermissionError):
+            raise
+        except OSError as err:
+            raise ToolError("Scoped repository file changed or is unavailable", code="path_escape", status=400) from err
+        with os_fdopen(descriptor, "rb") as opened:
+            state = os_fstat(opened.fileno())
+            if not S_ISREG(state.st_mode):
+                raise ToolError("Scoped source is not a regular file", code="bad_arguments", status=400)
+            if state.st_size > byte_limit:
+                raise ToolError("Scoped source exceeds its byte allowance", code="file_too_large", status=413)
+            return opened.read(byte_limit + 1)
+    finally:
+        os_close(directory)
 
 
 @tool
@@ -371,7 +461,7 @@ def file_patch(path: str, patches: list):
     if not isinstance(patches, list):
         raise ToolError("patches must be a list", code="bad_arguments", status=400)
     with FILE_LOCK:
-        content = target.read_text(encoding="utf-8")
+        content = workspace_file_text(target)
         for patch in patches:
             if not isinstance(patch, dict) or "old" not in patch or "new" not in patch:
                 raise ToolError(
@@ -410,24 +500,68 @@ def file_delete(path: str):
 
 @tool
 def file_list(path: str = ".", depth: int = 2, max_results: int = DEFAULT_MAX_LIST_RESULTS):
-    """List a bounded number of files beneath a workspace directory."""
+    """List files with depth pruning, bounded discovery and explicit incomplete results."""
     target = resolve_path(path)
     depth = max(0, min(int(depth), 64))
     max_results = max(1, min(int(max_results), DEFAULT_MAX_LIST_RESULTS))
+    started = time_monotonic()
+    deadline = started + min(DEFAULT_LIST_TIMEOUT, MAX_TOOL_TIMEOUT)
     files = []
-    truncated = False
-    for candidate in target.rglob("*"):
-        try:
-            relative_to_target = candidate.relative_to(target)
-        except ValueError:
-            continue
-        if len(relative_to_target.parts) > depth or not candidate.is_file():
-            continue
-        files.append(str(candidate.relative_to(WORKSPACE)))
-        if len(files) >= max_results:
-            truncated = True
+    pending = [(target, 0)] if depth else []
+    visited_entries = 0
+    visited_directories = 0
+    stop_reason = "complete"
+    while pending:
+        if visited_entries >= DEFAULT_MAX_LIST_ENTRIES:
+            stop_reason = "entry_limit"
             break
-    computed_return_value = {"files": sorted(files), "truncated": truncated}
+        if time_monotonic() >= deadline:
+            stop_reason = "time_limit"
+            break
+        directory, directory_depth = pending.pop()
+        entries = []
+        with os_scandir(directory) as iterator:
+            visited_directories += 1
+            while True:
+                if visited_entries >= DEFAULT_MAX_LIST_ENTRIES:
+                    stop_reason = "entry_limit"
+                    break
+                if time_monotonic() >= deadline:
+                    stop_reason = "time_limit"
+                    break
+                try:
+                    entry = next(iterator)
+                except StopIteration:
+                    break
+                visited_entries += 1
+                entries.append(entry)
+        # A partial directory cannot supply deterministic selection from its raw filesystem order.
+        if stop_reason != "complete":
+            break
+        children = []
+        for entry in sorted(entries, key=lambda item: item.name):
+            if time_monotonic() >= deadline:
+                stop_reason = "time_limit"
+                break
+            candidate = Path(entry.path)
+            if entry.is_file():
+                files.append(str(candidate.relative_to(WORKSPACE)))
+                if len(files) >= max_results:
+                    stop_reason = "result_limit"
+                    break
+            elif directory_depth + 1 < depth and entry.is_dir(follow_symlinks=False):
+                children.append((candidate, directory_depth + 1))
+        if stop_reason != "complete":
+            break
+        pending.extend(reversed(children))
+    computed_return_value = {
+        "files": sorted(files),
+        "truncated": stop_reason != "complete",
+        "visitedEntries": visited_entries,
+        "visitedDirectories": visited_directories,
+        "durationMs": round((time_monotonic() - started) * 1000, 3),
+        "stopReason": stop_reason,
+    }
     return computed_return_value
 
 
@@ -466,6 +600,52 @@ def file_search(pattern: str, path: str = ".", max_results: int = DEFAULT_MAX_SE
         "truncated": len(matches) >= max_results or result.get("outputLimited", False),
     }
     return computed_return_value
+
+
+@tool
+def file_search_scoped(repository_root: str, symbol: str, max_results: int = 32):
+    """Return bounded Python-source leads relative to one resolved repository."""
+    if type(repository_root) is not str or not repository_root or type(symbol) is not str:
+        raise ToolError("Scoped Python search requires repository root and symbol", code="bad_arguments", status=400)
+    if re_fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", symbol) is None:
+        raise ToolError("Scoped Python search symbol is invalid", code="bad_arguments", status=400)
+    if type(max_results) is not int or not 0 < max_results <= 64:
+        raise ToolError("Scoped Python search limit is invalid", code="bad_arguments", status=400)
+    root = resolve_path(repository_root)
+    if not root.is_dir():
+        raise ToolError("Scoped Python repository root is missing", code="path_missing", status=404)
+    result = internal_run_process(["rg", "--json", "--fixed-strings", "--glob", "*.py", "-e", symbol, "--", str(root)], timeout=15)
+    if result.get("exitCode", ()) not in (0, 1, -2):
+        require_process_success(result, "scoped Python search")
+    matches = []
+    for line in result.get("stdout", "").splitlines():
+        if not line:
+            continue
+        try:
+            data = json_loads(line)
+        except ValueError:
+            if result.get("outputLimited", False):
+                break
+            raise
+        if data.get("type", "") != "match":
+            continue
+        selected = Path(data.get("data", {}).get("path", {}).get("text", "")).resolve()
+        if not selected.is_relative_to(root):
+            raise ToolError("Scoped Python search escaped its repository root", code="path_escape", status=400)
+        matches.append(
+            {
+                "relative_path": str(selected.relative_to(root)),
+                "line": data.get("data", {}).get("line_number", 0),
+            }
+        )
+        if len(matches) >= max_results:
+            break
+    return {
+        "repository_root": str(root),
+        "symbol": symbol,
+        "matches": matches,
+        "truncated": len(matches) >= max_results or result.get("outputLimited", False),
+    }
 
 
 PACKAGE_PATTERN = re_compile(r"^[a-zA-Z0-9_.-]+([=<>!~\[\]][a-zA-Z0-9._,<>=!~\[\]]*)?$")
@@ -760,6 +940,7 @@ def build_manifest():
         "apiVersion": API_VERSION,
         "protocol": PROTOCOL_NAME,
         "egressPolicy": EGRESS_POLICY,
+        "egressEnforcement": EGRESS_ENFORCEMENT,
         "tools": tools,
     }
 
@@ -908,6 +1089,7 @@ class ToolHandler(BaseHTTPRequestHandler):
             payload["python"] = sys_version
             payload["apiVersion"] = API_VERSION
             payload["egressPolicy"] = EGRESS_POLICY
+            payload["egressEnforcement"] = EGRESS_ENFORCEMENT
             payload["requestId"] = request_id
             status = 200 if payload.get("status", "") == "healthy" else 503
             self.send_json(status, payload, request_id=request_id)
@@ -1049,6 +1231,7 @@ def parse_args(argv: list):
     parser.add_argument("--auth-token", required=True)
     parser.add_argument("--egress-policy", choices=("allowlist", "deny", "direct"), default="direct")
     parser.add_argument("--egress-allowlist", default="")
+    parser.add_argument("--egress-enforcement", choices=("container", "deployment"), default="container")
     parser.add_argument("--max-request-bytes", type=int, default=DEFAULT_MAX_REQUEST_BYTES)
     parser.add_argument("--max-output-bytes", type=int, default=DEFAULT_MAX_OUTPUT_BYTES)
     parser.add_argument("--max-file-bytes", type=int, default=DEFAULT_MAX_FILE_BYTES)
@@ -1062,7 +1245,7 @@ def parse_args(argv: list):
 
 def configure(args):
     """Apply validated process-wide settings before accepting requests."""
-    global WORKSPACE, EGRESS_POLICY, MAX_OUTPUT_BYTES, MAX_FILE_BYTES
+    global WORKSPACE, EGRESS_POLICY, EGRESS_ENFORCEMENT, MAX_OUTPUT_BYTES, MAX_FILE_BYTES
     global MAX_TOOL_TIMEOUT
     if len(args.auth_token) < 32:
         raise ValueError("auth token must be at least 32 characters")
@@ -1085,6 +1268,7 @@ def configure(args):
     WORKSPACE = args.workspace.resolve()
     WORKSPACE.mkdir(parents=True, exist_ok=True)
     EGRESS_POLICY = args.egress_policy
+    EGRESS_ENFORCEMENT = args.egress_enforcement
     MAX_OUTPUT_BYTES = args.max_output_bytes
     MAX_FILE_BYTES = args.max_file_bytes
     MAX_TOOL_TIMEOUT = args.max_tool_timeout

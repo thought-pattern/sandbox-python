@@ -1,6 +1,8 @@
 """Configure the sandbox network boundary, drop privilege, and start the server."""
 
 from argparse import ArgumentParser as argparse_ArgumentParser
+from ctypes import CDLL, get_errno
+from ipaddress import ip_address
 from os import environ as os_environ
 from os import execv as os_execv
 from os import geteuid as os_geteuid
@@ -24,6 +26,7 @@ def parse_policy(argv):
     parser = argparse_ArgumentParser(add_help=False)
     parser.add_argument("--egress-policy", choices=("allowlist", "deny", "direct"), default="direct")
     parser.add_argument("--egress-allowlist", default="")
+    parser.add_argument("--egress-enforcement", choices=("container", "deployment"), default="container")
     computed_return_value = parser.parse_known_args(argv)[0]
     return computed_return_value
 
@@ -52,6 +55,9 @@ def allowlist_addresses(hosts):
         except OSError as err:
             raise RuntimeError(f"allowlisted egress destination {host} does not resolve: {err}") from err
         for family, _, _, _, address in records:
+            resolved = ip_address(address[0])
+            if not resolved.is_global or resolved.is_multicast:
+                raise RuntimeError(f"allowlisted egress destination {host} resolved outside the public network")
             addresses["ipv6" if family == AF_INET6 else "ipv4"].add(address[0])
     return addresses
 
@@ -117,10 +123,28 @@ def drop_privileges(username="sandbox"):
     return False
 
 
+def verify_deployment_identity():
+    """Start a deployment-enforced guest without retaining privilege or gaining it on exec."""
+    if os_geteuid() == 0:
+        raise RuntimeError("deployment-enforced Workspace must start as nonroot")
+    status = dict(line.split(":", 1) for line in Path("/proc/self/status").read_text().splitlines() if ":" in line)
+    if any(int(status.get(name, "1").strip(), 16) for name in ("CapEff", "CapPrm", "CapAmb")):
+        raise RuntimeError("deployment-enforced Workspace must have zero guest capabilities")
+    libc = CDLL(None, use_errno=True)
+    if libc.prctl(38, 1, 0, 0, 0) != 0:
+        raise RuntimeError(f"Workspace could not install no-new-privileges: errno {get_errno()}")
+
+
 def main(argv=COMMAND_LINE_ARGUMENTS):
     selected_arguments = sys_argv[1:] if argv is COMMAND_LINE_ARGUMENTS else argv
     arguments = list(selected_arguments)
     policy = parse_policy(arguments)
+    if policy.egress_enforcement == "deployment":
+        if policy.egress_policy not in {"allowlist", "deny"}:
+            raise RuntimeError("deployment-enforced Workspace requires controlled egress")
+        verify_deployment_identity()
+        os_execv(sys_executable, [sys_executable, str(SERVER), *arguments])
+        return False
     if policy.egress_policy == "deny":
         enforce_egress_policy()
     elif policy.egress_policy == "allowlist":

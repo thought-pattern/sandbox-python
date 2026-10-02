@@ -19,17 +19,21 @@ Tapestry client
   -> bounded process group inside /workspace
 ```
 
-Networking defaults to `direct`; package and Git tools connect to actual
-destinations. Deployment owns the EC2/Fargate network boundary. The explicit
-local `deny` option supports offline execution. No intermediary rewrites or
-forwards requests, and Workspace has no SQLite storage dependency.
+Tapestry-managed networking defaults to `allowlist`; package and Git tools
+connect directly to their actual destinations when listed. The root entrypoint
+installs IPv4/IPv6 output rules before dropping privileges. The standalone
+server defaults to `direct` when started without the manager; explicit `deny`
+supports offline execution. Deployment owns the EC2/Fargate network boundary.
+No intermediary rewrites or forwards requests, and Workspace has no SQLite
+storage dependency.
 
 ## Security invariants
 
 1. The host publish address is `127.0.0.1` in local development.
 2. A fresh bearer token is generated for every sandbox session.
 3. The HTTP server and tool subprocesses run as the `sandbox` user.
-4. Network isolation is deployment-owned; direct startup adds no application firewall.
+4. Deployment owns the EC2/Fargate boundary; managed allowlist and deny modes
+   install guest output rules, while explicit direct startup adds no guest firewall.
 5. Request bytes, subprocess output, file reads, serialized responses,
    concurrency, timeout, CPU, memory, and process count are bounded.
 6. Timeouts and output overruns terminate the complete process group.

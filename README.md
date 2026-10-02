@@ -13,12 +13,63 @@ image, tool server, lifecycle manager, and verification suite.
 - CPU, memory, request size, result size, tool concurrency, wall time, process
   trees, and process count are bounded. Docker receives a capability drop and
   `no-new-privileges`.
-- Networking defaults to `direct`; packages and Git use actual destinations.
-  The explicit local `deny` option installs an offline IPv4/IPv6 OUTPUT policy.
-  There is no forwarding service or Workspace SQLite dependency.
+- Tapestry-managed sessions default to `allowlist` with direct connections to
+  configured destinations; the root entrypoint installs IPv4/IPv6 output rules.
+  This standalone server defaults to `direct` when started without the manager.
+  The explicit `deny` option is offline. There is no forwarding service or
+  Workspace SQLite dependency.
 
 The authentication token is passed as an explicit manager argument, not read
 from environment variables or committed configuration.
+
+## Fargate deployment
+
+`workspace-fargate.yml` provides the declarative production substrate. Supply
+the engagement's dedicated Workspace VPC, private subnets and route tables,
+an immutable service-only ECR image digest and its repository ARN. Account
+placement supplies the NAT route and direct application reachability. Attach
+the emitted controller policy to the application role. DNS Firewall must have
+fail-open disabled. This stack's DNS allow/block policy belongs only to the
+dedicated Workspace VPC.
+
+Select the adapter explicitly:
+
+```python
+from tapestry.workspace.execution_sandbox import ExecutionSandbox
+
+workspace = ExecutionSandbox(
+    runtime="fargate",
+    implementation_directory="",
+    image="123456789012.dkr.ecr.us-east-1.amazonaws.com/workspace@sha256:" + "a" * 64,
+    deployment={
+        "account_id": "123456789012",
+        "region": "us-east-1",
+        "cluster": "arn:aws:ecs:us-east-1:123456789012:cluster/workspace",
+        "task_definition": "arn:aws:ecs:us-east-1:123456789012:task-definition/workspace:1",
+        "vpc_id": "vpc-...",
+        "subnets": ["subnet-..."],
+        "application_security_group": "sg-...",
+        "endpoint_ids": ["vpce-ecr-api", "vpce-ecr-registry", "vpce-logs", "vpce-s3"],
+        "dns_rule_group_id": "rslvr-frg-...",
+        "startup_timeout": 90,
+        "cleanup_timeout": 60,
+    },
+)
+with workspace.session() as run_probe:
+    result = run_probe("print(6 * 7)", 5)
+```
+
+The adapter verifies deployment resources before creating a session's security
+group. It removes broad default egress, grants only resolved public destination
+and declared bootstrap traffic, launches one private task with no guest AWS
+role, and stops the task before deleting the group. Cleanup preserves primary
+failures and waits for ENI release. Fargate starts the server as nonroot with
+`--egress-enforcement deployment`; it does not request NET_ADMIN. Health and
+manifest report the enforcement owner.
+
+CloudFormation lint and offline native AWS SDK lifecycle validation pass.
+Production acceptance requires deployment in an actual engagement account;
+development Docker verification does not establish Fargate isolation.
 
 ## Structure
 
@@ -93,8 +144,8 @@ prompts so unavailable credentials fail within the normal tool contract rather
 than consuming the tool timeout.
 
 Remote package installation, clone, and push fail under explicit `deny` mode.
-Under default `direct` mode they use the actual index, repository URL or remote
-without rewriting. Local operations work under either policy.
+Under explicitly selected `direct` mode they use the actual index, repository URL or remote
+without rewriting. Local operations work under every policy.
 
 ## Verification
 
