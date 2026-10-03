@@ -29,4 +29,5 @@ EXPOSE 8080
 # firewall, then irreversibly drops to the sandbox user before the HTTP server
 # starts or any tool code can execute.
 USER root
+STOPSIGNAL SIGTERM
 ENTRYPOINT ["python", "/opt/tapestry/entrypoint.py"]

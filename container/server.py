@@ -42,7 +42,9 @@ from shutil import move as shutil_move
 from shutil import rmtree as shutil_rmtree
 from shutil import which as shutil_which
 from signal import SIGKILL as signal_SIGKILL
+from signal import SIGINT as signal_SIGINT
 from signal import SIGTERM as signal_SIGTERM
+from signal import signal as signal_signal
 from socketserver import TCPServer
 from stat import S_ISREG
 from subprocess import PIPE as subprocess_PIPE
@@ -54,6 +56,7 @@ from sys import version as sys_version
 from tempfile import NamedTemporaryFile as tempfile_NamedTemporaryFile
 from tempfile import mkstemp as tempfile_mkstemp
 from threading import BoundedSemaphore as threading_BoundedSemaphore
+from threading import Event as threading_Event
 from threading import RLock as threading_RLock
 from time import monotonic as time_monotonic
 from uuid import uuid4
@@ -500,17 +503,25 @@ def file_delete(path: str):
 
 @tool
 def file_list(path: str = ".", depth: int = 2, max_results: int = DEFAULT_MAX_LIST_RESULTS):
-    """List files with depth pruning, bounded discovery and explicit incomplete results."""
+    """List the inspected root, files and directories with explicit recursive coverage."""
     target = resolve_path(path)
+    if not target.is_dir():
+        raise ToolError("Path is not a directory", code="not_directory", status=400)
     depth = max(0, min(int(depth), 64))
     max_results = max(1, min(int(max_results), DEFAULT_MAX_LIST_RESULTS))
     started = time_monotonic()
     deadline = started + min(DEFAULT_LIST_TIMEOUT, MAX_TOOL_TIMEOUT)
     files = []
+    directories = []
+    links = []
+    other = []
+    depth_limited = depth == 0
     pending = [(target, 0)] if depth else []
     visited_entries = 0
     visited_directories = 0
     stop_reason = "complete"
+    root = {"path": str(target.relative_to(WORKSPACE)), "kind": "directory", "children": []}
+    tree_nodes = {root.get("path"): root}
     while pending:
         if visited_entries >= DEFAULT_MAX_LIST_ENTRIES:
             stop_reason = "entry_limit"
@@ -539,23 +550,48 @@ def file_list(path: str = ".", depth: int = 2, max_results: int = DEFAULT_MAX_LI
         if stop_reason != "complete":
             break
         children = []
+        parent_node = tree_nodes.get(str(directory.relative_to(WORKSPACE)))
         for entry in sorted(entries, key=lambda item: item.name):
             if time_monotonic() >= deadline:
                 stop_reason = "time_limit"
                 break
             candidate = Path(entry.path)
-            if entry.is_file():
-                files.append(str(candidate.relative_to(WORKSPACE)))
-                if len(files) >= max_results:
-                    stop_reason = "result_limit"
-                    break
-            elif directory_depth + 1 < depth and entry.is_dir(follow_symlinks=False):
-                children.append((candidate, directory_depth + 1))
+            relative_path = str(candidate.relative_to(WORKSPACE))
+            if entry.is_symlink():
+                links.append(relative_path)
+                kind = "link"
+            elif entry.is_file(follow_symlinks=False):
+                files.append(relative_path)
+                kind = "file"
+            elif entry.is_dir(follow_symlinks=False):
+                directories.append(relative_path)
+                kind = "directory"
+                if directory_depth + 1 < depth:
+                    children.append((candidate, directory_depth + 1))
+                else:
+                    depth_limited = True
+            else:
+                other.append(relative_path)
+                kind = "other"
+            node = {"path": relative_path, "kind": kind}
+            if kind == "directory":
+                node["children"] = []
+                tree_nodes[relative_path] = node
+            parent_node.get("children", []).append(node)
+            if len(files) + len(directories) + len(links) + len(other) >= max_results:
+                stop_reason = "result_limit"
+                break
         if stop_reason != "complete":
             break
         pending.extend(reversed(children))
     computed_return_value = {
+        "workspaceRoot": str(WORKSPACE),
+        "root": root,
         "files": sorted(files),
+        "directories": sorted(directories),
+        "links": sorted(links),
+        "other": sorted(other),
+        "scan": {"depth": depth, "depthLimited": depth_limited, "complete": stop_reason == "complete" and not depth_limited},
         "truncated": stop_reason != "complete",
         "visitedEntries": visited_entries,
         "visitedDirectories": visited_directories,
@@ -989,7 +1025,7 @@ class ToolHTTPServer(ThreadingHTTPServer):
 
     server_name: str
     server_port: int
-    daemon_threads = True
+    daemon_threads = False
 
     def server_bind(self):
         """Bind without HTTPServer's blocking reverse-DNS lookup."""
@@ -1297,7 +1333,29 @@ def main(argv: list):
         max_concurrent_requests=args.max_concurrent_requests,
         request_read_timeout=args.request_read_timeout,
     )
-    server.serve_forever()
+    stopped = threading_Event()
+    shutdown = {"signal": 0}
+
+    def request_shutdown(number, frame):
+        """Ask the main HTTP owner to stop accepting and drain current work."""
+        shutdown["signal"] = number
+        stopped.set()
+
+    previous_handlers = {}
+    try:
+        for number in (signal_SIGTERM, signal_SIGINT):
+            previous_handlers[number] = signal_signal(number, request_shutdown)
+        server.timeout = 0.25
+        while not stopped.is_set():
+            server.handle_request()
+        LOGGER.info("workspace_shutdown requested signal=%s; draining accepted requests", shutdown.get("signal"))
+    finally:
+        try:
+            server.server_close()
+        finally:
+            for number, handler in previous_handlers.items():
+                signal_signal(number, handler)
+    LOGGER.info("workspace_shutdown completed accepted requests drained")
     return False
 
 
