@@ -2,8 +2,7 @@
 
 **Status:** MVP implementation  
 **Interface:** authenticated HTTP, API version 1.0  
-**Runtimes:** Apple container, Docker, podman; Fargate contract present but not
-production-validated
+**Runtime:** Docker in development
 
 ## Design
 
@@ -14,27 +13,33 @@ workspace through a small, self-describing HTTP tool interface.
 ```text
 Tapestry client
   -> loopback/private authenticated HTTP
-  -> container entrypoint establishes network policy
+  -> direct tool endpoint
   -> entrypoint drops to non-root sandbox user
   -> bounded tool server
   -> bounded process group inside /workspace
 ```
 
-The current MVP supports fail-closed `deny` and controlled `broker` policies.
-Direct outbound flows are blocked by the guest firewall in both modes. Broker
-mode adds exactly one allowed destination: the external broker's explicit IPv4
-address and TCP port. Package installation and remote Git tools use that broker;
-other direct traffic remains unavailable.
+Tapestry-managed networking defaults to `web`; package and Git tools
+connect directly to their actual destinations. The root entrypoint installs
+IPv4/IPv6 output rules before dropping privileges: DNS to the configured
+resolvers and TCP 80/443 to public addresses, with private, loopback,
+link-local and multicast networks dropped. Rules match ports rather than
+startup-resolved addresses, so CDN and failover address changes keep working.
+The standalone
+server defaults to `direct` when started without the manager; explicit `deny`
+supports offline execution. Deployment owns the EC2/Fargate network boundary.
+No intermediary rewrites or forwards requests, and Workspace has no SQLite
+storage dependency.
 
 ## Security invariants
 
 1. The host publish address is `127.0.0.1` in local development.
 2. A fresh bearer token is generated for every sandbox session.
 3. The HTTP server and tool subprocesses run as the `sandbox` user.
-4. Direct egress is denied before the untrusted tool surface starts.
+4. Deployment owns the EC2/Fargate boundary; managed web and deny modes
+   install guest output rules, while explicit direct startup adds no guest firewall.
 5. Request bytes, subprocess output, file reads, serialized responses,
-   concurrency, timeout, CPU, and memory are bounded; Docker/podman additionally
-   bound process count.
+   concurrency, timeout, CPU, memory, and process count are bounded.
 6. Timeouts and output overruns terminate the complete process group.
 7. File writes and patches replace their target atomically.
 8. Cleanup failure is reported; it is not silently described as successful.
@@ -42,16 +47,16 @@ other direct traffic remains unavailable.
 
 ## Runtime lifecycle
 
-`ContainerConfig` owns the image, internal port, dynamically selected host
-port, loopback bind, per-session token, resource bounds, and egress policy.
-`sandbox_session` creates and starts the container, yields it, then force-removes
+An owned native configuration carries image, requested port, loopback bind,
+resource bounds and networking mode. The session owns fresh identity and the
+observed endpoint. `sandbox_session` creates and starts one container, yields its endpoint, then force-removes
 it. If work and cleanup both fail, the original work failure is preserved and
 annotated with the cleanup failure.
 
-Apple's runtime requires whole-number CPU allocations. Docker and podman retain
-fractional CPU limits and add `--cap-drop ALL`, `no-new-privileges`, a PID limit,
-and only the temporary `NET_ADMIN` capability needed by the root entrypoint.
-After firewall setup, the entrypoint clears groups and changes permanently to
+Docker applies fractional CPU limits, `--cap-drop ALL`,
+`no-new-privileges`, a PID limit and the `SETGID`/`SETUID` capabilities needed to
+drop identity. Only explicit local offline mode adds `NET_ADMIN`.
+The entrypoint clears groups and changes permanently to
 the non-root user.
 
 ## API contract
@@ -74,15 +79,16 @@ can distinguish refutation from infrastructure failure.
 The authenticated health endpoint is a readiness probe rather than a process
 liveness assertion. It verifies the workspace exists and is writable, reports
 free workspace capacity, and checks that Git, pip, and ripgrep are available.
+An unhealthy report returns 503 with an `unhealthy` error whose message names
+each failed check.
 Local Git commands execute with interactive credential acquisition disabled.
 Dedicated `git_init`, `git_log`, and `workspace_tree` tools provide bounded,
 structured startup context without requiring shell parsing.
 
-## External broker
+## Verification
 
-The controlled egress broker remains outside this container. The local broker
-provides destination/method policy, broker-held credential headers, request and
-response bounds, redirect validation, and hash-chained SQLite audit records.
-The sandbox receives only a per-session broker token. Fargate broker mode still
-requires private subnets and security groups whose only egress destination is
-the production broker; local MVP completion does not claim that AWS deployment.
+Tests consume the actual HTTP tool interface and run repository-controlled
+subprocess fixtures without Docker. Package/Git tests use disposable local
+destinations. The live developer-task harness consumes independent caller-provisioned
+execution and acceptance interfaces; it does not provision containers or execute
+model-authored code on the host.

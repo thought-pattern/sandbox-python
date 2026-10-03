@@ -1,45 +1,62 @@
-"""Network-boundary tests for deny and broker sandbox startup policies."""
+# Copyright 2025-2026 Jason E. Robinson.
+# SPDX-License-Identifier: Apache-2.0
 
-from unittest.mock import patch
+"""Firewall rules the root entrypoint installs for each egress policy, recorded instead of executed."""
 
-import pytest
+from pytest import fixture
 
 import entrypoint
 
+# Stand-in for the resolver the entrypoint reads from /etc/resolv.conf at startup.
+RESOLVER = "192.0.2.53"
+FLUSH = ["-F", "OUTPUT"]
+LOOPBACK = ["-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"]
+REPLIES = ["-A", "OUTPUT", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"]
+DROP_POLICY = ["-P", "OUTPUT", "DROP"]
 
-def test_broker_policy_allows_only_broker_before_default_drop():
+
+@fixture
+def installed_rules(monkeypatch):
+    rules = []
+    monkeypatch.setattr(entrypoint, "shutil_which", lambda name: f"/usr/sbin/{name}")
+    monkeypatch.setattr(entrypoint, "nameserver_addresses", lambda: [RESOLVER])
+    monkeypatch.setattr(entrypoint, "run_firewall", lambda binary, arguments: rules.append((binary, arguments)))
+    return rules
+
+
+def ipv4_rules(installed_rules):
+    return [arguments for binary, arguments in installed_rules if binary == "/usr/sbin/iptables"]
+
+
+def test_web_egress_passes_replies_before_dropping_non_public_networks(installed_rules):
+    entrypoint.enforce_egress_policy(allow_web=True)
+    assert ipv4_rules(installed_rules) == [
+        FLUSH,
+        LOOPBACK,
+        REPLIES,
+        ["-A", "OUTPUT", "-p", "udp", "-d", RESOLVER, "--dport", "53", "-j", "ACCEPT"],
+        ["-A", "OUTPUT", "-p", "tcp", "-d", RESOLVER, "--dport", "53", "-j", "ACCEPT"],
+        *[["-A", "OUTPUT", "-d", network, "-j", "DROP"] for network in entrypoint.NON_PUBLIC_NETWORKS.get("ipv4", ())],
+        ["-A", "OUTPUT", "-p", "tcp", "--dport", "80", "-j", "ACCEPT"],
+        ["-A", "OUTPUT", "-p", "tcp", "--dport", "443", "-j", "ACCEPT"],
+        DROP_POLICY,
+    ]
+    assert "169.254.0.0/16" in entrypoint.NON_PUBLIC_NETWORKS.get("ipv4", ())
+    assert "fc00::/7" in entrypoint.NON_PUBLIC_NETWORKS.get("ipv6", ())
+
+
+def test_deny_egress_allows_only_loopback_and_replies(installed_rules):
+    entrypoint.enforce_egress_policy()
+    assert ipv4_rules(installed_rules) == [FLUSH, LOOPBACK, REPLIES, DROP_POLICY]
+
+
+def test_main_maps_each_container_policy_to_its_firewall(monkeypatch):
     calls = []
-    with (
-        patch("entrypoint.shutil.which", side_effect=lambda name: "/sbin/iptables" if "iptables" in name else ""),
-        patch("entrypoint.run_firewall", side_effect=lambda binary, arguments: calls.append(arguments)),
-        patch.object(entrypoint.Path, "exists", return_value=False),
-    ):
-        entrypoint.enforce_egress_policy("http://192.168.64.9:8090")
-
-    broker_rule = next(arguments for arguments in calls if "192.168.64.9" in arguments)
-    assert broker_rule[broker_rule.index("--dport") + 1] == "8090"
-    assert broker_rule[broker_rule.index("--ctstate") + 1] == "NEW"
-    assert calls[-1] == ["-P", "OUTPUT", "DROP"]
-    assert sum("-d" in arguments for arguments in calls) == 1
-
-
-@pytest.mark.parametrize("url", ["https://192.168.64.9:8090", "http://broker:8090", "http://192.168.64.9"])
-def test_broker_policy_requires_explicit_http_ipv4_and_port(url):
-    with (
-        patch("entrypoint.shutil.which", return_value="/sbin/iptables"),
-        pytest.raises(RuntimeError, match="broker"),
-    ):
-        entrypoint.enforce_egress_policy(url)
-
-
-def test_main_forwards_process_command_line(monkeypatch):
-    arguments = ["entrypoint.py", "--egress-policy", "unrestricted", "--auth-token", "a" * 43]
-    monkeypatch.setattr(entrypoint.sys, "argv", arguments)
-    with (
-        patch("entrypoint.drop_privileges"),
-        patch("entrypoint.os.execv") as execute,
-    ):
-        entrypoint.main()
-
-    forwarded = execute.call_args.args[1]
-    assert forwarded[-4:] == arguments[-4:]
+    monkeypatch.setattr(entrypoint, "enforce_egress_policy", lambda allow_web=False: calls.append(("firewall", allow_web)))
+    monkeypatch.setattr(entrypoint, "drop_privileges", lambda: calls.append(("drop",)))
+    monkeypatch.setattr(entrypoint, "os_execv", lambda path, arguments: calls.append(("exec", arguments[2:])))
+    for policy, firewall in (("web", [("firewall", True)]), ("deny", [("firewall", False)]), ("direct", [])):
+        calls.clear()
+        arguments = ["--egress-policy", policy, "--auth-token", "t" * 32]
+        entrypoint.main(arguments)
+        assert calls == [*firewall, ("drop",), ("exec", arguments)]
