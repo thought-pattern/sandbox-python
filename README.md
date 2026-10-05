@@ -97,9 +97,11 @@ config = {
     "image": "python-sandbox:latest", "port": 8080, "workspace": "/workspace",
     "memory_limit": "2g", "cpu_limit": 1.0, "egress_policy": "direct",
 }
-with sandbox_session(config) as endpoint:
+cleanup_status = {}
+with sandbox_session(config, cleanup_status=cleanup_status) as endpoint:
     print(endpoint.get("base_url", ""))
     # Supply endpoint.get("auth_token", "") as Authorization: Bearer <token>.
+# cleanup_status now records "attempted", "failed" and, on failure, "error_type".
 ```
 
 Build the image with Docker:
