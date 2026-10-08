@@ -5,8 +5,7 @@
 
 from copy import deepcopy
 from http.client import HTTPConnection
-from json import dumps as json_dumps
-from json import loads as json_loads
+from json import dumps as json_dumps, loads as json_loads
 from urllib.parse import urlsplit
 
 DEFAULT_ARGUMENT_DICT = {}
@@ -44,18 +43,26 @@ class WorkspaceClient:
         return self
 
     def __exit__(self, exception_type, exception, traceback) -> None:
-        return None
+        """Each request owns and closes its own connection, so leaving the context releases nothing."""
 
-    def request(self, method: str, path: str, arguments: dict = DEFAULT_ARGUMENT_DICT, timeout: float = 0.0):
+    def request(
+        self, method: str, path: str, arguments: dict = DEFAULT_ARGUMENT_DICT, timeout: float = 0.0, *, root_task_id: str = ""
+    ):
         """Perform one authenticated request and return its status and decoded payload."""
         headers = {"Authorization": f"Bearer {self.auth_token}"}
-        body = None
+        if root_task_id:
+            headers["X-Tapestry-Root-Task-ID"] = root_task_id
+        body = b""
         if method == "POST":
             body = json_dumps(arguments).encode("utf-8")
             headers["Content-Type"] = "application/json"
         connection = HTTPConnection(self.host, self.port, timeout=timeout or self.timeout)
         try:
-            connection.request(method, path, body=body, headers=headers)
+            # Only POST carries a body; other methods keep http.client's bodiless request form.
+            if method == "POST":
+                connection.request(method, path, body=body, headers=headers)
+            else:
+                connection.request(method, path, headers=headers)
             response = connection.getresponse()
             status_code = response.status
             raw = response.read()

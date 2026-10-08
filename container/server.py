@@ -8,60 +8,50 @@ are bounded so one tool call cannot exhaust the service.
 """
 
 from argparse import ArgumentParser as argparse_ArgumentParser
+from contextvars import ContextVar
 from hashlib import sha256 as hashlib_sha256
 from hmac import compare_digest as hmac_compare_digest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from inspect import Parameter as inspect_Parameter
-from inspect import signature as inspect_signature
-from json import dumps as json_dumps
-from json import loads as json_loads
-from logging import INFO as logging_INFO
-from logging import basicConfig as logging_basicConfig
-from logging import getLogger as logging_getLogger
+from inspect import Parameter as inspect_Parameter, signature as inspect_signature
+from json import dumps as json_dumps, loads as json_loads
+from logging import INFO as logging_INFO, basicConfig as logging_basicConfig, getLogger as logging_getLogger
 from math import isfinite
-from os import environ as os_environ
-from os import O_CLOEXEC, O_DIRECTORY, O_NOFOLLOW, O_NONBLOCK, O_RDONLY
-from os import close as os_close
-from os import fdopen as os_fdopen
-from os import fsync as os_fsync
-from os import fstat as os_fstat
-from os import getpid as os_getpid
-from os import kill as os_kill
-from os import killpg as os_killpg
-from os import read as os_read
-from os import open as os_open
-from os import scandir as os_scandir
+from os import (
+    O_CLOEXEC,
+    O_DIRECTORY,
+    O_NOFOLLOW,
+    O_NONBLOCK,
+    O_RDONLY,
+    ST_RDONLY,
+    close as os_close,
+    environ as os_environ,
+    fdopen as os_fdopen,
+    fstat as os_fstat,
+    fsync as os_fsync,
+    getpid as os_getpid,
+    kill as os_kill,
+    killpg as os_killpg,
+    open as os_open,
+    read as os_read,
+    scandir as os_scandir,
+    statvfs as os_statvfs,
+)
 from pathlib import Path
-from re import compile as re_compile
-from re import fullmatch as re_fullmatch
-from re import sub as re_sub
-from selectors import EVENT_READ as selectors_EVENT_READ
-from selectors import DefaultSelector as selectors_DefaultSelector
-from shutil import disk_usage as shutil_disk_usage
-from shutil import move as shutil_move
-from shutil import rmtree as shutil_rmtree
-from shutil import which as shutil_which
-from signal import SIGKILL as signal_SIGKILL
-from signal import SIGINT as signal_SIGINT
-from signal import SIGTERM as signal_SIGTERM
-from signal import signal as signal_signal
+from re import compile as re_compile, fullmatch as re_fullmatch, sub as re_sub
+from selectors import EVENT_READ as selectors_EVENT_READ, DefaultSelector as selectors_DefaultSelector
+from shutil import disk_usage as shutil_disk_usage, move as shutil_move, rmtree as shutil_rmtree, which as shutil_which
+from signal import SIGINT as signal_SIGINT, SIGKILL as signal_SIGKILL, SIGTERM as signal_SIGTERM, signal as signal_signal
 from socketserver import TCPServer
 from stat import S_ISREG
-from subprocess import PIPE as subprocess_PIPE
-from subprocess import Popen as subprocess_Popen
-from subprocess import TimeoutExpired as subprocess_TimeoutExpired
-from sys import argv as sys_argv
-from sys import executable as sys_executable
-from sys import version as sys_version
-from tempfile import NamedTemporaryFile as tempfile_NamedTemporaryFile
-from tempfile import mkstemp as tempfile_mkstemp
-from threading import BoundedSemaphore as threading_BoundedSemaphore
-from threading import Event as threading_Event
-from threading import RLock as threading_RLock
+from subprocess import PIPE as subprocess_PIPE, Popen as subprocess_Popen, TimeoutExpired as subprocess_TimeoutExpired
+from sys import argv as sys_argv, executable as sys_executable, version as sys_version
+from tempfile import NamedTemporaryFile as tempfile_NamedTemporaryFile, mkstemp as tempfile_mkstemp
+from threading import BoundedSemaphore as threading_BoundedSemaphore, Event as threading_Event, RLock as threading_RLock
 from time import monotonic as time_monotonic
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 DEFAULT_ARGUMENT_DICT = {}
+READ_ONLY_FILE_TOOLS = {"file_read", "file_list", "file_search"}
 INVOCATION_MARKER_VARIABLE = "TAPESTRY_TOOL_INVOCATION"
 
 API_VERSION = "1.0"
@@ -83,6 +73,8 @@ DEFAULT_MAX_GIT_LOG_RESULTS = 100
 MIN_MAX_RESPONSE_BYTES = 512
 
 WORKSPACE = DEFAULT_WORKSPACE
+# Outside a request the context is the shared empty mapping; each request sets its own resolved mapping.
+WORKING_CONTEXT = ContextVar("tapestry.workspace.working_context", default=DEFAULT_ARGUMENT_DICT)
 EGRESS_POLICY = "direct"
 EGRESS_ENFORCEMENT = "container"
 MAX_OUTPUT_BYTES = DEFAULT_MAX_OUTPUT_BYTES
@@ -115,10 +107,42 @@ def tool(fn):
     return fn
 
 
+def current_workspace() -> Path:
+    """Use this request's directory without changing the process-wide cwd."""
+    context = WORKING_CONTEXT.get()
+    directory = context.get("directory", WORKSPACE)
+    return directory
+
+
+def request_working_context(root_task_id: str) -> dict:
+    """Resolve commissioned root placement inside the existing writable mount."""
+    if not root_task_id:
+        return {"mode": "repository", "directory": WORKSPACE}
+    try:
+        identity = UUID(root_task_id)
+    except ValueError as err:
+        raise ToolError(
+            "Working context requires a canonical native root Task", code="invalid_working_context", status=400
+        ) from err
+    if identity.version != 7 or str(identity) != root_task_id:
+        raise ToolError("Working context requires a canonical native root Task", code="invalid_working_context", status=400)
+    parent = WORKSPACE / ".tapestry-work"
+    directory = parent / root_task_id
+    with FILE_LOCK:
+        parent.mkdir(exist_ok=True)
+        if parent.resolve() != parent or directory.is_symlink():
+            raise ToolError("Working context cannot redirect outside its assigned directory", code="path_escape", status=400)
+        directory.mkdir(exist_ok=True)
+        if directory.resolve() != directory:
+            raise ToolError("Working context cannot redirect outside its assigned directory", code="path_escape", status=400)
+    return {"mode": "root", "root_task_id": root_task_id, "directory": directory}
+
+
 def resolve_path(path):
     """Resolve a path within the workspace, rejecting anything outside it."""
-    target = (WORKSPACE / str(path)).resolve()
-    if not target.is_relative_to(WORKSPACE):
+    workspace = current_workspace()
+    target = (workspace / str(path)).resolve()
+    if not target.is_relative_to(workspace):
         raise ToolError("Path must be within workspace", code="path_escape", status=400)
     return target
 
@@ -164,7 +188,8 @@ def invocation_process_ids(root_pid, marker):
     """
     proc = Path("/proc")
     if not proc.is_dir():
-        return set()
+        no_processes = set()
+        return no_processes
     marker_entry = f"{INVOCATION_MARKER_VARIABLE}={marker}".encode("utf-8")
     parents = {}
     marked = set()
@@ -187,7 +212,8 @@ def invocation_process_ids(root_pid, marker):
             if parent == current and pid not in descendants:
                 descendants.add(pid)
                 frontier.append(pid)
-    return (descendants | marked | {root_pid}) - {os_getpid()}
+    invocation_ids = (descendants | marked | {root_pid}) - {os_getpid()}
+    return invocation_ids
 
 
 def signal_invocation(process, marker, signal_number):
@@ -195,7 +221,8 @@ def signal_invocation(process, marker, signal_number):
     try:
         os_killpg(process.pid, signal_number)
     except ProcessLookupError:
-        pass
+        # The group has already exited; marked invocation processes that left it are still signalled below.
+        LOGGER.debug("Invocation process group %s exited before signal %s", process.pid, signal_number)
     except PermissionError:
         # Some kernels refuse a group signal once the reaped leader leaves only exited members.
         if process.poll() is None:
@@ -241,7 +268,7 @@ def internal_run_process(command, *, shell=False, timeout: float = 60.0, cwd="",
     process = subprocess_Popen(
         command,
         shell=shell,
-        cwd=cwd or WORKSPACE,
+        cwd=cwd or current_workspace(),
         env=process_environment,
         stdout=subprocess_PIPE,
         stderr=subprocess_PIPE,
@@ -364,7 +391,7 @@ def file_read(path: str):
 def workspace_file_text(target) -> str:
     """Read bounded regular-file bytes through the canonical descriptor owner."""
     try:
-        source = scoped_repository_bytes(WORKSPACE, target, MAX_FILE_BYTES)
+        source = scoped_repository_bytes(current_workspace(), target, MAX_FILE_BYTES)
     except ToolError as err:
         if err.code == "bad_arguments":
             raise ToolError("Expected a regular file", code="not_file", status=400) from err
@@ -372,9 +399,10 @@ def workspace_file_text(target) -> str:
     if len(source) > MAX_FILE_BYTES:
         raise ToolError("File exceeds its byte allowance", code="file_too_large", status=413)
     try:
-        return source.decode("utf-8")
+        text = source.decode("utf-8")
     except UnicodeDecodeError as err:
         raise ToolError("File is not UTF-8", code="invalid_source_encoding", status=422) from err
+    return text
 
 
 @tool
@@ -399,7 +427,7 @@ def file_read_scoped(repository_root: str, path: str, max_bytes: int = 262144):
         content = source.decode("utf-8")
     except UnicodeDecodeError as err:
         raise ToolError("Scoped source is not UTF-8", code="invalid_source_encoding", status=422) from err
-    return {
+    scoped_read = {
         "repository_root": str(root),
         "resolved_path": str(target),
         "relative_path": str(target.relative_to(root)),
@@ -407,6 +435,7 @@ def file_read_scoped(repository_root: str, path: str, max_bytes: int = 262144):
         "content_sha256": hashlib_sha256(source).hexdigest(),
         "byte_count": len(source),
     }
+    return scoped_read
 
 
 def scoped_repository_bytes(root: Path, target: Path, byte_limit: int) -> bytes:
@@ -437,7 +466,8 @@ def scoped_repository_bytes(root: Path, target: Path, byte_limit: int) -> bytes:
                 raise ToolError("Scoped source is not a regular file", code="bad_arguments", status=400)
             if state.st_size > byte_limit:
                 raise ToolError("Scoped source exceeds its byte allowance", code="file_too_large", status=413)
-            return opened.read(byte_limit + 1)
+            source = opened.read(byte_limit + 1)
+            return source
     finally:
         os_close(directory)
 
@@ -451,7 +481,7 @@ def file_write(path: str, content: str):
     with FILE_LOCK:
         atomic_write_text(target, content)
     computed_return_value = {
-        "path": str(target.relative_to(WORKSPACE)),
+        "path": str(target.relative_to(current_workspace())),
         "bytesWritten": len(content.encode("utf-8")),
     }
     return computed_return_value
@@ -485,7 +515,7 @@ def file_patch(path: str, patches: list):
             content = content.replace(old, new, 1)
         atomic_write_text(target, content)
     computed_return_value = {
-        "path": str(target.relative_to(WORKSPACE)),
+        "path": str(target.relative_to(current_workspace())),
         "patchesApplied": len(patches),
     }
     return computed_return_value
@@ -497,7 +527,7 @@ def file_delete(path: str):
     target = resolve_path(path)
     with FILE_LOCK:
         target.unlink(missing_ok=False)
-    computed_return_value = {"path": str(target.relative_to(WORKSPACE)), "deleted": True}
+    computed_return_value = {"path": str(target.relative_to(current_workspace())), "deleted": True}
     return computed_return_value
 
 
@@ -505,6 +535,7 @@ def file_delete(path: str):
 def file_list(path: str = ".", depth: int = 2, max_results: int = DEFAULT_MAX_LIST_RESULTS):
     """List the inspected root, files and directories with explicit recursive coverage."""
     target = resolve_path(path)
+    workspace = current_workspace()
     if not target.is_dir():
         raise ToolError("Path is not a directory", code="not_directory", status=400)
     depth = max(0, min(int(depth), 64))
@@ -520,8 +551,8 @@ def file_list(path: str = ".", depth: int = 2, max_results: int = DEFAULT_MAX_LI
     visited_entries = 0
     visited_directories = 0
     stop_reason = "complete"
-    root = {"path": str(target.relative_to(WORKSPACE)), "kind": "directory", "children": []}
-    tree_nodes = {root.get("path"): root}
+    root = {"path": str(target.relative_to(workspace)), "kind": "directory", "children": []}
+    tree_nodes = {root.get("path", ""): root}
     while pending:
         if visited_entries >= DEFAULT_MAX_LIST_ENTRIES:
             stop_reason = "entry_limit"
@@ -550,13 +581,16 @@ def file_list(path: str = ".", depth: int = 2, max_results: int = DEFAULT_MAX_LI
         if stop_reason != "complete":
             break
         children = []
-        parent_node = tree_nodes.get(str(directory.relative_to(WORKSPACE)))
+        parent_node = tree_nodes.get(str(directory.relative_to(workspace)), {})
+        # A directory is queued only after its own node is recorded, so a missing parent is a broken listing.
+        if not parent_node:
+            raise RuntimeError("workspace listing lost the node of a queued directory")
         for entry in sorted(entries, key=lambda item: item.name):
             if time_monotonic() >= deadline:
                 stop_reason = "time_limit"
                 break
             candidate = Path(entry.path)
-            relative_path = str(candidate.relative_to(WORKSPACE))
+            relative_path = str(candidate.relative_to(workspace))
             if entry.is_symlink():
                 links.append(relative_path)
                 kind = "link"
@@ -573,7 +607,7 @@ def file_list(path: str = ".", depth: int = 2, max_results: int = DEFAULT_MAX_LI
             else:
                 other.append(relative_path)
                 kind = "other"
-            node = {"path": relative_path, "kind": kind}
+            node: dict = {"path": relative_path, "kind": kind}
             if kind == "directory":
                 node["children"] = []
                 tree_nodes[relative_path] = node
@@ -585,7 +619,7 @@ def file_list(path: str = ".", depth: int = 2, max_results: int = DEFAULT_MAX_LI
             break
         pending.extend(reversed(children))
     computed_return_value = {
-        "workspaceRoot": str(WORKSPACE),
+        "workspaceRoot": str(workspace),
         "root": root,
         "files": sorted(files),
         "directories": sorted(directories),
@@ -624,7 +658,7 @@ def file_search(pattern: str, path: str = ".", max_results: int = DEFAULT_MAX_SE
         match = data.get("data", {})
         matches.append(
             {
-                "file": str(Path(match.get("path", {}).get("text", "")).relative_to(WORKSPACE)),
+                "file": str(Path(match.get("path", {}).get("text", "")).relative_to(current_workspace())),
                 "line": match.get("line_number", 0),
                 "content": match.get("lines", {}).get("text", "").strip(),
             }
@@ -676,12 +710,13 @@ def file_search_scoped(repository_root: str, symbol: str, max_results: int = 32)
         )
         if len(matches) >= max_results:
             break
-    return {
+    search = {
         "repository_root": str(root),
         "symbol": symbol,
         "matches": matches,
         "truncated": len(matches) >= max_results or result.get("outputLimited", False),
     }
+    return search
 
 
 PACKAGE_PATTERN = re_compile(r"^[a-zA-Z0-9_.-]+([=<>!~\[\]][a-zA-Z0-9._,<>=!~\[\]]*)?$")
@@ -784,7 +819,8 @@ def git_clone(repo_url: str, branch: str = "main"):
     require_network("git_clone")
     validate_git_atom(repo_url, "repository URL")
     validate_git_atom(branch, "branch")
-    staging = WORKSPACE / f".tapestry-clone-{uuid4().hex}"
+    workspace = current_workspace()
+    staging = workspace / f".tapestry-clone-{uuid4().hex}"
     with FILE_LOCK:
         try:
             result = run_git(
@@ -792,12 +828,12 @@ def git_clone(repo_url: str, branch: str = "main"):
                 timeout=MAX_TOOL_TIMEOUT,
             )
             require_process_success(result, "git clone")
-            for item in list(WORKSPACE.iterdir()):
+            for item in list(workspace.iterdir()):
                 if item == staging:
                     continue
                 shutil_rmtree(item) if item.is_dir() else item.unlink()
             for item in list(staging.iterdir()):
-                shutil_move(str(item), WORKSPACE / item.name)
+                shutil_move(str(item), workspace / item.name)
             staging.rmdir()
         except Exception:
             shutil_rmtree(staging, ignore_errors=True)
@@ -947,6 +983,29 @@ def snake_case(name):
     return computed_return_value
 
 
+def observed_mounts() -> list:
+    """Describe actual directory mount permissions; metadata grants no Task authority."""
+    try:
+        lines = Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines()
+    except (FileNotFoundError, PermissionError) as err:
+        LOGGER.warning("Workspace mount metadata unavailable error_type=%s", type(err).__name__)
+        mounts = []
+        return mounts
+    mounts = {}
+    for line in lines:
+        fields = line.split(" - ", 1)[0].split()
+        if len(fields) < 6:
+            raise ValueError("Workspace mount metadata has an invalid record")
+        mount_path = fields[4]
+        for encoded, decoded in (("\\040", " "), ("\\011", "\t"), ("\\012", "\n"), ("\\134", "\\")):
+            mount_path = mount_path.replace(encoded, decoded)
+        target = Path(mount_path)
+        if target.is_dir() and str(target.resolve()) == mount_path:
+            mounts[mount_path] = {"path": mount_path, "readOnly": bool(os_statvfs(mount_path).f_flag & ST_RDONLY)}
+    observed = [mounts.get(path, {}) for path in sorted(mounts)]
+    return observed
+
+
 def build_manifest():
     """Describe every tool with a versioned JSON-schema-shaped signature."""
     tools = []
@@ -972,13 +1031,15 @@ def build_manifest():
                 "parameters": parameters,
             }
         )
-    return {
+    manifest = {
         "apiVersion": API_VERSION,
         "protocol": PROTOCOL_NAME,
         "egressPolicy": EGRESS_POLICY,
         "egressEnforcement": EGRESS_ENFORCEMENT,
+        "mounts": observed_mounts(),
         "tools": tools,
     }
+    return manifest
 
 
 def build_readiness_report():
@@ -1095,10 +1156,18 @@ class ToolHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
         return response_status
 
-    def send_error_json(self, status, code, message, *, request_id=""):
+    def send_error_json(self, status, code, message, *, request_id="", workspace_context: dict = DEFAULT_ARGUMENT_DICT):
         response_status = self.send_json(
             status,
-            {"error": {"code": code, "message": str(message)}, "requestId": request_id},
+            {
+                "error": {"code": code, "message": str(message)},
+                "requestId": request_id,
+                **(
+                    {"workspaceContext": {key: value for key, value in workspace_context.items() if key != "directory"}}
+                    if workspace_context
+                    else {}
+                ),
+            },
             request_id=request_id,
         )
         return response_status
@@ -1217,28 +1286,76 @@ class ToolHandler(BaseHTTPRequestHandler):
 
         started = time_monotonic()
         status = 200
+        context_token = False
+        context = {}
         try:
             arguments = self.read_arguments(request_id)
+            context = request_working_context(self.headers.get("X-Tapestry-Root-Task-ID", ""))
+            context_token = WORKING_CONTEXT.set(context)
             result = fn(**arguments)
-            status = self.send_json(200, {"result": result, "requestId": request_id}, request_id=request_id)
+            status = self.send_json(
+                200,
+                {
+                    "result": result,
+                    "requestId": request_id,
+                    "workspaceContext": {key: value for key, value in context.items() if key != "directory"},
+                },
+                request_id=request_id,
+            )
         except ToolError as err:
             status = err.status
-            self.send_error_json(err.status, err.code, err, request_id=request_id)
+            self.send_error_json(
+                err.status,
+                err.code,
+                err,
+                request_id=request_id,
+                workspace_context=context if name in READ_ONLY_FILE_TOOLS else {},
+            )
         except FileNotFoundError:
             status = 404
-            self.send_error_json(404, "not_found", "requested file or tool was not found", request_id=request_id)
+            self.send_error_json(
+                404,
+                "not_found",
+                "requested file or tool was not found",
+                request_id=request_id,
+                workspace_context=context if name in READ_ONLY_FILE_TOOLS else {},
+            )
         except IsADirectoryError:
             status = 400
-            self.send_error_json(400, "not_file", "expected a file", request_id=request_id)
+            self.send_error_json(
+                400,
+                "not_file",
+                "expected a file",
+                request_id=request_id,
+                workspace_context=context if name in READ_ONLY_FILE_TOOLS else {},
+            )
         except NotADirectoryError:
             status = 400
-            self.send_error_json(400, "not_directory", "expected a directory", request_id=request_id)
+            self.send_error_json(
+                400,
+                "not_directory",
+                "expected a directory",
+                request_id=request_id,
+                workspace_context=context if name in READ_ONLY_FILE_TOOLS else {},
+            )
         except PermissionError:
             status = 403
-            self.send_error_json(403, "permission_denied", "tool access was denied", request_id=request_id)
+            self.send_error_json(
+                403,
+                "permission_denied",
+                "tool access was denied",
+                request_id=request_id,
+                workspace_context=context if name in READ_ONLY_FILE_TOOLS else {},
+            )
         except OSError:
             status = 422
-            self.send_error_json(422, "tool_io_error", "tool I/O failed", request_id=request_id)
+            self.send_error_json(
+                422,
+                "tool_io_error",
+                "tool I/O failed",
+                request_id=request_id,
+                workspace_context=context if name in READ_ONLY_FILE_TOOLS else {},
+            )
         except TypeError as err:
             status = 400
             self.send_error_json(
@@ -1246,15 +1363,24 @@ class ToolHandler(BaseHTTPRequestHandler):
                 "bad_arguments",
                 f"bad arguments for {name}: {err}",
                 request_id=request_id,
+                workspace_context=context if name in READ_ONLY_FILE_TOOLS else {},
             )
         except ValueError:
             status = 400
-            self.send_error_json(400, "bad_arguments", f"invalid arguments for {name}", request_id=request_id)
+            self.send_error_json(
+                400,
+                "bad_arguments",
+                f"invalid arguments for {name}",
+                request_id=request_id,
+                workspace_context=context if name in READ_ONLY_FILE_TOOLS else {},
+            )
         except Exception:
             status = 500
             LOGGER.exception("Unhandled tool error request_id=%s tool=%s", request_id, name)
             self.send_error_json(500, "internal_error", "tool execution failed", request_id=request_id)
         finally:
+            if context_token is not False:
+                WORKING_CONTEXT.reset(context_token)
             self.server.request_slots.release()
             LOGGER.info(
                 "tool_request request_id=%s tool=%s status=%s duration_ms=%.3f",
@@ -1348,7 +1474,7 @@ def main(argv: list):
         server.timeout = 0.25
         while not stopped.is_set():
             server.handle_request()
-        LOGGER.info("workspace_shutdown requested signal=%s; draining accepted requests", shutdown.get("signal"))
+        LOGGER.info("workspace_shutdown requested signal=%s; draining accepted requests", shutdown.get("signal", 0))
     finally:
         try:
             server.server_close()

@@ -3,6 +3,7 @@
 
 """PDC-DEVELOP batch 211: actual HTTP tools and subprocesses without a container runtime."""
 
+from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from os import environ, mkfifo
@@ -12,8 +13,23 @@ from threading import Thread
 from zipfile import ZipFile
 
 from pytest import fixture, raises
-
-import server
+from server import (
+    EGRESS_POLICY,
+    MAX_FILE_BYTES,
+    MAX_OUTPUT_BYTES,
+    MAX_TOOL_TIMEOUT,
+    WORKSPACE,
+    ToolError,
+    ToolHandler,
+    ToolHTTPServer,
+    configure,
+    current_workspace,
+    parse_args,
+    require_process_success,
+    run_git,
+    scoped_repository_bytes,
+    shutil_which,
+)
 from workspace_client import WorkspaceClient, WorkspaceToolError
 
 TOKEN = "direct-interface-test-" + "t" * 32
@@ -46,11 +62,19 @@ class ArtifactHandler(SimpleHTTPRequestHandler):
 def direct_tools(tmp_path, monkeypatch):
     """Use the real server configuration, HTTP handlers, client and subprocess owner."""
     monkeypatch.setenv("PATH", f"{Path(executable).parent}:{environ.get('PATH', '')}")
-    for name in ("WORKSPACE", "EGRESS_POLICY", "MAX_OUTPUT_BYTES", "MAX_FILE_BYTES", "MAX_TOOL_TIMEOUT"):
-        monkeypatch.setattr(server, name, getattr(server, name))
-    args = server.parse_args(["--workspace", str(tmp_path / "work"), "--auth-token", TOKEN])
-    server.configure(args)
-    with server.ToolHTTPServer(("127.0.0.1", 0), server.ToolHandler, auth_token=TOKEN) as endpoint:
+    # configure() rebinds these server globals; each test starts from, and is restored to, the imported defaults.
+    configured_defaults = {
+        "WORKSPACE": WORKSPACE,
+        "EGRESS_POLICY": EGRESS_POLICY,
+        "MAX_OUTPUT_BYTES": MAX_OUTPUT_BYTES,
+        "MAX_FILE_BYTES": MAX_FILE_BYTES,
+        "MAX_TOOL_TIMEOUT": MAX_TOOL_TIMEOUT,
+    }
+    for name, value in configured_defaults.items():
+        monkeypatch.setattr(f"server.{name}", value)
+    args = parse_args(["--workspace", str(tmp_path / "work"), "--auth-token", TOKEN])
+    configure(args)
+    with ToolHTTPServer(("127.0.0.1", 0), ToolHandler, auth_token=TOKEN) as endpoint:
         worker = Thread(target=endpoint.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         worker.start()
         try:
@@ -92,10 +116,47 @@ def test_authenticated_direct_interface_runs_real_tools_and_preserves_failures(d
         direct_tools.call_tool("run_python", {"script": "raise SystemExit(7)", "timeout": 2})
     assert failed.value.result.get("exitCode", -1) == 7
 
+    # The same authenticated execution service serves independent generated projects.
+    # Descendants use their existing root placement; request threads never share cwd.
+    roots = ("019cdc3d-a856-74f7-b720-f730ead81438", "019cdc3d-a857-74f7-b720-f730ead81438")
+    sources = ("print('decoder')\n", "print('sieve')\n")
+    for root, source in zip(roots, sources, strict=True):
+        status, envelope = direct_tools.request(
+            "POST", "/tools/file_write", {"path": "solution.py", "content": source}, root_task_id=root
+        )
+        assert status == 200
+        assert envelope.get("workspaceContext") == {"mode": "root", "root_task_id": root}
+        assert envelope.get("result", {}).get("path") == "solution.py"
+    direct_tools.call_tool("file_write", {"path": "solution.py", "content": "print('shared')\n"})
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        operations = [
+            executor.submit(
+                direct_tools.request,
+                "POST",
+                "/tools/run_python",
+                {"script": "import pathlib, time\ntime.sleep(0.05)\nexec(pathlib.Path('solution.py').read_text())", "timeout": 2},
+                root_task_id=root,
+            )
+            for root in roots
+        ]
+        for root, name, operation in zip(roots, ("decoder", "sieve"), operations, strict=True):
+            status, envelope = operation.result()
+            assert status == 200 and envelope.get("result", {}).get("stdout") == name + "\n"
+            assert envelope.get("workspaceContext") == {"mode": "root", "root_task_id": root}
+    _, child_read = direct_tools.request("POST", "/tools/file_read", {"path": "solution.py"}, root_task_id=roots[0])
+    assert child_read.get("result") == sources[0]
+    assert direct_tools.call_tool("file_read", {"path": "solution.py"}) == "print('shared')\n"
+    for root, path, code in (
+        (roots[0], "../solution.py", "path_escape"),
+        ("019cdc3d-a856-44f7-b720-f730ead81438", "solution.py", "invalid_working_context"),
+    ):
+        with raises(WorkspaceToolError) as refused:
+            direct_tools.request("POST", "/tools/file_read", {"path": path}, root_task_id=root)
+        assert refused.value.code == code
+
 
 def test_unhealthy_readiness_names_each_failed_check(direct_tools, monkeypatch):
-    real_which = server.shutil_which
-    monkeypatch.setattr(server, "shutil_which", lambda name: "" if name == "rg" else real_which(name))
+    monkeypatch.setattr("server.shutil_which", lambda name: "" if name == "rg" else shutil_which(name))
     with raises(WorkspaceToolError) as unhealthy:
         direct_tools.health()
     assert unhealthy.value.status_code == 503
@@ -104,7 +165,7 @@ def test_unhealthy_readiness_names_each_failed_check(direct_tools, monkeypatch):
 
 
 def test_scoped_read_returns_provenance_and_rejects_escapes(direct_tools, tmp_path):
-    repository = server.WORKSPACE / "repository"
+    repository = current_workspace() / "repository"
     (repository / "package").mkdir(parents=True)
     source = "VALUE = 'café'\n"
     (repository / "package" / "module.py").write_text(source, encoding="utf-8")
@@ -133,7 +194,7 @@ def test_scoped_read_returns_provenance_and_rejects_escapes(direct_tools, tmp_pa
 
 
 def test_scoped_read_enforces_byte_limit_encoding_and_regular_files(direct_tools):
-    repository = server.WORKSPACE / "repository"
+    repository = current_workspace() / "repository"
     (repository / "package").mkdir(parents=True)
     (repository / "large.py").write_text("x" * 65, encoding="utf-8")
     (repository / "latin1.py").write_bytes(b"caf\xe9\n")
@@ -160,13 +221,13 @@ def test_scoped_bytes_refuse_symlinks_swapped_in_after_resolution(tmp_path):
     (repository / "package").symlink_to(outside)
     (repository / "module.py").symlink_to(outside / "secret.py")
     for target in (repository / "package" / "secret.py", repository / "module.py"):
-        with raises(server.ToolError) as refused:
-            server.scoped_repository_bytes(repository, target, 1024)
+        with raises(ToolError) as refused:
+            scoped_repository_bytes(repository, target, 1024)
         assert refused.value.code == "path_escape"
 
 
 def test_scoped_search_returns_relative_python_leads_only(direct_tools):
-    repository = server.WORKSPACE / "repository"
+    repository = current_workspace() / "repository"
     (repository / "package").mkdir(parents=True)
     (repository / "package" / "module.py").write_text("def target_symbol():\n    return 1\n", encoding="utf-8")
     (repository / "notes.txt").write_text("target_symbol\n", encoding="utf-8")
@@ -224,7 +285,7 @@ def test_pip_downloads_from_the_actual_index_without_forwarding(direct_tools, ar
 def test_git_uses_original_http_destination_and_native_remote_with_real_process_results(direct_tools, artifacts):
     seed = artifacts.directory / "seed"
     origin = artifacts.directory / "origin.git"
-    server.require_process_success(server.run_git(["init", "--initial-branch=main", str(seed)]), "fixture init")
+    require_process_success(run_git(["init", "--initial-branch=main", str(seed)]), "fixture init")
     (seed / "sample.txt").write_text("initial\n", encoding="utf-8")
     for arguments in (
         ["-C", str(seed), "add", "sample.txt"],
@@ -232,24 +293,24 @@ def test_git_uses_original_http_destination_and_native_remote_with_real_process_
         ["clone", "--bare", str(seed), str(origin)],
         ["--git-dir", str(origin), "update-server-info"],
     ):
-        server.require_process_success(server.run_git(arguments), "fixture setup")
+        require_process_success(run_git(arguments), "fixture setup")
     destination = f"http://127.0.0.1:{artifacts.server_port}/origin.git"
     cloned = direct_tools.call_tool("git_clone", {"repoUrl": destination, "branch": "main"})
     assert cloned == {"repository": destination, "branch": "main", "cloned": True}
     assert direct_tools.call_tool("file_read", {"path": "sample.txt"}) == "initial\n"
-    assert server.run_git(["remote", "get-url", "origin"]).get("stdout", "").strip() == destination
+    assert run_git(["remote", "get-url", "origin"]).get("stdout", "").strip() == destination
     assert artifacts.paths and all(path.startswith("/origin.git/") for path in artifacts.paths)
     for arguments in (
         ["config", "user.name", "Fixture"],
         ["config", "user.email", "fixture@example.test"],
         ["remote", "set-url", "origin", str(origin)],
     ):
-        server.require_process_success(server.run_git(arguments), "fixture remote")
+        require_process_success(run_git(arguments), "fixture remote")
     direct_tools.call_tool("file_write", {"path": "sample.txt", "content": "changed\n"})
     direct_tools.call_tool("git_commit", {"message": "changed"})
     pushed = direct_tools.call_tool("git_push", {"remote": "origin", "branch": "main"})
     assert pushed == {"remote": "origin", "branch": "main", "pushed": True}
-    assert server.run_git(["--git-dir", str(origin), "show", "main:sample.txt"]).get("stdout", "") == "changed\n"
+    assert run_git(["--git-dir", str(origin), "show", "main:sample.txt"]).get("stdout", "") == "changed\n"
     with raises(WorkspaceToolError) as missing:
         direct_tools.call_tool("git_clone", {"repoUrl": destination + "-missing", "branch": "main"})
     assert missing.value.code == "process_failed"

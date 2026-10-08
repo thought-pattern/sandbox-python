@@ -2,21 +2,24 @@
 
 from argparse import ArgumentParser as argparse_ArgumentParser
 from ctypes import CDLL, get_errno
-from os import environ as os_environ
-from os import execv as os_execv
-from os import geteuid as os_geteuid
-from os import setgid as os_setgid
-from os import setgroups as os_setgroups
-from os import setuid as os_setuid
+from os import (
+    environ as os_environ,
+    execv as os_execv,
+    geteuid as os_geteuid,
+    setgid as os_setgid,
+    setgroups as os_setgroups,
+    setuid as os_setuid,
+)
 from pathlib import Path
 from pwd import getpwnam as pwd_getpwnam
 from shutil import which as shutil_which
 from subprocess import run as subprocess_run
-from sys import argv as sys_argv
-from sys import executable as sys_executable
+from sys import argv as sys_argv, executable as sys_executable
 
 SERVER = Path(__file__).with_name("server.py")
 COMMAND_LINE_ARGUMENTS = []
+# The image's pinned Debian bookworm base ships glibc under this stable soname; prctl is resolved from it.
+LIBC_SONAME = "libc.so.6"
 WEB_PORTS = ("80", "443")
 # Web egress never reaches private, loopback, link-local or multicast networks,
 # keeping cloud metadata and credential endpoints (169.254.169.254,
@@ -131,7 +134,7 @@ def verify_deployment_identity():
     status = dict(line.split(":", 1) for line in Path("/proc/self/status").read_text().splitlines() if ":" in line)
     if any(int(status.get(name, "1").strip(), 16) for name in ("CapEff", "CapPrm", "CapAmb")):
         raise RuntimeError("deployment-enforced Workspace must have zero guest capabilities")
-    libc = CDLL(None, use_errno=True)
+    libc = CDLL(LIBC_SONAME, use_errno=True)
     if libc.prctl(38, 1, 0, 0, 0) != 0:
         raise RuntimeError(f"Workspace could not install no-new-privileges: errno {get_errno()}")
 
