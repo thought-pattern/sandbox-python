@@ -117,12 +117,11 @@ All calls require `Authorization: Bearer <session-token>`.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/health` | Authenticated readiness, dependency, workspace, capacity, API, and egress state |
-| `GET` | `/tools` | Versioned, typed, self-describing manifest |
+| `GET` | `/health` | Authenticated readiness, dependency, workspace, capacity, and egress state |
+| `GET` | `/tools` | Typed, self-describing manifest |
 | `POST` | `/tools/<name>` | Invoke a tool with a JSON argument object |
 
-The API uses camelCase fields and carries `apiVersion: "1.0"`. Every response
-includes a request identifier. Expected failures use a structured error:
+The API uses camelCase fields. Every response includes a request identifier. Expected failures use a structured error:
 
 ```json
 {"error":{"code":"egress_denied","message":"..."},"requestId":"..."}

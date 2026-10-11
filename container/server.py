@@ -54,7 +54,6 @@ DEFAULT_ARGUMENT_DICT = {}
 READ_ONLY_FILE_TOOLS = {"file_read", "file_list", "file_search"}
 INVOCATION_MARKER_VARIABLE = "TAPESTRY_TOOL_INVOCATION"
 
-API_VERSION = "1.0"
 PROTOCOL_NAME = "tapestry.workspace.http"
 DEFAULT_WORKSPACE = Path("/workspace")
 DEFAULT_PORT = 8080
@@ -536,6 +535,13 @@ def file_list(path: str = ".", depth: int = 2, max_results: int = DEFAULT_MAX_LI
     """List the inspected root, files and directories with explicit recursive coverage."""
     target = resolve_path(path)
     workspace = current_workspace()
+    if not target.exists():
+        raise ToolError(
+            f"No such directory: {path!r} is resolved relative to the working directory, and '.' lists the working "
+            "directory itself",
+            code="not_found",
+            status=404,
+        )
     if not target.is_dir():
         raise ToolError("Path is not a directory", code="not_directory", status=400)
     depth = max(0, min(int(depth), 64))
@@ -989,8 +995,8 @@ def observed_mounts() -> list:
         lines = Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines()
     except (FileNotFoundError, PermissionError) as err:
         LOGGER.warning("Workspace mount metadata unavailable error_type=%s", type(err).__name__)
-        mounts = []
-        return mounts
+        unavailable = []
+        return unavailable
     mounts = {}
     for line in lines:
         fields = line.split(" - ", 1)[0].split()
@@ -1007,7 +1013,7 @@ def observed_mounts() -> list:
 
 
 def build_manifest():
-    """Describe every tool with a versioned JSON-schema-shaped signature."""
+    """Describe every tool with a JSON-schema-shaped signature."""
     tools = []
     for name, fn in TOOLS.items():
         parameters = []
@@ -1032,7 +1038,6 @@ def build_manifest():
             }
         )
     manifest = {
-        "apiVersion": API_VERSION,
         "protocol": PROTOCOL_NAME,
         "egressPolicy": EGRESS_POLICY,
         "egressEnforcement": EGRESS_ENFORCEMENT,
@@ -1125,7 +1130,7 @@ class ToolHandler(BaseHTTPRequestHandler):
     """Authenticated request handler for health, manifest, and tool calls."""
 
     server: ToolHTTPServer
-    server_version = "TapestryWorkspace/1.0"
+    server_version = "TapestryWorkspace"
 
     def setup(self):
         super().setup()
@@ -1201,8 +1206,6 @@ class ToolHandler(BaseHTTPRequestHandler):
             return False
         if self.path == "/health":
             payload = build_readiness_report()
-            payload["python"] = sys_version
-            payload["apiVersion"] = API_VERSION
             payload["egressPolicy"] = EGRESS_POLICY
             payload["egressEnforcement"] = EGRESS_ENFORCEMENT
             payload["requestId"] = request_id
