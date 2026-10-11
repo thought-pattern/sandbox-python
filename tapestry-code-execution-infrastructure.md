@@ -2,12 +2,14 @@
 
 **Status:** MVP implementation  
 **Interface:** authenticated HTTP, API version 1.0  
-**Runtime:** Docker in development
+**Runtime:** Podman for the native Tapestry deployment; standalone Docker/Fargate interfaces remain supported
 
 ## Design
 
-The Actor and all governance remain outside this image. The image contains no
-agent and receives no application credentials. It provides a disposable Python
+Actor, Will, Regulator, Utility, Motivator, KE, Research, Engram and Channels run
+as independent native services outside this image. The image contains only the
+Workspace service and its declared dependencies, with no Tapestry project copy
+or application credentials. It provides a disposable Python
 workspace through a small, self-describing HTTP tool interface.
 
 ```text
