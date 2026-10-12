@@ -101,7 +101,9 @@ def artifacts(tmp_path):
             assert not worker.is_alive()
 
 
-def test_authenticated_direct_interface_runs_real_tools_and_preserves_failures(direct_tools):
+def test_authenticated_direct_interface_runs_real_tools_and_preserves_failures(
+    direct_tools,
+):
     assert direct_tools.health().get("egressPolicy", "") == "direct"
     with WorkspaceClient(direct_tools.base_url, "incorrect-identity") as unauthorized:
         with raises(WorkspaceToolError) as rejected:
@@ -118,14 +120,23 @@ def test_authenticated_direct_interface_runs_real_tools_and_preserves_failures(d
 
     # The same authenticated execution service serves independent generated projects.
     # Descendants use their existing root placement; request threads never share cwd.
-    roots = ("019cdc3d-a856-74f7-b720-f730ead81438", "019cdc3d-a857-74f7-b720-f730ead81438")
+    roots = (
+        "019cdc3d-a856-74f7-b720-f730ead81438",
+        "019cdc3d-a857-74f7-b720-f730ead81438",
+    )
     sources = ("print('decoder')\n", "print('sieve')\n")
     for root, source in zip(roots, sources, strict=True):
         status, envelope = direct_tools.request(
-            "POST", "/tools/file_write", {"path": "solution.py", "content": source}, root_task_id=root
+            "POST",
+            "/tools/file_write",
+            {"path": "solution.py", "content": source},
+            root_task_id=root,
         )
         assert status == 200
-        assert envelope.get("workspaceContext") == {"mode": "root", "root_task_id": root}
+        assert envelope.get("workspaceContext") == {
+            "mode": "root",
+            "root_task_id": root,
+        }
         assert envelope.get("result", {}).get("path") == "solution.py"
     direct_tools.call_tool("file_write", {"path": "solution.py", "content": "print('shared')\n"})
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -134,7 +145,10 @@ def test_authenticated_direct_interface_runs_real_tools_and_preserves_failures(d
                 direct_tools.request,
                 "POST",
                 "/tools/run_python",
-                {"script": "import pathlib, time\ntime.sleep(0.05)\nexec(pathlib.Path('solution.py').read_text())", "timeout": 2},
+                {
+                    "script": "import pathlib, time\ntime.sleep(0.05)\nexec(pathlib.Path('solution.py').read_text())",
+                    "timeout": 2,
+                },
                 root_task_id=root,
             )
             for root in roots
@@ -142,13 +156,20 @@ def test_authenticated_direct_interface_runs_real_tools_and_preserves_failures(d
         for root, name, operation in zip(roots, ("decoder", "sieve"), operations, strict=True):
             status, envelope = operation.result()
             assert status == 200 and envelope.get("result", {}).get("stdout") == name + "\n"
-            assert envelope.get("workspaceContext") == {"mode": "root", "root_task_id": root}
+            assert envelope.get("workspaceContext") == {
+                "mode": "root",
+                "root_task_id": root,
+            }
     _, child_read = direct_tools.request("POST", "/tools/file_read", {"path": "solution.py"}, root_task_id=roots[0])
     assert child_read.get("result") == sources[0]
     assert direct_tools.call_tool("file_read", {"path": "solution.py"}) == "print('shared')\n"
     for root, path, code in (
         (roots[0], "../solution.py", "path_escape"),
-        ("019cdc3d-a856-44f7-b720-f730ead81438", "solution.py", "invalid_working_context"),
+        (
+            "019cdc3d-a856-44f7-b720-f730ead81438",
+            "solution.py",
+            "invalid_working_context",
+        ),
     ):
         with raises(WorkspaceToolError) as refused:
             direct_tools.request("POST", "/tools/file_read", {"path": path}, root_task_id=root)
@@ -169,7 +190,10 @@ def test_scoped_read_returns_provenance_and_rejects_escapes(direct_tools, tmp_pa
     (repository / "package").mkdir(parents=True)
     source = "VALUE = 'café'\n"
     (repository / "package" / "module.py").write_text(source, encoding="utf-8")
-    read = direct_tools.call_tool("file_read_scoped", {"repository_root": "repository", "path": "package/module.py"})
+    read = direct_tools.call_tool(
+        "file_read_scoped",
+        {"repository_root": "repository", "path": "package/module.py"},
+    )
     assert read == {
         "repository_root": str(repository),
         "resolved_path": str(repository / "package" / "module.py"),
@@ -178,7 +202,12 @@ def test_scoped_read_returns_provenance_and_rejects_escapes(direct_tools, tmp_pa
         "content_sha256": sha256(source.encode("utf-8")).hexdigest(),
         "byte_count": len(source.encode("utf-8")),
     }
-    for path in ("../outside.py", "/etc/passwd", "package//module.py", "./package/module.py"):
+    for path in (
+        "../outside.py",
+        "/etc/passwd",
+        "package//module.py",
+        "./package/module.py",
+    ):
         with raises(WorkspaceToolError) as rejected:
             direct_tools.call_tool("file_read_scoped", {"repository_root": "repository", "path": path})
         assert rejected.value.code == "bad_arguments"
@@ -231,7 +260,10 @@ def test_scoped_search_returns_relative_python_leads_only(direct_tools):
     (repository / "package").mkdir(parents=True)
     (repository / "package" / "module.py").write_text("def target_symbol():\n    return 1\n", encoding="utf-8")
     (repository / "notes.txt").write_text("target_symbol\n", encoding="utf-8")
-    found = direct_tools.call_tool("file_search_scoped", {"repository_root": "repository", "symbol": "target_symbol"})
+    found = direct_tools.call_tool(
+        "file_search_scoped",
+        {"repository_root": "repository", "symbol": "target_symbol"},
+    )
     assert found == {
         "repository_root": str(repository),
         "symbol": "target_symbol",
@@ -257,7 +289,8 @@ def test_pip_downloads_from_the_actual_index_without_forwarding(direct_tools, ar
     with ZipFile(wheel, "w") as archive:
         archive.writestr("workspace_fixture.py", "VALUE = 42\n")
         archive.writestr(
-            "workspace_fixture-1.0.dist-info/METADATA", "Metadata-Version: 2.1\nName: workspace-fixture\nVersion: 1.0\n"
+            "workspace_fixture-1.0.dist-info/METADATA",
+            "Metadata-Version: 2.1\nName: workspace-fixture\nVersion: 1.0\n",
         )
         archive.writestr(
             "workspace_fixture-1.0.dist-info/WHEEL",
@@ -272,7 +305,12 @@ def test_pip_downloads_from_the_actual_index_without_forwarding(direct_tools, ar
     monkeypatch.setenv("PIP_INDEX_URL", f"http://127.0.0.1:{artifacts.server_port}/simple/")
     monkeypatch.setenv("PIP_TARGET", str(target))
     monkeypatch.setenv("PIP_DISABLE_PIP_VERSION_CHECK", "1")
-    for name in ("PIP_NO_INDEX", "PIP_EXTRA_INDEX_URL", "PIP_REQUIRE_VIRTUALENV", "PIP_REQUIRE_VENV"):
+    for name in (
+        "PIP_NO_INDEX",
+        "PIP_EXTRA_INDEX_URL",
+        "PIP_REQUIRE_VIRTUALENV",
+        "PIP_REQUIRE_VENV",
+    ):
         monkeypatch.delenv(name, raising=False)
     result = direct_tools.call_tool("pip_install", {"packages": ["workspace-fixture==1.0"]}, timeout=30)
     assert result.get("ok", False) and result.get("exitCode", -1) == 0
@@ -289,7 +327,17 @@ def test_git_uses_original_http_destination_and_native_remote_with_real_process_
     (seed / "sample.txt").write_text("initial\n", encoding="utf-8")
     for arguments in (
         ["-C", str(seed), "add", "sample.txt"],
-        ["-C", str(seed), "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-m", "initial"],
+        [
+            "-C",
+            str(seed),
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.test",
+            "commit",
+            "-m",
+            "initial",
+        ],
         ["clone", "--bare", str(seed), str(origin)],
         ["--git-dir", str(origin), "update-server-info"],
     ):

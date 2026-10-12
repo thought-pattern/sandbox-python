@@ -14,7 +14,11 @@ from hmac import compare_digest as hmac_compare_digest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from inspect import Parameter as inspect_Parameter, signature as inspect_signature
 from json import dumps as json_dumps, loads as json_loads
-from logging import INFO as logging_INFO, basicConfig as logging_basicConfig, getLogger as logging_getLogger
+from logging import (
+    INFO as logging_INFO,
+    basicConfig as logging_basicConfig,
+    getLogger as logging_getLogger,
+)
 from math import isfinite
 from os import (
     O_CLOEXEC,
@@ -38,15 +42,39 @@ from os import (
 )
 from pathlib import Path
 from re import compile as re_compile, fullmatch as re_fullmatch, sub as re_sub
-from selectors import EVENT_READ as selectors_EVENT_READ, DefaultSelector as selectors_DefaultSelector
-from shutil import disk_usage as shutil_disk_usage, move as shutil_move, rmtree as shutil_rmtree, which as shutil_which
-from signal import SIGINT as signal_SIGINT, SIGKILL as signal_SIGKILL, SIGTERM as signal_SIGTERM, signal as signal_signal
+from selectors import (
+    EVENT_READ as selectors_EVENT_READ,
+    DefaultSelector as selectors_DefaultSelector,
+)
+from shutil import (
+    disk_usage as shutil_disk_usage,
+    move as shutil_move,
+    rmtree as shutil_rmtree,
+    which as shutil_which,
+)
+from signal import (
+    SIGINT as signal_SIGINT,
+    SIGKILL as signal_SIGKILL,
+    SIGTERM as signal_SIGTERM,
+    signal as signal_signal,
+)
 from socketserver import TCPServer
 from stat import S_ISREG
-from subprocess import PIPE as subprocess_PIPE, Popen as subprocess_Popen, TimeoutExpired as subprocess_TimeoutExpired
+from subprocess import (
+    PIPE as subprocess_PIPE,
+    Popen as subprocess_Popen,
+    TimeoutExpired as subprocess_TimeoutExpired,
+)
 from sys import argv as sys_argv, executable as sys_executable, version as sys_version
-from tempfile import NamedTemporaryFile as tempfile_NamedTemporaryFile, mkstemp as tempfile_mkstemp
-from threading import BoundedSemaphore as threading_BoundedSemaphore, Event as threading_Event, RLock as threading_RLock
+from tempfile import (
+    NamedTemporaryFile as tempfile_NamedTemporaryFile,
+    mkstemp as tempfile_mkstemp,
+)
+from threading import (
+    BoundedSemaphore as threading_BoundedSemaphore,
+    Event as threading_Event,
+    RLock as threading_RLock,
+)
 from time import monotonic as time_monotonic
 from uuid import UUID, uuid4
 
@@ -121,19 +149,33 @@ def request_working_context(root_task_id: str) -> dict:
         identity = UUID(root_task_id)
     except ValueError as err:
         raise ToolError(
-            "Working context requires a canonical native root Task", code="invalid_working_context", status=400
+            "Working context requires a canonical native root Task",
+            code="invalid_working_context",
+            status=400,
         ) from err
     if identity.version != 7 or str(identity) != root_task_id:
-        raise ToolError("Working context requires a canonical native root Task", code="invalid_working_context", status=400)
+        raise ToolError(
+            "Working context requires a canonical native root Task",
+            code="invalid_working_context",
+            status=400,
+        )
     parent = WORKSPACE / ".tapestry-work"
     directory = parent / root_task_id
     with FILE_LOCK:
         parent.mkdir(exist_ok=True)
         if parent.resolve() != parent or directory.is_symlink():
-            raise ToolError("Working context cannot redirect outside its assigned directory", code="path_escape", status=400)
+            raise ToolError(
+                "Working context cannot redirect outside its assigned directory",
+                code="path_escape",
+                status=400,
+            )
         directory.mkdir(exist_ok=True)
         if directory.resolve() != directory:
-            raise ToolError("Working context cannot redirect outside its assigned directory", code="path_escape", status=400)
+            raise ToolError(
+                "Working context cannot redirect outside its assigned directory",
+                code="path_escape",
+                status=400,
+            )
     return {"mode": "root", "root_task_id": root_task_id, "directory": directory}
 
 
@@ -221,7 +263,11 @@ def signal_invocation(process, marker, signal_number):
         os_killpg(process.pid, signal_number)
     except ProcessLookupError:
         # The group has already exited; marked invocation processes that left it are still signalled below.
-        LOGGER.debug("Invocation process group %s exited before signal %s", process.pid, signal_number)
+        LOGGER.debug(
+            "Invocation process group %s exited before signal %s",
+            process.pid,
+            signal_number,
+        )
     except PermissionError:
         # Some kernels refuse a group signal once the reaped leader leaves only exited members.
         if process.poll() is None:
@@ -239,7 +285,10 @@ def terminate_process_group(process, marker):
     try:
         process.wait(timeout=0.25)
     except (ChildProcessError, subprocess_TimeoutExpired):
-        LOGGER.warning("tool invocation %s did not fully stop after SIGTERM; sending SIGKILL", process.pid)
+        LOGGER.warning(
+            "tool invocation %s did not fully stop after SIGTERM; sending SIGKILL",
+            process.pid,
+        )
     # The leader may exit on SIGTERM while a descendant ignores it, so the kill never depends on the leader.
     signal_invocation(process, marker, signal_SIGKILL)
     if process.poll() is None:
@@ -256,14 +305,24 @@ def terminate_process_group(process, marker):
     return False
 
 
-def internal_run_process(command, *, shell=False, timeout: float = 60.0, cwd="", environment=DEFAULT_ARGUMENT_DICT):
+def internal_run_process(
+    command,
+    *,
+    shell=False,
+    timeout: float = 60.0,
+    cwd="",
+    environment=DEFAULT_ARGUMENT_DICT,
+):
     """Run a bounded process and return a structured camelCase result."""
     if environment is DEFAULT_ARGUMENT_DICT:
         environment = DEFAULT_ARGUMENT_DICT.copy()
     timeout = bounded_timeout(timeout)
     started = time_monotonic()
     marker = uuid4().hex
-    process_environment = {**(environment or os_environ), INVOCATION_MARKER_VARIABLE: marker}
+    process_environment = {
+        **(environment or os_environ),
+        INVOCATION_MARKER_VARIABLE: marker,
+    }
     process = subprocess_Popen(
         command,
         shell=shell,
@@ -408,12 +467,20 @@ def workspace_file_text(target) -> str:
 def file_read_scoped(repository_root: str, path: str, max_bytes: int = 262144):
     """Read exact UTF-8 bytes beneath one resolved repository root with provenance."""
     if type(repository_root) is not str or not repository_root or type(path) is not str or not path:
-        raise ToolError("Scoped read requires repository root and relative path", code="bad_arguments", status=400)
+        raise ToolError(
+            "Scoped read requires repository root and relative path",
+            code="bad_arguments",
+            status=400,
+        )
     if type(max_bytes) is not int or not 0 < max_bytes <= 262144:
         raise ToolError("Scoped read byte limit is invalid", code="bad_arguments", status=400)
     parts = path.split("/")
     if Path(path).is_absolute() or any(part in {"", ".", ".."} for part in parts):
-        raise ToolError("Scoped read path must be canonical and relative", code="bad_arguments", status=400)
+        raise ToolError(
+            "Scoped read path must be canonical and relative",
+            code="bad_arguments",
+            status=400,
+        )
     root = resolve_path(repository_root)
     target = (root / path).resolve()
     if not root.is_dir() or not target.is_relative_to(root):
@@ -421,7 +488,11 @@ def file_read_scoped(repository_root: str, path: str, max_bytes: int = 262144):
     with FILE_LOCK:
         source = scoped_repository_bytes(root, target, min(max_bytes, MAX_FILE_BYTES))
     if len(source) > min(max_bytes, MAX_FILE_BYTES):
-        raise ToolError("Scoped source changed beyond its byte allowance", code="file_too_large", status=413)
+        raise ToolError(
+            "Scoped source changed beyond its byte allowance",
+            code="file_too_large",
+            status=413,
+        )
     try:
         content = source.decode("utf-8")
     except UnicodeDecodeError as err:
@@ -446,25 +517,49 @@ def scoped_repository_bytes(root: Path, target: Path, byte_limit: int) -> bytes:
             raise ToolError("Scoped source is not a regular file", code="bad_arguments", status=400)
         for component in (*root.parts[1:], *relative.parts[:-1]):
             try:
-                child = os_open(component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC, dir_fd=directory)
+                child = os_open(
+                    component,
+                    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC,
+                    dir_fd=directory,
+                )
             except PermissionError:
                 raise
             except OSError as err:
-                raise ToolError("Scoped repository directory changed or is unavailable", code="path_escape", status=400) from err
+                raise ToolError(
+                    "Scoped repository directory changed or is unavailable",
+                    code="path_escape",
+                    status=400,
+                ) from err
             os_close(directory)
             directory = child
         try:
-            descriptor = os_open(relative.name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, dir_fd=directory)
+            descriptor = os_open(
+                relative.name,
+                O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC,
+                dir_fd=directory,
+            )
         except (FileNotFoundError, PermissionError):
             raise
         except OSError as err:
-            raise ToolError("Scoped repository file changed or is unavailable", code="path_escape", status=400) from err
+            raise ToolError(
+                "Scoped repository file changed or is unavailable",
+                code="path_escape",
+                status=400,
+            ) from err
         with os_fdopen(descriptor, "rb") as opened:
             state = os_fstat(opened.fileno())
             if not S_ISREG(state.st_mode):
-                raise ToolError("Scoped source is not a regular file", code="bad_arguments", status=400)
+                raise ToolError(
+                    "Scoped source is not a regular file",
+                    code="bad_arguments",
+                    status=400,
+                )
             if state.st_size > byte_limit:
-                raise ToolError("Scoped source exceeds its byte allowance", code="file_too_large", status=413)
+                raise ToolError(
+                    "Scoped source exceeds its byte allowance",
+                    code="file_too_large",
+                    status=413,
+                )
             source = opened.read(byte_limit + 1)
             return source
     finally:
@@ -526,7 +621,10 @@ def file_delete(path: str):
     target = resolve_path(path)
     with FILE_LOCK:
         target.unlink(missing_ok=False)
-    computed_return_value = {"path": str(target.relative_to(current_workspace())), "deleted": True}
+    computed_return_value = {
+        "path": str(target.relative_to(current_workspace())),
+        "deleted": True,
+    }
     return computed_return_value
 
 
@@ -557,7 +655,11 @@ def file_list(path: str = ".", depth: int = 2, max_results: int = DEFAULT_MAX_LI
     visited_entries = 0
     visited_directories = 0
     stop_reason = "complete"
-    root = {"path": str(target.relative_to(workspace)), "kind": "directory", "children": []}
+    root = {
+        "path": str(target.relative_to(workspace)),
+        "kind": "directory",
+        "children": [],
+    }
     tree_nodes = {root.get("path", ""): root}
     while pending:
         if visited_entries >= DEFAULT_MAX_LIST_ENTRIES:
@@ -631,7 +733,11 @@ def file_list(path: str = ".", depth: int = 2, max_results: int = DEFAULT_MAX_LI
         "directories": sorted(directories),
         "links": sorted(links),
         "other": sorted(other),
-        "scan": {"depth": depth, "depthLimited": depth_limited, "complete": stop_reason == "complete" and not depth_limited},
+        "scan": {
+            "depth": depth,
+            "depthLimited": depth_limited,
+            "complete": stop_reason == "complete" and not depth_limited,
+        },
         "truncated": stop_reason != "complete",
         "visitedEntries": visited_entries,
         "visitedDirectories": visited_directories,
@@ -682,7 +788,11 @@ def file_search(pattern: str, path: str = ".", max_results: int = DEFAULT_MAX_SE
 def file_search_scoped(repository_root: str, symbol: str, max_results: int = 32):
     """Return bounded Python-source leads relative to one resolved repository."""
     if type(repository_root) is not str or not repository_root or type(symbol) is not str:
-        raise ToolError("Scoped Python search requires repository root and symbol", code="bad_arguments", status=400)
+        raise ToolError(
+            "Scoped Python search requires repository root and symbol",
+            code="bad_arguments",
+            status=400,
+        )
     if re_fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", symbol) is None:
         raise ToolError("Scoped Python search symbol is invalid", code="bad_arguments", status=400)
     if type(max_results) is not int or not 0 < max_results <= 64:
@@ -690,7 +800,20 @@ def file_search_scoped(repository_root: str, symbol: str, max_results: int = 32)
     root = resolve_path(repository_root)
     if not root.is_dir():
         raise ToolError("Scoped Python repository root is missing", code="path_missing", status=404)
-    result = internal_run_process(["rg", "--json", "--fixed-strings", "--glob", "*.py", "-e", symbol, "--", str(root)], timeout=15)
+    result = internal_run_process(
+        [
+            "rg",
+            "--json",
+            "--fixed-strings",
+            "--glob",
+            "*.py",
+            "-e",
+            symbol,
+            "--",
+            str(root),
+        ],
+        timeout=15,
+    )
     if result.get("exitCode", ()) not in (0, 1, -2):
         require_process_success(result, "scoped Python search")
     matches = []
@@ -707,7 +830,11 @@ def file_search_scoped(repository_root: str, symbol: str, max_results: int = 32)
             continue
         selected = Path(data.get("data", {}).get("path", {}).get("text", "")).resolve()
         if not selected.is_relative_to(root):
-            raise ToolError("Scoped Python search escaped its repository root", code="path_escape", status=400)
+            raise ToolError(
+                "Scoped Python search escaped its repository root",
+                code="path_escape",
+                status=400,
+            )
         matches.append(
             {
                 "relative_path": str(selected.relative_to(root)),
@@ -1003,11 +1130,19 @@ def observed_mounts() -> list:
         if len(fields) < 6:
             raise ValueError("Workspace mount metadata has an invalid record")
         mount_path = fields[4]
-        for encoded, decoded in (("\\040", " "), ("\\011", "\t"), ("\\012", "\n"), ("\\134", "\\")):
+        for encoded, decoded in (
+            ("\\040", " "),
+            ("\\011", "\t"),
+            ("\\012", "\n"),
+            ("\\134", "\\"),
+        ):
             mount_path = mount_path.replace(encoded, decoded)
         target = Path(mount_path)
         if target.is_dir() and str(target.resolve()) == mount_path:
-            mounts[mount_path] = {"path": mount_path, "readOnly": bool(os_statvfs(mount_path).f_flag & ST_RDONLY)}
+            mounts[mount_path] = {
+                "path": mount_path,
+                "readOnly": bool(os_statvfs(mount_path).f_flag & ST_RDONLY),
+            }
     observed = [mounts.get(path, {}) for path in sorted(mounts)]
     return observed
 
@@ -1082,7 +1217,10 @@ def build_readiness_report():
         missing = [name for name, found in tools.items() if not found]
         if missing:
             problems.append(f"required tools not on PATH: {', '.join(missing)}")
-        result["error"] = {"code": "unhealthy", "message": "sandbox is not ready: " + "; ".join(problems)}
+        result["error"] = {
+            "code": "unhealthy",
+            "message": "sandbox is not ready: " + "; ".join(problems),
+        }
     return result
 
 
@@ -1161,7 +1299,15 @@ class ToolHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
         return response_status
 
-    def send_error_json(self, status, code, message, *, request_id="", workspace_context: dict = DEFAULT_ARGUMENT_DICT):
+    def send_error_json(
+        self,
+        status,
+        code,
+        message,
+        *,
+        request_id="",
+        workspace_context: dict = DEFAULT_ARGUMENT_DICT,
+    ):
         response_status = self.send_json(
             status,
             {
@@ -1477,7 +1623,10 @@ def main(argv: list):
         server.timeout = 0.25
         while not stopped.is_set():
             server.handle_request()
-        LOGGER.info("workspace_shutdown requested signal=%s; draining accepted requests", shutdown.get("signal", 0))
+        LOGGER.info(
+            "workspace_shutdown requested signal=%s; draining accepted requests",
+            shutdown.get("signal", 0),
+        )
     finally:
         try:
             server.server_close()

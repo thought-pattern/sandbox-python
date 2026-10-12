@@ -93,12 +93,29 @@ def enforce_egress_policy(allow_web=False):
         for resolver in resolvers:
             if (":" in resolver) == (family == "ipv6"):
                 for protocol in ("udp", "tcp"):
-                    run_firewall(binary, ["-A", "OUTPUT", "-p", protocol, "-d", resolver, "--dport", "53", "-j", "ACCEPT"])
+                    run_firewall(
+                        binary,
+                        [
+                            "-A",
+                            "OUTPUT",
+                            "-p",
+                            protocol,
+                            "-d",
+                            resolver,
+                            "--dport",
+                            "53",
+                            "-j",
+                            "ACCEPT",
+                        ],
+                    )
         if allow_web:
             for network in NON_PUBLIC_NETWORKS.get(family, ()):
                 run_firewall(binary, ["-A", "OUTPUT", "-d", network, "-j", "DROP"])
             for port in WEB_PORTS:
-                run_firewall(binary, ["-A", "OUTPUT", "-p", "tcp", "--dport", port, "-j", "ACCEPT"])
+                run_firewall(
+                    binary,
+                    ["-A", "OUTPUT", "-p", "tcp", "--dport", port, "-j", "ACCEPT"],
+                )
         run_firewall(binary, ["-P", "OUTPUT", "DROP"])
         return False
 

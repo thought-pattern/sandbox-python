@@ -46,7 +46,13 @@ class WorkspaceClient:
         """Each request owns and closes its own connection, so leaving the context releases nothing."""
 
     def request(
-        self, method: str, path: str, arguments: dict = DEFAULT_ARGUMENT_DICT, timeout: float = 0.0, *, root_task_id: str = ""
+        self,
+        method: str,
+        path: str,
+        arguments: dict = DEFAULT_ARGUMENT_DICT,
+        timeout: float = 0.0,
+        *,
+        root_task_id: str = "",
     ):
         """Perform one authenticated request and return its status and decoded payload."""
         headers = {"Authorization": f"Bearer {self.auth_token}"}
@@ -74,11 +80,15 @@ class WorkspaceClient:
             payload = json_loads(raw)
         except ValueError as err:
             raise WorkspaceToolError(
-                f"{method} {path} returned a non-JSON response", code="invalid_response", status_code=status_code
+                f"{method} {path} returned a non-JSON response",
+                code="invalid_response",
+                status_code=status_code,
             ) from err
         if not isinstance(payload, dict):
             raise WorkspaceToolError(
-                f"{method} {path} returned a non-object response", code="invalid_response", status_code=status_code
+                f"{method} {path} returned a non-object response",
+                code="invalid_response",
+                status_code=status_code,
             )
         if status_code >= 400 or "error" in payload:
             error = payload.get("error", {})
@@ -103,7 +113,11 @@ class WorkspaceClient:
         """Return a tool result, raising when the request or the tool's process failed."""
         status_code, payload = self.request("POST", f"/tools/{name}", arguments, timeout)
         if "result" not in payload:
-            raise WorkspaceToolError("tool response has no result", code="invalid_response", status_code=status_code)
+            raise WorkspaceToolError(
+                "tool response has no result",
+                code="invalid_response",
+                status_code=status_code,
+            )
         result = payload.get("result", {})
         if isinstance(result, dict) and result.get("ok", True) is False:
             if result.get("timedOut", False):

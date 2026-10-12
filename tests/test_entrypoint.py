@@ -3,14 +3,27 @@
 
 """Firewall rules the root entrypoint installs for each egress policy, recorded instead of executed."""
 
-from entrypoint import NON_PUBLIC_NETWORKS, enforce_egress_policy, main as entrypoint_main
+from entrypoint import (
+    NON_PUBLIC_NETWORKS,
+    enforce_egress_policy,
+    main as entrypoint_main,
+)
 from pytest import fixture
 
 # Stand-in for the resolver the entrypoint reads from /etc/resolv.conf at startup.
 RESOLVER = "192.0.2.53"
 FLUSH = ["-F", "OUTPUT"]
 LOOPBACK = ["-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"]
-REPLIES = ["-A", "OUTPUT", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"]
+REPLIES = [
+    "-A",
+    "OUTPUT",
+    "-m",
+    "conntrack",
+    "--ctstate",
+    "ESTABLISHED,RELATED",
+    "-j",
+    "ACCEPT",
+]
 DROP_POLICY = ["-P", "OUTPUT", "DROP"]
 
 
@@ -19,7 +32,10 @@ def installed_rules(monkeypatch):
     rules = []
     monkeypatch.setattr("entrypoint.shutil_which", lambda name: f"/usr/sbin/{name}")
     monkeypatch.setattr("entrypoint.nameserver_addresses", lambda: [RESOLVER])
-    monkeypatch.setattr("entrypoint.run_firewall", lambda binary, arguments: rules.append((binary, arguments)))
+    monkeypatch.setattr(
+        "entrypoint.run_firewall",
+        lambda binary, arguments: rules.append((binary, arguments)),
+    )
     return rules
 
 
@@ -52,10 +68,20 @@ def test_deny_egress_allows_only_loopback_and_replies(installed_rules):
 
 def test_main_maps_each_container_policy_to_its_firewall(monkeypatch):
     calls = []
-    monkeypatch.setattr("entrypoint.enforce_egress_policy", lambda allow_web=False: calls.append(("firewall", allow_web)))
+    monkeypatch.setattr(
+        "entrypoint.enforce_egress_policy",
+        lambda allow_web=False: calls.append(("firewall", allow_web)),
+    )
     monkeypatch.setattr("entrypoint.drop_privileges", lambda: calls.append(("drop",)))
-    monkeypatch.setattr("entrypoint.os_execv", lambda path, arguments: calls.append(("exec", arguments[2:])))
-    for policy, firewall in (("web", [("firewall", True)]), ("deny", [("firewall", False)]), ("direct", [])):
+    monkeypatch.setattr(
+        "entrypoint.os_execv",
+        lambda path, arguments: calls.append(("exec", arguments[2:])),
+    )
+    for policy, firewall in (
+        ("web", [("firewall", True)]),
+        ("deny", [("firewall", False)]),
+        ("direct", []),
+    ):
         calls.clear()
         arguments = ["--egress-policy", policy, "--auth-token", "t" * 32]
         entrypoint_main(arguments)
