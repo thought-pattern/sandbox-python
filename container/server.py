@@ -1257,6 +1257,7 @@ class ToolHTTPServer(ThreadingHTTPServer):
         request_read_timeout=DEFAULT_REQUEST_READ_TIMEOUT,
     ):
         super().__init__(server_address, handler_class)
+        self.incarnation = str(uuid4())
         self.auth_token = auth_token
         self.max_request_bytes = max_request_bytes
         self.max_response_bytes = max_response_bytes
@@ -1352,6 +1353,7 @@ class ToolHandler(BaseHTTPRequestHandler):
             return False
         if self.path == "/health":
             payload = build_readiness_report()
+            payload["incarnation"] = self.server.incarnation
             payload["egressPolicy"] = EGRESS_POLICY
             payload["egressEnforcement"] = EGRESS_ENFORCEMENT
             payload["requestId"] = request_id

@@ -10,6 +10,7 @@ from os import environ, mkfifo
 from pathlib import Path
 from sys import executable
 from threading import Thread
+from uuid import UUID
 from zipfile import ZipFile
 
 from pytest import fixture, raises
@@ -104,10 +105,16 @@ def artifacts(tmp_path):
 def test_authenticated_direct_interface_runs_real_tools_and_preserves_failures(
     direct_tools,
 ):
-    assert direct_tools.health().get("egressPolicy", "") == "direct"
+    health = direct_tools.health()
+    assert health.get("egressPolicy", "") == "direct"
+    incarnation = health.get("incarnation", "")
+    assert UUID(incarnation).version == 4
+    assert direct_tools.health().get("incarnation", "") == incarnation
+    with ToolHTTPServer(("127.0.0.1", 0), ToolHandler, auth_token=TOKEN) as replacement:
+        assert replacement.incarnation != incarnation
     with WorkspaceClient(direct_tools.base_url, "incorrect-identity") as unauthorized:
         with raises(WorkspaceToolError) as rejected:
-            unauthorized.fetch_manifest()
+            unauthorized.health()
     assert rejected.value.status_code == 401
     assert direct_tools.fetch_manifest().get("protocol", "") == "tapestry.workspace.http"
     assert direct_tools.call_tool("file_write", {"path": "smoke.txt", "content": "hello"}).get("bytesWritten", 0) == 5
