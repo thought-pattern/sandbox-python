@@ -1,4 +1,4 @@
-# Copyright 2025-2026 Jason E. Robinson.
+# Copyright 2025-2026 Thought Pattern AI, LLC
 # SPDX-License-Identifier: Apache-2.0
 
 """Firewall rules the root entrypoint installs for each egress policy, recorded instead of executed."""

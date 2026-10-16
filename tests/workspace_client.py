@@ -1,4 +1,4 @@
-# Copyright 2025-2026 Jason E. Robinson.
+# Copyright 2025-2026 Thought Pattern AI, LLC
 # SPDX-License-Identifier: Apache-2.0
 
 """Standard-library HTTP client that drives the tool server in tests."""

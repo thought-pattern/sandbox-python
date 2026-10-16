@@ -57,7 +57,9 @@ annotated with the cleanup failure.
 
 Docker applies fractional CPU limits, `--cap-drop ALL`,
 `no-new-privileges`, a PID limit and the `SETGID`/`SETUID` capabilities needed to
-drop identity. Only explicit local offline mode adds `NET_ADMIN`.
+drop identity. The `web` and `deny` egress policies add `NET_ADMIN`, which only
+the root entrypoint uses to install the firewall before privileges drop; the
+`direct` policy leaves egress to the host and does not add it.
 The entrypoint clears groups and changes permanently to
 the non-root user.
 

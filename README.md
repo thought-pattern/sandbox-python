@@ -134,6 +134,9 @@ distinguish command failure from a transport or service failure.
 
 - Files: `file_read`, `file_write`, `file_patch`, `file_delete`, `file_list`,
   `file_search`, `workspace_tree`
+- Repository-scoped reads: `file_read_scoped` (UTF-8 bytes beneath one
+  resolved repository root, with provenance) and `file_search_scoped` (bounded
+  Python-source leads for one symbol in that repository)
 - Python: `run_python`, `python_version`
 - Shell: `run_command`
 - Packages: `pip_install`, `pip_uninstall`, `pip_list`, `pip_freeze`
@@ -156,7 +159,7 @@ without rewriting. Local operations work under every policy.
 Tests run the actual HTTP server and package/Git subprocesses against local
 fixtures. They do not build images, require Docker or change installed project
 packages. They need `git`, `pip` and `rg` (ripgrep) on `PATH`, the same tools
-the image installs. The standalone mocked runtime-command tests have been removed.
+the image installs.
 
 ```bash
 python3 -m pytest tests/test_smoke.py -q
