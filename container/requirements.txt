@@ -1,4 +1,6 @@
-# The tool server uses only the Python standard library; no third-party
-# dependencies. Task-time packages are installed into the sandbox user's home
-# directory at runtime through the pip_install tool.
+# Declared component transport dependencies follow the root runtime pins.
+grpcio==1.83.1
+protobuf==7.35.1
+msgpack==1.2.2
+# Retained component checks and generated Python deliverables use pytest.
 pytest==8.4.2

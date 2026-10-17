@@ -1,13 +1,11 @@
-"""Authenticated, bounded HTTP tool server for the Python sandbox.
+"""Authenticated, bounded gRPC tool server for the Python sandbox.
 
-The server is intentionally headless.  A controller supplies a per-session
-bearer token and reaches the three versioned endpoints over a host-loopback
-published port.  Tool execution remains free inside the disposable container,
-while request size, concurrency, wall time, process trees, and captured output
-are bounded so one tool call cannot exhaust the service.
+The component owns gRPC tools and a separate observation-only HTTP listener.
+Accepted tool functions drain even when their caller disconnects.
 """
 
 from argparse import ArgumentParser as argparse_ArgumentParser
+from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
 from hashlib import sha256 as hashlib_sha256
 from hmac import compare_digest as hmac_compare_digest
@@ -68,6 +66,7 @@ from subprocess import (
 from sys import argv as sys_argv, executable as sys_executable, version as sys_version
 from tempfile import (
     NamedTemporaryFile as tempfile_NamedTemporaryFile,
+    TemporaryFile as tempfile_TemporaryFile,
     mkstemp as tempfile_mkstemp,
 )
 from threading import (
@@ -78,17 +77,28 @@ from threading import (
 from time import monotonic as time_monotonic
 from uuid import UUID, uuid4
 
+from grpc import StatusCode, server as grpc_server
+from health import PAGE_HEADERS, WorkspaceHealth, page_file
+
+from tapestry.interfaces.envelope import decode_envelope, encode_envelope
+from tapestry.interfaces.workspace.constants import (
+    CONTROL_WORKERS,
+    DEFAULT_MAX_REQUEST_BYTES,
+    DEFAULT_MAX_RESPONSE_BYTES,
+    ENVELOPE_FRAME_BYTES,
+)
+from tapestry.interfaces.workspace.workspace_pb2 import WorkspaceEnvelope
+from tapestry.interfaces.workspace.workspace_pb2_grpc import WorkspaceServiceServicer, add_WorkspaceServiceServicer_to_server
+
 DEFAULT_ARGUMENT_DICT = {}
-READ_ONLY_FILE_TOOLS = {"file_read", "file_list", "file_search"}
 INVOCATION_MARKER_VARIABLE = "TAPESTRY_TOOL_INVOCATION"
 
-PROTOCOL_NAME = "tapestry.workspace.http"
+PROTOCOL_NAME = "tapestry.workspace.grpc"
 DEFAULT_WORKSPACE = Path("/workspace")
 DEFAULT_PORT = 8080
-DEFAULT_MAX_REQUEST_BYTES = 1_048_576
+DEFAULT_HEALTH_PORT = 8081
 DEFAULT_MAX_OUTPUT_BYTES = 1_048_576
 DEFAULT_MAX_FILE_BYTES = 10_485_760
-DEFAULT_MAX_RESPONSE_BYTES = 12_582_912
 DEFAULT_MAX_CONCURRENT_REQUESTS = 4
 DEFAULT_MAX_TOOL_TIMEOUT = 300
 DEFAULT_REQUEST_READ_TIMEOUT = 10.0
@@ -98,12 +108,19 @@ DEFAULT_LIST_TIMEOUT = 5.0
 DEFAULT_MAX_SEARCH_RESULTS = 1_000
 DEFAULT_MAX_GIT_LOG_RESULTS = 100
 MIN_MAX_RESPONSE_BYTES = 512
+# The bearer key file holds one line of at least this many characters, within this byte bound.
+MIN_AUTH_TOKEN_LENGTH = 32
+MAX_AUTH_TOKEN_FILE_BYTES = 4096
 
 WORKSPACE = DEFAULT_WORKSPACE
 # Outside a request the context is the shared empty mapping; each request sets its own resolved mapping.
 WORKING_CONTEXT = ContextVar("tapestry.workspace.working_context", default=DEFAULT_ARGUMENT_DICT)
 EGRESS_POLICY = "direct"
 EGRESS_ENFORCEMENT = "container"
+# The container image the manager started this server from, shown on the health page; empty when not supplied.
+IMAGE = ""
+# Routes answered without the Workspace key: the health page, its assets and the health API.
+PUBLIC_PATHS = {"/", "/health.js", "/health-common.js", "/health.css", "/api/health", "/health/live", "/health/ready"}
 MAX_OUTPUT_BYTES = DEFAULT_MAX_OUTPUT_BYTES
 MAX_FILE_BYTES = DEFAULT_MAX_FILE_BYTES
 MAX_TOOL_TIMEOUT = DEFAULT_MAX_TOOL_TIMEOUT
@@ -142,9 +159,13 @@ def current_workspace() -> Path:
 
 
 def request_working_context(root_task_id: str) -> dict:
-    """Resolve commissioned root placement inside the existing writable mount."""
+    """Resolve the folder of the root Task that sent this request inside the writable mount."""
     if not root_task_id:
-        return {"mode": "repository", "directory": WORKSPACE}
+        raise ToolError(
+            "Every tool call names its root Task",
+            code="invalid_working_context",
+            status=400,
+        )
     try:
         identity = UUID(root_task_id)
     except ValueError as err:
@@ -176,7 +197,14 @@ def request_working_context(root_task_id: str) -> dict:
                 code="path_escape",
                 status=400,
             )
-    return {"mode": "root", "root_task_id": root_task_id, "directory": directory}
+    return {"root_task_id": root_task_id, "directory": directory}
+
+
+def wire_working_context(context: dict) -> dict:
+    """Return the request's root Task folder as the reply names it, without the host directory."""
+    root_task_id = context.get("root_task_id", "")
+    wire = {"rootTaskId": root_task_id} if root_task_id else {}
+    return wire
 
 
 def resolve_path(path):
@@ -312,6 +340,7 @@ def internal_run_process(
     timeout: float = 60.0,
     cwd="",
     environment=DEFAULT_ARGUMENT_DICT,
+    inherited_descriptors: tuple = (),
 ):
     """Run a bounded process and return a structured camelCase result."""
     if environment is DEFAULT_ARGUMENT_DICT:
@@ -331,6 +360,7 @@ def internal_run_process(
         stdout=subprocess_PIPE,
         stderr=subprocess_PIPE,
         start_new_session=True,
+        pass_fds=inherited_descriptors,
     )
     stdout_stream = process.stdout
     stderr_stream = process.stderr
@@ -464,7 +494,7 @@ def workspace_file_text(target) -> str:
 
 
 @tool
-def file_read_scoped(repository_root: str, path: str, max_bytes: int = 262144):
+def file_read_scoped(repository_root: str, path: str, max_bytes: int = 0):
     """Read exact UTF-8 bytes beneath one resolved repository root with provenance."""
     if type(repository_root) is not str or not repository_root or type(path) is not str or not path:
         raise ToolError(
@@ -472,8 +502,9 @@ def file_read_scoped(repository_root: str, path: str, max_bytes: int = 262144):
             code="bad_arguments",
             status=400,
         )
-    if type(max_bytes) is not int or not 0 < max_bytes <= 262144:
+    if type(max_bytes) is not int or max_bytes < 0:
         raise ToolError("Scoped read byte limit is invalid", code="bad_arguments", status=400)
+    byte_budget = min(max_bytes, MAX_FILE_BYTES) if max_bytes else MAX_FILE_BYTES
     parts = path.split("/")
     if Path(path).is_absolute() or any(part in {"", ".", ".."} for part in parts):
         raise ToolError(
@@ -486,8 +517,8 @@ def file_read_scoped(repository_root: str, path: str, max_bytes: int = 262144):
     if not root.is_dir() or not target.is_relative_to(root):
         raise ToolError("Scoped read escaped its repository root", code="path_escape", status=400)
     with FILE_LOCK:
-        source = scoped_repository_bytes(root, target, min(max_bytes, MAX_FILE_BYTES))
-    if len(source) > min(max_bytes, MAX_FILE_BYTES):
+        source = scoped_repository_bytes(root, target, byte_budget)
+    if len(source) > byte_budget:
         raise ToolError(
             "Scoped source changed beyond its byte allowance",
             code="file_too_large",
@@ -785,8 +816,8 @@ def file_search(pattern: str, path: str = ".", max_results: int = DEFAULT_MAX_SE
 
 
 @tool
-def file_search_scoped(repository_root: str, symbol: str, max_results: int = 32):
-    """Return bounded Python-source leads relative to one resolved repository."""
+def file_search_scoped(repository_root: str, symbol: str, max_results: int = 0):
+    """Return distinct Python-source paths within configured retrieval and optional caller budgets."""
     if type(repository_root) is not str or not repository_root or type(symbol) is not str:
         raise ToolError(
             "Scoped Python search requires repository root and symbol",
@@ -795,7 +826,7 @@ def file_search_scoped(repository_root: str, symbol: str, max_results: int = 32)
         )
     if re_fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", symbol) is None:
         raise ToolError("Scoped Python search symbol is invalid", code="bad_arguments", status=400)
-    if type(max_results) is not int or not 0 < max_results <= 64:
+    if type(max_results) is not int or max_results < 0:
         raise ToolError("Scoped Python search limit is invalid", code="bad_arguments", status=400)
     root = resolve_path(repository_root)
     if not root.is_dir():
@@ -812,11 +843,11 @@ def file_search_scoped(repository_root: str, symbol: str, max_results: int = 32)
             "--",
             str(root),
         ],
-        timeout=15,
+        timeout=MAX_TOOL_TIMEOUT,
     )
-    if result.get("exitCode", ()) not in (0, 1, -2):
+    if result.get("exitCode", -1) not in (0, 1, -2):
         require_process_success(result, "scoped Python search")
-    matches = []
+    matches_by_path = {}
     for line in result.get("stdout", "").splitlines():
         if not line:
             continue
@@ -835,19 +866,22 @@ def file_search_scoped(repository_root: str, symbol: str, max_results: int = 32)
                 code="path_escape",
                 status=400,
             )
-        matches.append(
-            {
+        relative = str(selected.relative_to(root))
+        if relative not in matches_by_path:
+            matches_by_path[relative] = {
                 "relative_path": str(selected.relative_to(root)),
                 "line": data.get("data", {}).get("line_number", 0),
             }
-        )
-        if len(matches) >= max_results:
-            break
+    matches = [matches_by_path.get(path, {}) for path in sorted(matches_by_path)]
+    truncated = bool(result.get("outputLimited", False) or result.get("timedOut", False) or result.get("exitCode", 0) == -2)
+    if max_results and len(matches) > max_results:
+        matches = matches[:max_results]
+        truncated = True
     search = {
         "repository_root": str(root),
         "symbol": symbol,
         "matches": matches,
-        "truncated": len(matches) >= max_results or result.get("outputLimited", False),
+        "truncated": truncated,
     }
     return search
 
@@ -920,8 +954,18 @@ def run_python(script: str, timeout: float = 60.0):
     """Execute bounded Python code in the workspace."""
     if not isinstance(script, str) or not script.strip():
         raise ToolError("script must be a non-empty string", code="bad_arguments", status=400)
-    computed_return_value = internal_run_process([sys_executable, "-c", script], timeout=timeout)
-    return computed_return_value
+    with tempfile_TemporaryFile(mode="w+b") as source:
+        source.write(script.encode("utf-8"))
+        source.seek(0)
+        descriptor = source.fileno()
+        bootstrap = (
+            f"with open({descriptor}, encoding='utf-8') as source:\n"
+            "    source_code = compile(source.read(), '<string>', 'exec')\n"
+            "del source\n"
+            "exec(globals().pop('source_code'))"
+        )
+        result = internal_run_process([sys_executable, "-c", bootstrap], timeout=timeout, inherited_descriptors=(descriptor,))
+    return result
 
 
 def validate_git_atom(value, label):
@@ -1138,11 +1182,14 @@ def observed_mounts() -> list:
         ):
             mount_path = mount_path.replace(encoded, decoded)
         target = Path(mount_path)
-        if target.is_dir() and str(target.resolve()) == mount_path:
-            mounts[mount_path] = {
-                "path": mount_path,
-                "readOnly": bool(os_statvfs(mount_path).f_flag & ST_RDONLY),
-            }
+        try:
+            if target.is_dir() and str(target.resolve()) == mount_path:
+                mounts[mount_path] = {
+                    "path": mount_path,
+                    "readOnly": bool(os_statvfs(mount_path).f_flag & ST_RDONLY),
+                }
+        except PermissionError:
+            LOGGER.debug("Workspace mount excluded reason=permission_denied")
     observed = [mounts.get(path, {}) for path in sorted(mounts)]
     return observed
 
@@ -1174,6 +1221,7 @@ def build_manifest():
         )
     manifest = {
         "protocol": PROTOCOL_NAME,
+        "incarnation": "",
         "egressPolicy": EGRESS_POLICY,
         "egressEnforcement": EGRESS_ENFORCEMENT,
         "mounts": observed_mounts(),
@@ -1224,323 +1272,273 @@ def build_readiness_report():
     return result
 
 
-class ToolHTTPServer(ThreadingHTTPServer):
-    """Threaded server carrying immutable per-session boundary settings."""
+class WorkspaceService(WorkspaceServiceServicer):
+    """Own authenticated RPC admission, accepted work, tool slots and one health projection."""
 
-    server_name: str
-    server_port: int
+    def __init__(self, auth_token: str, args):
+        self.auth_token = auth_token
+        self.incarnation = str(uuid4())
+        self.max_request_bytes = args.max_request_bytes
+        self.max_response_bytes = args.max_response_bytes
+        self.max_concurrent_requests = args.max_concurrent_requests
+        self.request_slots = threading_BoundedSemaphore(self.max_concurrent_requests)
+        self.health = WorkspaceHealth(self.incarnation)
+        self.workers = ThreadPoolExecutor(max_workers=self.max_concurrent_requests + CONTROL_WORKERS)
+        self.rpc = grpc_server(
+            self.workers,
+            options=(
+                ("grpc.max_receive_message_length", self.max_request_bytes + ENVELOPE_FRAME_BYTES),
+                ("grpc.max_send_message_length", self.max_response_bytes + ENVELOPE_FRAME_BYTES),
+            ),
+            maximum_concurrent_rpcs=self.max_concurrent_requests + CONTROL_WORKERS,
+        )
+        add_WorkspaceServiceServicer_to_server(self, self.rpc)
+        self.port = 0
+        self.closed = False
+
+    def start(self, address: str) -> int:
+        """Bind and start the sole tool transport; a failed bind cannot become ready."""
+        self.port = self.rpc.add_insecure_port(address)
+        if not self.port:
+            raise RuntimeError("Workspace gRPC address could not bind")
+        self.rpc.start()
+        return self.port
+
+    def close(self) -> None:
+        """Stop admission and drain actual tool functions even after their RPCs disconnected."""
+        if not self.closed:
+            self.closed = True
+            self.rpc.stop(0).wait()
+            self.workers.shutdown(wait=True)
+
+    def authorize(self, context, operation: str) -> None:
+        headers = [value for key, value in context.invocation_metadata() if key == "authorization"]
+        expected = f"Bearer {self.auth_token}".encode("utf-8")
+        if len(headers) != 1 or type(headers[0]) is not str or not hmac_compare_digest(headers[0].encode("utf-8"), expected):
+            self.health.refused(operation, "UNAUTHORIZED", "unauthorized")
+            context.abort(StatusCode.UNAUTHENTICATED, "A valid Workspace service key is required")
+
+    def decode(self, request, context, fields: set) -> dict:
+        try:
+            payload = decode_envelope(request.payload, self.max_request_bytes, "Workspace")
+            if set(payload) != fields:
+                raise ValueError("Workspace RPC fields differ from its operation contract")
+            if "request_id" in fields:
+                identifier = payload.get("request_id", "")
+                if type(identifier) is not str or not re_fullmatch(r"[A-Za-z0-9._:-]{1,128}", identifier):
+                    raise ValueError("Workspace request ID is invalid")
+        except (TypeError, ValueError, OverflowError) as err:
+            self.health.refused("request", "INVALID_ARGUMENT", "invalid_request")
+            context.abort(StatusCode.INVALID_ARGUMENT, str(err))
+            raise
+        return payload
+
+    def encode(self, payload: dict):
+        encoded = encode_envelope(payload, self.max_response_bytes, "Workspace")
+        response = WorkspaceEnvelope(payload=encoded)
+        return response
+
+    def readiness(self) -> dict:
+        payload = build_readiness_report()
+        payload.update({"incarnation": self.incarnation, "egressPolicy": EGRESS_POLICY, "egressEnforcement": EGRESS_ENFORCEMENT})
+        return payload
+
+    def health_snapshot(self) -> dict:
+        snapshot = self.health.snapshot(
+            build_readiness_report(),
+            {
+                "egress_policy": EGRESS_POLICY,
+                "egress_enforcement": EGRESS_ENFORCEMENT,
+                "image": IMAGE,
+                "tool_call_limit": self.max_concurrent_requests,
+            },
+        )
+        return snapshot
+
+    def CheckHealth(self, request, context):
+        self.decode(request, context, set())
+        response = self.encode(self.readiness())
+        return response
+
+    def Describe(self, request, context):
+        self.authorize(context, "manifest")
+        payload = self.decode(request, context, {"request_id"})
+        identifier = payload.get("request_id", "")
+        key = self.health.received("manifest", {"request_id": identifier})
+        try:
+            manifest = build_manifest()
+            manifest.update({"incarnation": self.incarnation, "request_id": identifier})
+            response = self.encode(manifest)
+        except (TypeError, ValueError, OSError):
+            self.health.finished(key, "MANIFEST_FAILED", "manifest_failed")
+            context.abort(StatusCode.INTERNAL, "Workspace manifest is unavailable")
+            raise
+        self.health.finished(key, "OK", "")
+        return response
+
+    def InvokeTool(self, request, context):
+        self.authorize(context, "tool")
+        payload = self.decode(request, context, {"name", "arguments", "request_id", "root_task_id"})
+        name = payload.get("name", "")
+        arguments = payload.get("arguments", {})
+        root = payload.get("root_task_id", "")
+        if type(name) is not str or not re_fullmatch(r"[a-z][a-z0-9_]*", name):
+            context.abort(StatusCode.INVALID_ARGUMENT, "Workspace tool name is invalid")
+        if type(arguments) is not dict or any(type(key) is not str for key in arguments):
+            context.abort(StatusCode.INVALID_ARGUMENT, "Workspace arguments require a string-key mapping")
+        identifier = payload.get("request_id", "")
+        fn = TOOLS.get(name, False)
+        operation = name if fn is not False else "unknown tool"
+        working = (
+            {"root_task_id": root}
+            if type(root) is str and re_fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", root)
+            else {}
+        )
+        if not working:
+            response = self.refuse(identifier, operation, 400, "invalid_working_context", "A canonical root Task is required", {})
+            return response
+        if fn is False:
+            response = self.refuse(identifier, operation, 404, "unknown_tool", "Workspace tool is unknown", working)
+            return response
+        if not self.request_slots.acquire(blocking=False):
+            response = self.refuse(identifier, operation, 429, "busy", "Workspace tool concurrency limit reached", working)
+            return response
+        started = time_monotonic()
+        key = self.health.received(name, {"request_id": identifier, "root_task_id": root})
+        context_token = False
+        observation = {"request_id": identifier, "status_code": 200, "result": {}, "workspace_context": working}
+        code = ""
+        try:
+            normalized = {snake_case(key): value for key, value in arguments.items()}
+            if len(normalized) != len(arguments):
+                raise ToolError("Tool arguments repeat a normalized name", code="bad_arguments", status=400)
+            inspect_signature(fn).bind(**normalized)
+            resolved = request_working_context(root)
+            context_token = WORKING_CONTEXT.set(resolved)
+            observation["result"] = fn(**normalized)
+        except ToolError as err:
+            code = err.code
+            observation.update({"status_code": err.status, "result": {"error": {"code": code, "message": str(err)}}})
+        except (OSError, TypeError, ValueError) as err:
+            status, code, message = tool_failure(err)
+            observation.update({"status_code": status, "result": {"error": {"code": code, "message": message}}})
+        except Exception:
+            code = "internal_error"
+            LOGGER.exception("Unhandled tool error request_id=%s tool=%s", identifier, name)
+            observation.update({"status_code": 500, "result": {"error": {"code": code, "message": "Tool execution failed"}}})
+        finally:
+            if context_token is not False:
+                WORKING_CONTEXT.reset(context_token)
+            # Encoding is part of the outcome, and a disconnected client cannot release this slot early.
+            try:
+                response = self.encode(observation)
+            except (TypeError, ValueError, OverflowError):
+                code = "response_too_large"
+                observation.update(
+                    {"status_code": 413, "result": {"error": {"code": code, "message": "Tool response exceeds its allowance"}}}
+                )
+                response = self.encode(observation)
+            finally:
+                self.request_slots.release()
+                result = observation.get("result", {})
+                outcome = (
+                    code.upper() if code else "PROCESS_FAILED" if type(result) is dict and result.get("ok", True) is False else "OK"
+                )
+                self.health.finished(key, outcome, code)
+                LOGGER.info(
+                    "tool_request request_id=%s tool=%s status=%s duration_ms=%.3f",
+                    identifier,
+                    name,
+                    observation.get("status_code", 0),
+                    (time_monotonic() - started) * 1000,
+                )
+        return response
+
+    def refuse(self, identifier: str, operation: str, status: int, code: str, message: str, working: dict):
+        self.health.refused(operation, code.upper(), code)
+        response = self.encode(
+            {
+                "request_id": identifier,
+                "status_code": status,
+                "result": {"error": {"code": code, "message": message}},
+                "workspace_context": working,
+            }
+        )
+        return response
+
+
+def tool_failure(error: Exception) -> tuple:
+    """Classify the owning tool's bounded failure without leaking paths, arguments or subprocess output."""
+    if isinstance(error, FileNotFoundError):
+        failure = (404, "not_found", "Requested file or tool was not found")
+    elif isinstance(error, IsADirectoryError):
+        failure = (400, "not_file", "Expected a file")
+    elif isinstance(error, NotADirectoryError):
+        failure = (400, "not_directory", "Expected a directory")
+    elif isinstance(error, PermissionError):
+        failure = (403, "permission_denied", "Tool access was denied")
+    elif isinstance(error, OSError):
+        failure = (422, "tool_io_error", "Tool I/O failed")
+    else:
+        failure = (400, "bad_arguments", "Invalid tool arguments")
+    return failure
+
+
+class HealthHTTPServer(ThreadingHTTPServer):
+    """Own the observation listener while the gRPC service owns its safe snapshot."""
+
     daemon_threads = False
 
-    def server_bind(self):
-        """Bind without HTTPServer's blocking reverse-DNS lookup."""
-        TCPServer.server_bind(self)
-        bound_address = self.server_address
-        if not isinstance(bound_address, tuple) or len(bound_address) != 2:
-            raise RuntimeError("Workspace HTTP server did not bind an internet address")
-        bound_name = bound_address[0]
-        bound_port = bound_address[1]
-        if not isinstance(bound_name, str) or not isinstance(bound_port, int):
-            raise RuntimeError("Workspace HTTP server returned an invalid bound address")
-        self.server_name = bound_name
-        self.server_port = bound_port
-        return False
-
-    def __init__(
-        self,
-        server_address,
-        handler_class,
-        *,
-        auth_token,
-        max_request_bytes=DEFAULT_MAX_REQUEST_BYTES,
-        max_response_bytes=DEFAULT_MAX_RESPONSE_BYTES,
-        max_concurrent_requests=DEFAULT_MAX_CONCURRENT_REQUESTS,
-        request_read_timeout=DEFAULT_REQUEST_READ_TIMEOUT,
-    ):
-        super().__init__(server_address, handler_class)
-        self.incarnation = str(uuid4())
-        self.auth_token = auth_token
-        self.max_request_bytes = max_request_bytes
-        self.max_response_bytes = max_response_bytes
-        self.request_slots = threading_BoundedSemaphore(max_concurrent_requests)
+    def __init__(self, address: tuple, owner: WorkspaceService, request_read_timeout: float):
+        self.owner = owner
         self.request_read_timeout = request_read_timeout
+        super().__init__(address, HealthHandler)
+
+    def server_bind(self):
+        TCPServer.server_bind(self)
+        address = self.server_address
+        if not isinstance(address, tuple) or len(address) != 2:
+            raise RuntimeError("Workspace health listener requires an internet address")
+        host, port = address
+        if type(host) is not str or type(port) is not int:
+            raise RuntimeError("Workspace health listener returned an invalid address")
+        self.server_name = host
+        self.server_port = port
 
 
-class ToolHandler(BaseHTTPRequestHandler):
-    """Authenticated request handler for health, manifest, and tool calls."""
+class HealthHandler(BaseHTTPRequestHandler):
+    """Public observation only; tools and manifests have no HTTP routes."""
 
-    server: ToolHTTPServer
+    server: HealthHTTPServer
     server_version = "TapestryWorkspace"
 
     def setup(self):
         super().setup()
         self.connection.settimeout(self.server.request_read_timeout)
-        return False
-
-    def send_json(self, status, payload, *, request_id=""):
-        body = json_dumps(payload, separators=(",", ":")).encode("utf-8")
-        response_status = status
-        if len(body) > self.server.max_response_bytes:
-            response_status = 413
-            payload = {
-                "error": {
-                    "code": "response_too_large",
-                    "message": "Tool response exceeds the configured byte limit",
-                },
-                "requestId": request_id,
-            }
-            body = json_dumps(payload, separators=(",", ":")).encode("utf-8")
-        self.send_response(response_status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        if request_id:
-            self.send_header("X-Tapestry-Request-ID", request_id)
-        self.end_headers()
-        self.wfile.write(body)
-        return response_status
-
-    def send_error_json(
-        self,
-        status,
-        code,
-        message,
-        *,
-        request_id="",
-        workspace_context: dict = DEFAULT_ARGUMENT_DICT,
-    ):
-        response_status = self.send_json(
-            status,
-            {
-                "error": {"code": code, "message": str(message)},
-                "requestId": request_id,
-                **(
-                    {"workspaceContext": {key: value for key, value in workspace_context.items() if key != "directory"}}
-                    if workspace_context
-                    else {}
-                ),
-            },
-            request_id=request_id,
-        )
-        return response_status
-
-    def authorized(self):
-        header = self.headers.get("Authorization", "")
-        expected = f"Bearer {self.server.auth_token}"
-        computed_return_value = hmac_compare_digest(header.encode("utf-8"), expected.encode("utf-8"))
-        return computed_return_value
-
-    def require_authorized(self, request_id):
-        if self.authorized():
-            return True
-        self.send_error_json(
-            401,
-            "unauthorized",
-            "A valid sandbox session token is required",
-            request_id=request_id,
-        )
-        return False
-
-    def request_id(self):
-        supplied = self.headers.get("X-Tapestry-Request-ID", "").strip()
-        if supplied and len(supplied) <= 128 and re_fullmatch(r"[A-Za-z0-9._:-]+", supplied):
-            return supplied
-        return uuid4().hex
 
     def do_GET(self):
-        request_id = self.request_id()
-        if not self.require_authorized(request_id):
-            return False
-        if self.path == "/health":
-            payload = build_readiness_report()
-            payload["incarnation"] = self.server.incarnation
-            payload["egressPolicy"] = EGRESS_POLICY
-            payload["egressEnforcement"] = EGRESS_ENFORCEMENT
-            payload["requestId"] = request_id
-            status = 200 if payload.get("status", "") == "healthy" else 503
-            self.send_json(status, payload, request_id=request_id)
-        elif self.path == "/tools":
-            payload = build_manifest()
-            payload["requestId"] = request_id
-            self.send_json(200, payload, request_id=request_id)
-        else:
-            self.send_error_json(404, "not_found", f"no such path: {self.path}", request_id=request_id)
-        return False
-
-    def read_arguments(self, request_id):
-        if self.headers.get("Transfer-Encoding", ""):
-            raise ToolError(
-                "Transfer-Encoding is not supported",
-                code="unsupported_transfer_encoding",
-                status=400,
-            )
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-        except ValueError as err:
-            raise ToolError(
-                "Content-Length must be an integer",
-                code="invalid_content_length",
-                status=400,
-            ) from err
-        if length < 0:
-            raise ToolError(
-                "Content-Length must not be negative",
-                code="invalid_content_length",
-                status=400,
-            )
-        if length > self.server.max_request_bytes:
-            raise ToolError(
-                "Request body exceeds the configured limit",
-                code="request_too_large",
-                status=413,
-            )
-        if length and self.headers.get_content_type() != "application/json":
-            raise ToolError(
-                "Content-Type must be application/json",
-                code="unsupported_media_type",
-                status=415,
-            )
-        raw = self.rfile.read(length) if length else b""
-        try:
-            arguments = json_loads(raw) if raw else {}
-        except (UnicodeDecodeError, ValueError) as err:
-            raise ToolError(f"invalid JSON body: {err}", code="invalid_json", status=400) from err
-        if not isinstance(arguments, dict):
-            raise ToolError(
-                "request body must be a JSON object of arguments",
-                code="bad_arguments",
-                status=400,
-            )
-        computed_return_value = {snake_case(key): value for key, value in arguments.items()}
-        return computed_return_value
-
-    def do_POST(self):
-        request_id = self.request_id()
-        if not self.require_authorized(request_id):
-            return False
-        if not self.path.startswith("/tools/"):
-            self.send_error_json(404, "not_found", f"no such path: {self.path}", request_id=request_id)
-            return False
-        name = self.path[len("/tools/") :]
-        fn = TOOLS.get(name, False)
-        if fn is False:
-            self.send_error_json(404, "unknown_tool", f"no such tool: {name}", request_id=request_id)
-            return False
-        if not self.server.request_slots.acquire(blocking=False):
-            self.send_error_json(
-                429,
-                "busy",
-                "sandbox tool concurrency limit reached",
-                request_id=request_id,
-            )
-            return False
-
-        started = time_monotonic()
+        body, media_type = page_file(self.path)
         status = 200
-        context_token = False
-        context = {}
-        try:
-            arguments = self.read_arguments(request_id)
-            context = request_working_context(self.headers.get("X-Tapestry-Root-Task-ID", ""))
-            context_token = WORKING_CONTEXT.set(context)
-            result = fn(**arguments)
-            status = self.send_json(
-                200,
-                {
-                    "result": result,
-                    "requestId": request_id,
-                    "workspaceContext": {key: value for key, value in context.items() if key != "directory"},
-                },
-                request_id=request_id,
-            )
-        except ToolError as err:
-            status = err.status
-            self.send_error_json(
-                err.status,
-                err.code,
-                err,
-                request_id=request_id,
-                workspace_context=context if name in READ_ONLY_FILE_TOOLS else {},
-            )
-        except FileNotFoundError:
-            status = 404
-            self.send_error_json(
-                404,
-                "not_found",
-                "requested file or tool was not found",
-                request_id=request_id,
-                workspace_context=context if name in READ_ONLY_FILE_TOOLS else {},
-            )
-        except IsADirectoryError:
-            status = 400
-            self.send_error_json(
-                400,
-                "not_file",
-                "expected a file",
-                request_id=request_id,
-                workspace_context=context if name in READ_ONLY_FILE_TOOLS else {},
-            )
-        except NotADirectoryError:
-            status = 400
-            self.send_error_json(
-                400,
-                "not_directory",
-                "expected a directory",
-                request_id=request_id,
-                workspace_context=context if name in READ_ONLY_FILE_TOOLS else {},
-            )
-        except PermissionError:
-            status = 403
-            self.send_error_json(
-                403,
-                "permission_denied",
-                "tool access was denied",
-                request_id=request_id,
-                workspace_context=context if name in READ_ONLY_FILE_TOOLS else {},
-            )
-        except OSError:
-            status = 422
-            self.send_error_json(
-                422,
-                "tool_io_error",
-                "tool I/O failed",
-                request_id=request_id,
-                workspace_context=context if name in READ_ONLY_FILE_TOOLS else {},
-            )
-        except TypeError as err:
-            status = 400
-            self.send_error_json(
-                400,
-                "bad_arguments",
-                f"bad arguments for {name}: {err}",
-                request_id=request_id,
-                workspace_context=context if name in READ_ONLY_FILE_TOOLS else {},
-            )
-        except ValueError:
-            status = 400
-            self.send_error_json(
-                400,
-                "bad_arguments",
-                f"invalid arguments for {name}",
-                request_id=request_id,
-                workspace_context=context if name in READ_ONLY_FILE_TOOLS else {},
-            )
-        except Exception:
-            status = 500
-            LOGGER.exception("Unhandled tool error request_id=%s tool=%s", request_id, name)
-            self.send_error_json(500, "internal_error", "tool execution failed", request_id=request_id)
-        finally:
-            if context_token is not False:
-                WORKING_CONTEXT.reset(context_token)
-            self.server.request_slots.release()
-            LOGGER.info(
-                "tool_request request_id=%s tool=%s status=%s duration_ms=%.3f",
-                request_id,
-                name,
-                status,
-                (time_monotonic() - started) * 1000,
-            )
-        return False
+        if not media_type:
+            media_type = "application/json"
+            if self.path == "/api/health":
+                payload = self.server.owner.health_snapshot()
+            elif self.path == "/health/live":
+                payload = {"status": "running"}
+            elif self.path == "/health/ready":
+                payload = self.server.owner.readiness()
+                status = 200 if payload.get("status", "") == "healthy" else 503
+            else:
+                payload = {"error": "not_found"}
+                status = 404
+            body = json_dumps(payload, separators=(",", ":")).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", media_type)
+        self.send_header("Content-Length", str(len(body)))
+        for name, value in PAGE_HEADERS.items():
+            self.send_header(name, value)
+        self.end_headers()
+        self.wfile.write(body)
 
     def log_message(self, format, *args):
         return False
@@ -1551,7 +1549,8 @@ def parse_args(argv: list):
     parser = argparse_ArgumentParser(description=__doc__)
     parser.add_argument("--workspace", type=Path, default=DEFAULT_WORKSPACE)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
-    parser.add_argument("--auth-token", required=True)
+    parser.add_argument("--health-port", type=int, default=DEFAULT_HEALTH_PORT)
+    parser.add_argument("--auth-token-fd", type=int, required=True)
     parser.add_argument("--egress-policy", choices=("web", "deny", "direct"), default="direct")
     parser.add_argument("--egress-enforcement", choices=("container", "deployment"), default="container")
     parser.add_argument("--max-request-bytes", type=int, default=DEFAULT_MAX_REQUEST_BYTES)
@@ -1561,18 +1560,33 @@ def parse_args(argv: list):
     parser.add_argument("--max-concurrent-requests", type=int, default=DEFAULT_MAX_CONCURRENT_REQUESTS)
     parser.add_argument("--max-tool-timeout", type=int, default=DEFAULT_MAX_TOOL_TIMEOUT)
     parser.add_argument("--request-read-timeout", type=float, default=DEFAULT_REQUEST_READ_TIMEOUT)
+    parser.add_argument("--image", default="")
     computed_return_value = parser.parse_args(argv)
     return computed_return_value
+
+
+def read_auth_token(args):
+    """Read the bearer key once from a regular owner-only file and close it, so no tool child inherits it."""
+    descriptor = args.auth_token_fd
+    with os_fdopen(descriptor, "rb") as stream:
+        metadata = os_fstat(stream.fileno())
+        if not S_ISREG(metadata.st_mode) or metadata.st_mode & 0o077:
+            raise ValueError("auth token file must be a regular owner-only file")
+        content = stream.read(MAX_AUTH_TOKEN_FILE_BYTES + 1)
+    if len(content) > MAX_AUTH_TOKEN_FILE_BYTES:
+        raise ValueError("auth token file exceeds its bound")
+    token = content.decode("utf-8").removesuffix("\n")
+    if len(token) < MIN_AUTH_TOKEN_LENGTH or any(character in token for character in ("\r", "\n", "\x00")):
+        raise ValueError(f"auth token must be one line of at least {MIN_AUTH_TOKEN_LENGTH} characters")
+    return token
 
 
 def configure(args):
     """Apply validated process-wide settings before accepting requests."""
     global WORKSPACE, EGRESS_POLICY, EGRESS_ENFORCEMENT, MAX_OUTPUT_BYTES, MAX_FILE_BYTES
-    global MAX_TOOL_TIMEOUT
-    if len(args.auth_token) < 32:
-        raise ValueError("auth token must be at least 32 characters")
-    if not 1 <= args.port <= 65535:
-        raise ValueError("port must be between 1 and 65535")
+    global MAX_TOOL_TIMEOUT, IMAGE
+    if not 1 <= args.port <= 65535 or not 1 <= args.health_port <= 65535 or args.port == args.health_port:
+        raise ValueError("gRPC and health ports must be distinct ports between 1 and 65535")
     for name in (
         "max_request_bytes",
         "max_output_bytes",
@@ -1594,27 +1608,23 @@ def configure(args):
     MAX_OUTPUT_BYTES = args.max_output_bytes
     MAX_FILE_BYTES = args.max_file_bytes
     MAX_TOOL_TIMEOUT = args.max_tool_timeout
+    IMAGE = args.image
     return False
 
 
 def main(argv: list):
     logging_basicConfig(level=logging_INFO, format="%(asctime)s %(levelname)s %(message)s")
     args = parse_args(argv)
+    auth_token = read_auth_token(args)
     configure(args)
-    server = ToolHTTPServer(
-        ("0.0.0.0", args.port),
-        ToolHandler,
-        auth_token=args.auth_token,
-        max_request_bytes=args.max_request_bytes,
-        max_response_bytes=args.max_response_bytes,
-        max_concurrent_requests=args.max_concurrent_requests,
-        request_read_timeout=args.request_read_timeout,
-    )
+    owner = WorkspaceService(auth_token, args)
+    server = HealthHTTPServer(("0.0.0.0", args.health_port), owner, args.request_read_timeout)
+    owner.start(f"0.0.0.0:{args.port}")
     stopped = threading_Event()
     shutdown = {"signal": 0}
 
     def request_shutdown(number, frame):
-        """Ask the main HTTP owner to stop accepting and drain current work."""
+        """Ask the component owner to stop accepting and drain current work."""
         shutdown["signal"] = number
         stopped.set()
 
@@ -1625,12 +1635,14 @@ def main(argv: list):
         server.timeout = 0.25
         while not stopped.is_set():
             server.handle_request()
+            owner.health.sample()
         LOGGER.info(
             "workspace_shutdown requested signal=%s; draining accepted requests",
             shutdown.get("signal", 0),
         )
     finally:
         try:
+            owner.close()
             server.server_close()
         finally:
             for number, handler in previous_handlers.items():

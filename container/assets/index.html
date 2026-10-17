@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tapestry · Workspace health</title>
+  <link rel="stylesheet" href="/health.css"><script type="module" src="/health.js"></script>
+</head>
+<body>
+  <main>
+    <header><div><p class="eyebrow">TAPESTRY / WORKSPACE</p><h1>Workspace health</h1><p class="subtle">Tool calls this Workspace server ran; each tool is one operation.</p></div><div id="connection" class="status">Connecting</div></header>
+    <p id="scope" class="subtle">Waiting for the first observation.</p><p id="notice" class="notice" hidden></p>
+    <div id="standard-summary"></div>
+    <section class="tables">
+      <article class="panel"><h2>Readiness checks</h2><dl id="readiness-facts"></dl></article>
+      <article class="panel"><h2>Workspace</h2><dl id="workspace-facts"></dl></article>
+    </section>
+    <div id="standard-detail"></div>
+    <footer>Read-only observation of this server only · no tool arguments, results, file contents, key or controls <span id="observed"></span></footer>
+  </main>
+</body>
+</html>

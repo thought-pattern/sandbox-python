@@ -2,7 +2,7 @@
 
 **Status:** MVP implementation  
 **Interface:** authenticated HTTP, API version 1.0  
-**Runtime:** Podman for the native Tapestry deployment; standalone Docker/Fargate interfaces remain supported
+**Runtime:** the configured container engine, Docker or Podman (`sandbox.container_engine`), or Fargate
 
 ## Design
 
@@ -36,7 +36,8 @@ storage dependency.
 ## Security invariants
 
 1. The host publish address is `127.0.0.1` in local development.
-2. A fresh bearer token is generated for every sandbox session.
+2. Every tool call carries the instance's one configured Workspace key, which the
+   server reads once from an owner-only file and never from its command line.
 3. The HTTP server and tool subprocesses run as the `sandbox` user.
 4. Deployment owns the EC2/Fargate boundary; managed web and deny modes
    install guest output rules, while explicit direct startup adds no guest firewall.
@@ -50,12 +51,15 @@ storage dependency.
 ## Runtime lifecycle
 
 An owned native configuration carries image, requested port, loopback bind,
-resource bounds and networking mode. The session owns fresh identity and the
-observed endpoint. `sandbox_session` creates and starts one container, yields its endpoint, then force-removes
-it. If work and cleanup both fail, the original work failure is preserved and
-annotated with the cleanup failure.
+resource bounds and networking mode. The instance Workspace is one long-lived
+container started by `scripts/workspace_start.py` and removed by
+`scripts/workspace_stop.py`; each Task works in its own folder inside it. A
+disposable `SandboxSession` owns fresh identity, its own key file and the
+observed endpoint: it creates and starts one container, yields its endpoint,
+then force-removes it and deletes the key file. If work and cleanup both fail,
+the original work failure is preserved and annotated with the cleanup failure.
 
-Docker applies fractional CPU limits, `--cap-drop ALL`,
+The configured engine applies fractional CPU limits, `--cap-drop ALL`,
 `no-new-privileges`, a PID limit and the `SETGID`/`SETUID` capabilities needed to
 drop identity. The `web` and `deny` egress policies add `NET_ADMIN`, which only
 the root entrypoint uses to install the firewall before privileges drop; the
@@ -65,13 +69,16 @@ the non-root user.
 
 ## API contract
 
-- `GET /health`
 - `GET /tools`
 - `POST /tools/<tool-name>`
+- `GET /health/ready`, `GET /health/live`, `GET /api/health` and the health
+  page at `GET /` with its assets
 
-All endpoints authenticate. The manifest is generated from the registered tool
-functions and includes the protocol name, API version, egress policy, parameter
-names, required/default state, and JSON types. External field names are
+The manifest and tool calls authenticate; the health routes do not, and they
+carry no tool arguments, results, file contents or token. The manifest is
+generated from the registered tool functions and includes the protocol name,
+the server's incarnation, egress policy, parameter names, required/default
+state, and JSON types. External field names are
 camelCase; request arguments are translated to internal Python names.
 
 Every tool response carries a request ID. Server/API failures are structured.
@@ -80,8 +87,8 @@ Process tools return `ok`, `stdout`, `stderr`, `exitCode`, `timedOut`,
 process; execution verification explicitly consumes the nonzero result so it
 can distinguish refutation from infrastructure failure.
 
-The authenticated health endpoint is a readiness probe rather than a process
-liveness assertion. It verifies the workspace exists and is writable, reports
+The readiness endpoint (`/health/ready`) is a readiness probe rather than a
+process liveness assertion; `/health/live` answers while the server runs. It verifies the workspace exists and is writable, reports
 free workspace capacity, and checks that Git, pip, and ripgrep are available.
 An unhealthy report returns 503 with an `unhealthy` error whose message names
 each failed check.

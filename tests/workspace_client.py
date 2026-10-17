@@ -1,19 +1,25 @@
 # Copyright 2025-2026 Thought Pattern AI, LLC
 # SPDX-License-Identifier: Apache-2.0
 
-"""Standard-library HTTP client that drives the tool server in tests."""
+"""Retained component harness client using the actual Workspace protobuf interface."""
 
 from copy import deepcopy
-from http.client import HTTPConnection
-from json import dumps as json_dumps, loads as json_loads
-from urllib.parse import urlsplit
+from uuid import uuid4
+
+from grpc import RpcError, StatusCode, insecure_channel
+
+from tapestry.interfaces.envelope import decode_envelope, encode_envelope
+from tapestry.interfaces.workspace.constants import DEFAULT_MAX_REQUEST_BYTES, DEFAULT_MAX_RESPONSE_BYTES
+from tapestry.interfaces.workspace.workspace_pb2 import WorkspaceEnvelope
+from tapestry.interfaces.workspace.workspace_pb2_grpc import WorkspaceServiceStub
 
 DEFAULT_ARGUMENT_DICT = {}
 DEFAULT_TIMEOUT = 120.0
+DEFAULT_ROOT_TASK_ID = "019cdc3d-a855-74f7-b720-f730ead81438"
 
 
 class WorkspaceToolError(RuntimeError):
-    """A structured failure retaining the HTTP status, error code and process result."""
+    """A tool observation or RPC failure retained by the component harness."""
 
     def __init__(self, message, *, code="tool_error", status_code=0, result=DEFAULT_ARGUMENT_DICT):
         super().__init__(message)
@@ -23,109 +29,72 @@ class WorkspaceToolError(RuntimeError):
 
 
 class WorkspaceClient:
-    """Authenticated client bound to one server URL and bearer token.
+    """Own a harness RPC connection and one default root Task."""
 
-    http.client never consults proxy environment variables, so every request
-    reaches the server under test directly.
-    """
-
-    def __init__(self, base_url: str, auth_token: str, timeout: float = DEFAULT_TIMEOUT):
-        parts = urlsplit(base_url)
-        if parts.scheme != "http" or not parts.hostname or not parts.port:
-            raise ValueError("base_url must be http://host:port")
-        self.base_url = base_url.rstrip("/")
+    def __init__(self, address: str, auth_token: str, timeout: float = DEFAULT_TIMEOUT, root_task_id: str = DEFAULT_ROOT_TASK_ID):
+        self.address = address
         self.auth_token = auth_token
         self.timeout = timeout
-        self.host = parts.hostname
-        self.port = parts.port
+        self.root_task_id = root_task_id
+        self.channel = insecure_channel(address)
+        self.stub = WorkspaceServiceStub(self.channel)
+        self.health_address = ()
 
     def __enter__(self):
         return self
 
     def __exit__(self, exception_type, exception, traceback) -> None:
-        """Each request owns and closes its own connection, so leaving the context releases nothing."""
+        self.channel.close()
 
-    def request(
-        self,
-        method: str,
-        path: str,
-        arguments: dict = DEFAULT_ARGUMENT_DICT,
-        timeout: float = 0.0,
-        *,
-        root_task_id: str = "",
-    ):
-        """Perform one authenticated request and return its status and decoded payload."""
-        headers = {"Authorization": f"Bearer {self.auth_token}"}
-        if root_task_id:
-            headers["X-Tapestry-Root-Task-ID"] = root_task_id
-        body = b""
-        if method == "POST":
-            body = json_dumps(arguments).encode("utf-8")
-            headers["Content-Type"] = "application/json"
-        connection = HTTPConnection(self.host, self.port, timeout=timeout or self.timeout)
+    def rpc(self, operation: str, payload: dict, timeout: float = 0.0) -> dict:
+        request = WorkspaceEnvelope(payload=encode_envelope(payload, DEFAULT_MAX_REQUEST_BYTES, "Workspace"))
+        metadata = () if operation == "CheckHealth" else (("authorization", f"Bearer {self.auth_token}"),)
         try:
-            # Only POST carries a body; other methods keep http.client's bodiless request form.
-            if method == "POST":
-                connection.request(method, path, body=body, headers=headers)
-            else:
-                connection.request(method, path, headers=headers)
-            response = connection.getresponse()
-            status_code = response.status
-            raw = response.read()
-        except OSError as err:
-            raise WorkspaceToolError(f"{method} {path} transport failed: {err}", code="transport_error") from err
-        finally:
-            connection.close()
-        try:
-            payload = json_loads(raw)
-        except ValueError as err:
+            response = getattr(self.stub, operation)(request, timeout=timeout or self.timeout, metadata=metadata)
+        except RpcError as err:
+            unauthorized = err.code() == StatusCode.UNAUTHENTICATED
             raise WorkspaceToolError(
-                f"{method} {path} returned a non-JSON response",
-                code="invalid_response",
-                status_code=status_code,
+                "Workspace RPC refused",
+                code="unauthorized" if unauthorized else "transport_error",
+                status_code=401 if unauthorized else 0,
             ) from err
-        if not isinstance(payload, dict):
-            raise WorkspaceToolError(
-                f"{method} {path} returned a non-object response",
-                code="invalid_response",
-                status_code=status_code,
-            )
-        if status_code >= 400 or "error" in payload:
-            error = payload.get("error", {})
-            if not isinstance(error, dict):
-                error = {}
-            raise WorkspaceToolError(
-                error.get("message", f"{method} {path} failed with status {status_code}"),
-                code=error.get("code", "tool_error"),
-                status_code=status_code,
-            )
-        return status_code, payload
+        result = decode_envelope(response.payload, DEFAULT_MAX_RESPONSE_BYTES, "Workspace")
+        return result
 
     def health(self, timeout: float = 0.0) -> dict:
-        status_code, payload = self.request("GET", "/health", timeout=timeout)
+        payload = self.rpc("CheckHealth", {}, timeout)
+        if payload.get("status", "") != "healthy":
+            error = payload.get("error", {})
+            raise WorkspaceToolError(
+                error.get("message", "Workspace is not ready"), code="unhealthy", status_code=503, result=payload
+            )
         return payload
 
-    def fetch_manifest(self, timeout: float = 0.0) -> dict:
-        status_code, payload = self.request("GET", "/tools", timeout=timeout)
+    def describe(self, timeout: float = 0.0) -> dict:
+        payload = self.rpc("Describe", {"request_id": uuid4().hex}, timeout)
+        return payload
+
+    def invoke_tool(
+        self, name: str, arguments: dict = DEFAULT_ARGUMENT_DICT, timeout: float = 0.0, *, root_task_id: str = ""
+    ) -> dict:
+        payload = self.rpc(
+            "InvokeTool", {"name": name, "arguments": arguments, "request_id": uuid4().hex, "root_task_id": root_task_id}, timeout
+        )
+        status = payload.get("status_code", 0)
+        result = payload.get("result", {})
+        if status >= 400:
+            error = result.get("error", {})
+            raise WorkspaceToolError(error.get("message", "Tool failed"), code=error.get("code", "tool_error"), status_code=status)
         return payload
 
     def call_tool(self, name: str, arguments: dict = DEFAULT_ARGUMENT_DICT, timeout: float = 0.0):
-        """Return a tool result, raising when the request or the tool's process failed."""
-        status_code, payload = self.request("POST", f"/tools/{name}", arguments, timeout)
-        if "result" not in payload:
-            raise WorkspaceToolError(
-                "tool response has no result",
-                code="invalid_response",
-                status_code=status_code,
-            )
+        payload = self.invoke_tool(name, arguments, timeout, root_task_id=self.root_task_id)
         result = payload.get("result", {})
         if isinstance(result, dict) and result.get("ok", True) is False:
-            if result.get("timedOut", False):
-                code = "timeout"
-            elif result.get("outputLimited", False):
-                code = "output_limit"
-            else:
-                code = "process_failed"
-            message = result.get("stderr", "") or result.get("stdout", "") or f"tool {name} failed"
-            raise WorkspaceToolError(message.strip(), code=code, status_code=status_code, result=result)
+            code = (
+                "timeout"
+                if result.get("timedOut", False)
+                else "output_limit" if result.get("outputLimited", False) else "process_failed"
+            )
+            raise WorkspaceToolError("Tool process failed", code=code, status_code=payload.get("status_code", 0), result=result)
         return result

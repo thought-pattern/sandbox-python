@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y \
 
 RUN useradd --create-home --shell /usr/sbin/nologin sandbox
 
-COPY requirements.txt /opt/tapestry/
+COPY container/sandbox-python/container/requirements.txt /opt/tapestry/
 RUN pip install --no-cache-dir -r /opt/tapestry/requirements.txt
 
 # The container is disposable, so there is no virtualenv. The system Python
@@ -17,16 +17,21 @@ RUN pip install --no-cache-dir -r /opt/tapestry/requirements.txt
 # pip list/freeze into --user listings that hide build-time packages.
 ENV PATH=$PATH:/home/sandbox/.local/bin
 
-COPY server.py entrypoint.py /opt/tapestry/
+COPY container/sandbox-python/container/server.py container/sandbox-python/container/entrypoint.py container/sandbox-python/container/health.py /opt/tapestry/
+COPY container/sandbox-python/container/assets /opt/tapestry/assets/
+COPY tapestry/__init__.py /opt/workspace-interface/tapestry/
+COPY tapestry/interfaces/__init__.py tapestry/interfaces/envelope.py /opt/workspace-interface/tapestry/interfaces/
+COPY tapestry/interfaces/workspace/__init__.py tapestry/interfaces/workspace/constants.py tapestry/interfaces/workspace/workspace_pb2.py tapestry/interfaces/workspace/workspace_pb2_grpc.py /opt/workspace-interface/tapestry/interfaces/workspace/
+ENV PYTHONPATH=/opt/workspace-interface
 
 RUN mkdir /workspace \
     && chown -R sandbox:sandbox /workspace
 WORKDIR /workspace
 
-EXPOSE 8080
+EXPOSE 8080 8081
 
 # The entrypoint starts as root solely to install the deny-by-default OUTPUT
-# firewall, then irreversibly drops to the sandbox user before the HTTP server
+# firewall, then irreversibly drops to the sandbox user before the gRPC server
 # starts or any tool code can execute.
 USER root
 STOPSIGNAL SIGTERM

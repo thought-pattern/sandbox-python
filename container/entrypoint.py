@@ -3,9 +3,18 @@
 from argparse import ArgumentParser as argparse_ArgumentParser
 from ctypes import CDLL, get_errno
 from os import (
+    O_CLOEXEC,
+    O_CREAT,
+    O_EXCL,
+    O_NOFOLLOW,
+    O_RDONLY,
+    O_WRONLY,
     environ as os_environ,
     execv as os_execv,
+    fdopen as os_fdopen,
     geteuid as os_geteuid,
+    open as os_open,
+    set_inheritable as os_set_inheritable,
     setgid as os_setgid,
     setgroups as os_setgroups,
     setuid as os_setuid,
@@ -15,9 +24,16 @@ from pwd import getpwnam as pwd_getpwnam
 from shutil import which as shutil_which
 from subprocess import run as subprocess_run
 from sys import argv as sys_argv, executable as sys_executable
+from tempfile import mkdtemp as tempfile_mkdtemp
 
 SERVER = Path(__file__).with_name("server.py")
 COMMAND_LINE_ARGUMENTS = []
+KEY_FILE_OPTION = "--auth-token-file"
+KEY_DESCRIPTOR_OPTION = "--auth-token-fd"
+KEY_MOUNT_DIRECTORY = Path("/run/secrets")
+# A deployment controller with no host file to mount passes the key in this one bootstrap environment value;
+# Tapestry's Fargate controller names the same variable.
+KEY_BOOTSTRAP_VARIABLE = "TAPESTRY_WORKSPACE_KEY"
 # The image's pinned Debian bookworm base ships glibc under this stable soname; prctl is resolved from it.
 LIBC_SONAME = "libc.so.6"
 WEB_PORTS = ("80", "443")
@@ -156,6 +172,52 @@ def verify_deployment_identity():
         raise RuntimeError(f"Workspace could not install no-new-privileges: errno {get_errno()}")
 
 
+def key_file_position(arguments):
+    """Return the position of the one key file option's value."""
+    if arguments.count(KEY_FILE_OPTION) != 1 or arguments.index(KEY_FILE_OPTION) + 1 >= len(arguments):
+        raise RuntimeError(f"sandbox server requires exactly one {KEY_FILE_OPTION} value")
+    position = arguments.index(KEY_FILE_OPTION) + 1
+    return position
+
+
+def pass_key_descriptor(arguments):
+    """Open the key file while still root and hand the server only that open descriptor across the privilege drop.
+
+    The mounted file is behind the root-only secret directory, or a bootstrap file is unlinked before service exec.
+    The server reads the descriptor once and closes it.
+    """
+    position = key_file_position(arguments)
+    descriptor = os_open(arguments[position], O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+    os_set_inheritable(descriptor, True)
+    result = [*arguments[: position - 1], KEY_DESCRIPTOR_OPTION, str(descriptor), *arguments[position + 1 :]]
+    return result
+
+
+def protect_key_directory(arguments) -> None:
+    """Keep the mounted key unreachable by tool processes even when file sharing maps its owner to the sandbox UID."""
+    position = key_file_position(arguments)
+    directory = Path(arguments[position]).parent
+    if directory != KEY_MOUNT_DIRECTORY or directory.resolve() != directory:
+        raise RuntimeError("mounted Workspace key must be inside the canonical service-secret directory")
+    if not directory.is_dir() or directory.stat().st_uid != 0:
+        raise RuntimeError("Workspace service-secret directory must be owned by root")
+    directory.chmod(0o700)
+
+
+def write_bootstrap_key(arguments):
+    """Move a deployment's bootstrap key out of the environment into this account's own owner-only key file."""
+    key = os_environ.pop(KEY_BOOTSTRAP_VARIABLE, "")
+    if not key:
+        raise RuntimeError("deployment-enforced Workspace requires its bootstrap key")
+    position = key_file_position(arguments)
+    path = Path(tempfile_mkdtemp(prefix="workspace-key-")) / "workspace.key"
+    descriptor = os_open(str(path), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+    with os_fdopen(descriptor, "w", encoding="utf-8") as stream:
+        stream.write(key + "\n")
+    result = [*arguments[:position], str(path), *arguments[position + 1 :]]
+    return result
+
+
 def main(argv=COMMAND_LINE_ARGUMENTS):
     selected_arguments = sys_argv[1:] if argv is COMMAND_LINE_ARGUMENTS else argv
     arguments = list(selected_arguments)
@@ -164,12 +226,19 @@ def main(argv=COMMAND_LINE_ARGUMENTS):
         if policy.egress_policy not in {"web", "deny"}:
             raise RuntimeError("deployment-enforced Workspace requires controlled egress")
         verify_deployment_identity()
+        arguments = write_bootstrap_key(arguments)
+        bootstrap_path = Path(arguments[key_file_position(arguments)])
+        arguments = pass_key_descriptor(arguments)
+        bootstrap_path.unlink()
+        bootstrap_path.parent.rmdir()
         os_execv(sys_executable, [sys_executable, str(SERVER), *arguments])
         return False
     if policy.egress_policy == "deny":
         enforce_egress_policy()
     elif policy.egress_policy == "web":
         enforce_egress_policy(allow_web=True)
+    protect_key_directory(arguments)
+    arguments = pass_key_descriptor(arguments)
     drop_privileges()
     os_execv(sys_executable, [sys_executable, str(SERVER), *arguments])
     return False

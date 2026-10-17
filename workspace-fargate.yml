@@ -191,6 +191,8 @@ Resources:
           PortMappings:
             - ContainerPort: 8080
               Protocol: tcp
+            - ContainerPort: 8081
+              Protocol: tcp
           LogConfiguration:
             LogDriver: awslogs
             Options:
