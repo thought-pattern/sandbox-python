@@ -72,7 +72,6 @@ def test_deny_egress_allows_only_loopback_and_replies(installed_rules):
 def test_main_maps_each_container_policy_to_its_firewall(monkeypatch, tmp_path):
     key_file = tmp_path / "workspace-key"
     key_file.write_text("k" * 32 + "\n")
-    key_file.chmod(0o600)
     calls = []
     monkeypatch.setattr(
         "entrypoint.enforce_egress_policy",

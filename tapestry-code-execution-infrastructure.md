@@ -37,7 +37,7 @@ storage dependency.
 
 1. The host publish address is `127.0.0.1` in local development.
 2. Every tool call carries the instance's one configured Workspace key, which the
-   server reads once from an owner-only file and never from its command line.
+   server reads once from a file and never from its command line.
 3. The HTTP server and tool subprocesses run as the `sandbox` user.
 4. Deployment owns the EC2/Fargate boundary; managed web and deny modes
    install guest output rules, while explicit direct startup adds no guest firewall.

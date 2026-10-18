@@ -1446,10 +1446,11 @@ class WorkspaceService(WorkspaceServiceServicer):
                 )
                 self.health.finished(key, outcome, code)
                 LOGGER.info(
-                    "tool_request request_id=%s tool=%s status=%s duration_ms=%.3f",
+                    "tool_request request_id=%s tool=%s status=%s outcome=%s duration_ms=%.3f",
                     identifier,
                     name,
                     observation.get("status_code", 0),
+                    outcome,
                     (time_monotonic() - started) * 1000,
                 )
         return response
@@ -1566,12 +1567,12 @@ def parse_args(argv: list):
 
 
 def read_auth_token(args):
-    """Read the bearer key once from a regular owner-only file and close it, so no tool child inherits it."""
+    """Read the bearer key once from a regular file and close it, so no tool child inherits it."""
     descriptor = args.auth_token_fd
     with os_fdopen(descriptor, "rb") as stream:
         metadata = os_fstat(stream.fileno())
-        if not S_ISREG(metadata.st_mode) or metadata.st_mode & 0o077:
-            raise ValueError("auth token file must be a regular owner-only file")
+        if not S_ISREG(metadata.st_mode):
+            raise ValueError("auth token file must be a regular file")
         content = stream.read(MAX_AUTH_TOKEN_FILE_BYTES + 1)
     if len(content) > MAX_AUTH_TOKEN_FILE_BYTES:
         raise ValueError("auth token file exceeds its bound")

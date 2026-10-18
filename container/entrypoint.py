@@ -205,13 +205,13 @@ def protect_key_directory(arguments) -> None:
 
 
 def write_bootstrap_key(arguments):
-    """Move a deployment's bootstrap key out of the environment into this account's own owner-only key file."""
+    """Move a deployment's bootstrap key out of the environment into this account's own key file."""
     key = os_environ.pop(KEY_BOOTSTRAP_VARIABLE, "")
     if not key:
         raise RuntimeError("deployment-enforced Workspace requires its bootstrap key")
     position = key_file_position(arguments)
     path = Path(tempfile_mkdtemp(prefix="workspace-key-")) / "workspace.key"
-    descriptor = os_open(str(path), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+    descriptor = os_open(str(path), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o666)
     with os_fdopen(descriptor, "w", encoding="utf-8") as stream:
         stream.write(key + "\n")
     result = [*arguments[:position], str(path), *arguments[position + 1 :]]

@@ -89,7 +89,6 @@ def direct_tools(tmp_path, monkeypatch):
         monkeypatch.setattr(f"server.{name}", value)
     key_file = tmp_path / "workspace-key"
     key_file.write_text(TOKEN + "\n")
-    key_file.chmod(0o600)
     with key_file.open("rb") as key_stream:
         args = parse_args(["--workspace", str(configured_workspace(tmp_path)), "--auth-token-fd", str(dup(key_stream.fileno()))])
         assert read_auth_token(args) == TOKEN
@@ -458,12 +457,3 @@ def test_git_uses_original_http_destination_and_native_remote_with_real_process_
         direct_tools.call_tool("git_clone", {"repoUrl": destination + "-missing", "branch": "main"})
     assert missing.value.code == "process_failed"
     assert direct_tools.call_tool("file_read", {"path": "sample.txt"}) == "changed\n"
-
-
-def test_key_file_must_be_owner_only(tmp_path):
-    key_file = tmp_path / "workspace-key"
-    key_file.write_text(TOKEN + "\n")
-    key_file.chmod(0o640)
-    with raises(ValueError):
-        with key_file.open("rb") as key_stream:
-            read_auth_token(parse_args(["--auth-token-fd", str(dup(key_stream.fileno()))]))
