@@ -188,6 +188,7 @@ Resources:
           Command: [--egress-enforcement, deployment]
           LinuxParameters:
             Capabilities: {Drop: [ALL]}
+            InitProcessEnabled: true
           PortMappings:
             - ContainerPort: 8080
               Protocol: tcp

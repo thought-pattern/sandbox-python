@@ -41,9 +41,12 @@ storage dependency.
 3. The HTTP server and tool subprocesses run as the `sandbox` user.
 4. Deployment owns the EC2/Fargate boundary; managed web and deny modes
    install guest output rules, while explicit direct startup adds no guest firewall.
-5. Request bytes, subprocess output, file reads, serialized responses,
-   concurrency, timeout, CPU, memory, and process count are bounded.
-6. Timeouts and output overruns terminate the complete process group.
+5. Concurrency, CPU, memory, and process count are bounded. Requests,
+   subprocess output, file reads and responses are bound only by protobuf's
+   largest message; subprocess output goes to anonymous files on disk.
+6. A watchdog ends a program once neither its CPU time nor its output has moved
+   for `process_watchdog_seconds` (default 120); a program that keeps working runs
+   to its end. The complete process group is ended once its leader exits or stalls.
 7. File writes and patches replace their target atomically.
 8. Cleanup failure is reported; it is not silently described as successful.
 9. A container receives no Tapestry credential environment variables.
@@ -82,8 +85,8 @@ state, and JSON types. External field names are
 camelCase; request arguments are translated to internal Python names.
 
 Every tool response carries a request ID. Server/API failures are structured.
-Process tools return `ok`, `stdout`, `stderr`, `exitCode`, `timedOut`,
-`outputLimited`, and `durationMs`. The normal Tapestry client raises on a failed
+Process tools return `ok`, `stdout`, `stderr`, `exitCode`, `stalled`, and
+`durationMs`. The normal Tapestry client raises on a failed
 process; execution verification explicitly consumes the nonzero result so it
 can distinguish refutation from infrastructure failure.
 

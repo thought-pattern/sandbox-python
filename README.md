@@ -17,8 +17,8 @@ image, tool server, lifecycle manager, and verification suite.
   names a fresh root for each run.
 - The entrypoint drops permanently to the non-root `sandbox` user before the
   gRPC server or any tool code starts.
-- CPU, memory, request size, result size, tool concurrency, wall time, process
-  trees, and process count are bounded. The container engine (`docker` or
+- CPU, memory, tool concurrency, process trees, and process count
+  are bounded, and a watchdog ends a tool process that stalls. The container engine (`docker` or
   `podman`, `sandbox.container_engine`) applies a capability drop and
   `no-new-privileges`.
 - Tapestry-managed sessions default to `web`; the root entrypoint installs
@@ -150,12 +150,14 @@ distinguish command failure from a transport or service failure.
 - Git: `git_init`, `git_clone`, `git_status`, `git_diff`, `git_commit`,
   `git_push`, `git_log`
 
-File reads and complete encoded RPC observations have independent configurable
-byte limits. Oversized files fail before their contents are allocated, and an
-oversized serialized result is replaced with a structured
-`response_too_large` error. Git commands disable interactive credential
+File reads, program output and RPC observations have no size limit of their
+own; each message is bound only by protobuf's largest message, 2 GB less one
+byte. A file that cannot fit in one answer fails with `file_too_large` before
+its contents are allocated, and a result that cannot be one message is replaced
+with a structured `response_too_large` error. Program output goes to anonymous
+files on disk while the program runs. Git commands disable interactive credential
 prompts so unavailable credentials fail within the normal tool contract rather
-than consuming the tool timeout.
+than waiting for the watchdog.
 
 Remote package installation, clone, and push fail under explicit `deny` mode.
 Under explicitly selected `direct` mode they use the actual index, repository URL or remote

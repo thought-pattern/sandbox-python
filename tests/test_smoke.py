@@ -18,9 +18,7 @@ from zipfile import ZipFile
 from pytest import fixture, raises
 from server import (
     EGRESS_POLICY,
-    MAX_FILE_BYTES,
-    MAX_OUTPUT_BYTES,
-    MAX_TOOL_TIMEOUT,
+    PROCESS_WATCHDOG_SECONDS,
     WORKSPACE,
     HealthHTTPServer,
     ToolError,
@@ -81,9 +79,7 @@ def direct_tools(tmp_path, monkeypatch):
     configured_defaults = {
         "WORKSPACE": WORKSPACE,
         "EGRESS_POLICY": EGRESS_POLICY,
-        "MAX_OUTPUT_BYTES": MAX_OUTPUT_BYTES,
-        "MAX_FILE_BYTES": MAX_FILE_BYTES,
-        "MAX_TOOL_TIMEOUT": MAX_TOOL_TIMEOUT,
+        "PROCESS_WATCHDOG_SECONDS": PROCESS_WATCHDOG_SECONDS,
     }
     for name, value in configured_defaults.items():
         monkeypatch.setattr(f"server.{name}", value)
@@ -143,7 +139,7 @@ def test_authenticated_direct_interface_runs_real_tools_and_preserves_failures(d
     assert (manifest.get("protocol", ""), manifest.get("incarnation", "")) == ("tapestry.workspace.grpc", incarnation)
     assert direct_tools.call_tool("file_write", {"path": "smoke.txt", "content": "hello"}).get("bytesWritten", 0) == 5
     assert direct_tools.call_tool("file_read", {"path": "smoke.txt"}) == "hello"
-    result = direct_tools.call_tool("run_python", {"script": "print(6 * 7)", "timeout": 2})
+    result = direct_tools.call_tool("run_python", {"script": "print(6 * 7)"})
     assert result.get("exitCode", -1) == 0 and result.get("stdout", "").strip() == "42"
     script = "#" + "x" * 300_000 + "\n"
     script += (
@@ -155,10 +151,10 @@ def test_authenticated_direct_interface_runs_real_tools_and_preserves_failures(d
         "assert sys.argv == ['-c']\n"
         "print('large source: π')\n"
     )
-    result = direct_tools.call_tool("run_python", {"script": script, "timeout": 2})
+    result = direct_tools.call_tool("run_python", {"script": script})
     assert result.get("ok", False) and result.get("stdout", "").strip() == "large source: π"
     with raises(WorkspaceToolError) as failed:
-        direct_tools.call_tool("run_python", {"script": "raise SystemExit(7)", "timeout": 2})
+        direct_tools.call_tool("run_python", {"script": "raise SystemExit(7)"})
     assert failed.value.result.get("exitCode", -1) == 7
 
     # One Workspace serves every root Task, each in its own folder; a child Task names its root and shares its folder.
@@ -187,7 +183,6 @@ def test_authenticated_direct_interface_runs_real_tools_and_preserves_failures(d
                 "run_python",
                 {
                     "script": "import pathlib, time\ntime.sleep(0.05)\nexec(pathlib.Path('solution.py').read_text())",
-                    "timeout": 2,
                 },
                 root_task_id=root,
             )
@@ -215,6 +210,20 @@ def test_authenticated_direct_interface_runs_real_tools_and_preserves_failures(d
         assert refused.value.code == code
 
 
+def test_the_watchdog_ends_only_a_process_that_stalls(direct_tools, monkeypatch):
+    monkeypatch.setattr("server.PROCESS_WATCHDOG_SECONDS", 2)
+    working = "import time\nfor step in range(6):\n    print(step, flush=True)\n    time.sleep(0.75)\n"
+    finished = direct_tools.call_tool("run_python", {"script": working})
+    assert (finished.get("exitCode", -1), finished.get("stalled", True)) == (0, False)
+    with raises(WorkspaceToolError) as ended:
+        direct_tools.call_tool("run_python", {"script": "import time\ntime.sleep(60)\n"})
+    assert (ended.value.code, ended.value.result.get("exitCode", 0), ended.value.result.get("stalled", False)) == (
+        "stalled",
+        -1,
+        True,
+    )
+
+
 def test_health_page_and_api_answer_without_the_key_and_count_tool_calls_without_content(direct_tools, monkeypatch):
     """The page and its API need no key, and the figures move with a real tool call but never hold its content."""
     # Readiness requires ripgrep, which this test does not exercise; the host running it may not have it installed.
@@ -239,7 +248,7 @@ def test_health_page_and_api_answer_without_the_key_and_count_tool_calls_without
         before = loads(fetch("/api/health")[2])
         direct_tools.call_tool("file_write", {"path": "secret.txt", "content": "private file text"})
         with raises(WorkspaceToolError):
-            direct_tools.call_tool("run_python", {"script": "raise SystemExit(3)", "timeout": 2})
+            direct_tools.call_tool("run_python", {"script": "raise SystemExit(3)"})
         status, _, raw = fetch("/api/health")
     finally:
         connection.close()
@@ -301,10 +310,9 @@ def test_scoped_read_returns_provenance_and_rejects_escapes(direct_tools, tmp_pa
         assert escaped.value.code == "path_escape"
 
 
-def test_scoped_read_enforces_byte_limit_encoding_and_regular_files(direct_tools, tmp_path):
+def test_scoped_read_returns_whole_files_and_enforces_encoding_and_regular_files(direct_tools, tmp_path):
     repository = task_folder(tmp_path, direct_tools) / "repository"
     (repository / "package").mkdir(parents=True)
-    (repository / "large.py").write_text("x" * 65, encoding="utf-8")
     acquired = "#" + "x" * 300_000 + "\n"
     (repository / "above_old_limit.py").write_text(acquired, encoding="utf-8")
     observed = direct_tools.call_tool("file_read_scoped", {"repository_root": "repository", "path": "above_old_limit.py"})
@@ -313,11 +321,12 @@ def test_scoped_read_enforces_byte_limit_encoding_and_regular_files(direct_tools
     (repository / "latin1.py").write_bytes(b"caf\xe9\n")
     mkfifo(repository / "pipe.py")
     for arguments, code, status in (
-        ({"path": "large.py", "max_bytes": 64}, "file_too_large", 413),
         ({"path": "latin1.py"}, "invalid_source_encoding", 422),
         ({"path": "package"}, "not_file", 400),
         ({"path": "pipe.py"}, "bad_arguments", 400),
         ({"path": "missing.py"}, "not_found", 404),
+        ({"path": "missing_folder/module.py"}, "not_found", 404),
+        ({"path": "latin1.py/module.py"}, "not_directory", 400),
     ):
         with raises(WorkspaceToolError) as rejected:
             direct_tools.call_tool("file_read_scoped", {"repository_root": "repository", **arguments})
@@ -335,7 +344,7 @@ def test_scoped_bytes_refuse_symlinks_swapped_in_after_resolution(tmp_path):
     (repository / "module.py").symlink_to(outside / "secret.py")
     for target in (repository / "package" / "secret.py", repository / "module.py"):
         with raises(ToolError) as refused:
-            scoped_repository_bytes(repository, target, 1024)
+            scoped_repository_bytes(repository, target)
         assert refused.value.code == "path_escape"
 
 

@@ -17,7 +17,6 @@ from logging import (
     basicConfig as logging_basicConfig,
     getLogger as logging_getLogger,
 )
-from math import isfinite
 from os import (
     O_CLOEXEC,
     O_DIRECTORY,
@@ -34,16 +33,12 @@ from os import (
     kill as os_kill,
     killpg as os_killpg,
     open as os_open,
-    read as os_read,
     scandir as os_scandir,
+    stat as os_stat,
     statvfs as os_statvfs,
 )
 from pathlib import Path
 from re import compile as re_compile, fullmatch as re_fullmatch, sub as re_sub
-from selectors import (
-    EVENT_READ as selectors_EVENT_READ,
-    DefaultSelector as selectors_DefaultSelector,
-)
 from shutil import (
     disk_usage as shutil_disk_usage,
     move as shutil_move,
@@ -57,9 +52,8 @@ from signal import (
     signal as signal_signal,
 )
 from socketserver import TCPServer
-from stat import S_ISREG
+from stat import S_ISLNK, S_ISREG
 from subprocess import (
-    PIPE as subprocess_PIPE,
     Popen as subprocess_Popen,
     TimeoutExpired as subprocess_TimeoutExpired,
 )
@@ -81,12 +75,7 @@ from grpc import StatusCode, server as grpc_server
 from health import PAGE_HEADERS, WorkspaceHealth, page_file
 
 from tapestry.interfaces.envelope import decode_envelope, encode_envelope
-from tapestry.interfaces.workspace.constants import (
-    CONTROL_WORKERS,
-    DEFAULT_MAX_REQUEST_BYTES,
-    DEFAULT_MAX_RESPONSE_BYTES,
-    ENVELOPE_FRAME_BYTES,
-)
+from tapestry.interfaces.workspace.constants import CONTROL_WORKERS, PAYLOAD_LIMIT_BYTES, PROTOBUF_MESSAGE_LIMIT_BYTES
 from tapestry.interfaces.workspace.workspace_pb2 import WorkspaceEnvelope
 from tapestry.interfaces.workspace.workspace_pb2_grpc import WorkspaceServiceServicer, add_WorkspaceServiceServicer_to_server
 
@@ -97,17 +86,15 @@ PROTOCOL_NAME = "tapestry.workspace.grpc"
 DEFAULT_WORKSPACE = Path("/workspace")
 DEFAULT_PORT = 8080
 DEFAULT_HEALTH_PORT = 8081
-DEFAULT_MAX_OUTPUT_BYTES = 1_048_576
-DEFAULT_MAX_FILE_BYTES = 10_485_760
 DEFAULT_MAX_CONCURRENT_REQUESTS = 4
-DEFAULT_MAX_TOOL_TIMEOUT = 300
+# The watchdog ends a tool process once neither its CPU time nor its output has moved for this many seconds.
+DEFAULT_PROCESS_WATCHDOG_SECONDS = 120
+# How often the watchdog reads a running tool process's CPU time and output size.
+WATCHDOG_POLL_SECONDS = 1.0
 DEFAULT_REQUEST_READ_TIMEOUT = 10.0
-DEFAULT_MAX_LIST_RESULTS = 5_000
-DEFAULT_MAX_LIST_ENTRIES = 10_000
 DEFAULT_LIST_TIMEOUT = 5.0
-DEFAULT_MAX_SEARCH_RESULTS = 1_000
-DEFAULT_MAX_GIT_LOG_RESULTS = 100
-MIN_MAX_RESPONSE_BYTES = 512
+# The depth a listing has when its caller names none: the whole tree.
+WHOLE_TREE_DEPTH = -1
 # The bearer key file holds one line of at least this many characters, within this byte bound.
 MIN_AUTH_TOKEN_LENGTH = 32
 MAX_AUTH_TOKEN_FILE_BYTES = 4096
@@ -121,9 +108,7 @@ EGRESS_ENFORCEMENT = "container"
 IMAGE = ""
 # Routes answered without the Workspace key: the health page, its assets and the health API.
 PUBLIC_PATHS = {"/", "/health.js", "/health-common.js", "/health.css", "/api/health", "/health/live", "/health/ready"}
-MAX_OUTPUT_BYTES = DEFAULT_MAX_OUTPUT_BYTES
-MAX_FILE_BYTES = DEFAULT_MAX_FILE_BYTES
-MAX_TOOL_TIMEOUT = DEFAULT_MAX_TOOL_TIMEOUT
+PROCESS_WATCHDOG_SECONDS = DEFAULT_PROCESS_WATCHDOG_SECONDS
 GIT_ENV = {
     **os_environ,
     "GIT_CONFIG_NOSYSTEM": "1",
@@ -233,22 +218,6 @@ def atomic_write_text(target, content):
     return False
 
 
-def bounded_timeout(timeout):
-    """Admit a finite native positive tool timeout before acquiring a process."""
-    if type(timeout) not in (int, float):
-        raise ToolError("timeout must be a native number", code="invalid_timeout", status=400)
-    try:
-        value = float(timeout)
-    except OverflowError as err:
-        raise ToolError("timeout must be finite", code="invalid_timeout", status=400) from err
-    if not isfinite(value):
-        raise ToolError("timeout must be finite", code="invalid_timeout", status=400)
-    if value <= 0:
-        raise ToolError("timeout must be greater than zero", code="invalid_timeout", status=400)
-    computed_return_value = min(value, float(MAX_TOOL_TIMEOUT))
-    return computed_return_value
-
-
 def invocation_process_ids(root_pid, marker):
     """Collect a tool invocation's live processes by parent links and its inherited marker.
 
@@ -333,123 +302,107 @@ def terminate_process_group(process, marker):
     return False
 
 
+def invocation_activity(process, marker, outputs: tuple) -> tuple:
+    """Read how far a running tool invocation has got: its processes' CPU ticks and its output sizes.
+
+    The ticks are each live invocation process's own and its reaped children's user and system time. Without /proc only
+    the output sizes are read. Any change between two readings is activity.
+    """
+    ticks = 0
+    proc = Path("/proc")
+    if proc.is_dir():
+        for pid in invocation_process_ids(process.pid, marker):
+            try:
+                stat = (proc / str(pid) / "stat").read_text(encoding="utf-8", errors="replace")
+                ticks += sum(int(value) for value in stat[stat.rindex(")") + 2 :].split()[11:15])
+            except (OSError, ValueError, IndexError):
+                continue
+    activity = (ticks, *(os_fstat(output.fileno()).st_size for output in outputs))
+    return activity
+
+
 def internal_run_process(
     command,
     *,
     shell=False,
-    timeout: float = 60.0,
     cwd="",
     environment=DEFAULT_ARGUMENT_DICT,
     inherited_descriptors: tuple = (),
 ):
-    """Run a bounded process and return a structured camelCase result."""
+    """Run one process until it ends or stalls and return a structured camelCase result with its whole output.
+
+    The output goes to anonymous files on disk while the process runs, so a large output costs disk space, not memory.
+    A watchdog ends a process that has stopped making progress: once neither the invocation's CPU time nor its output
+    has moved for PROCESS_WATCHDOG_SECONDS, the invocation is ended and the result is `stalled`. A process that keeps
+    working runs to its end. When the direct child exits, its process group is ended: a background descendant still
+    holding the output open cannot keep a finished tool running.
+    """
     if environment is DEFAULT_ARGUMENT_DICT:
         environment = DEFAULT_ARGUMENT_DICT.copy()
-    timeout = bounded_timeout(timeout)
     started = time_monotonic()
     marker = uuid4().hex
     process_environment = {
         **(environment or os_environ),
         INVOCATION_MARKER_VARIABLE: marker,
     }
-    process = subprocess_Popen(
-        command,
-        shell=shell,
-        cwd=cwd or current_workspace(),
-        env=process_environment,
-        stdout=subprocess_PIPE,
-        stderr=subprocess_PIPE,
-        start_new_session=True,
-        pass_fds=inherited_descriptors,
-    )
-    stdout_stream = process.stdout
-    stderr_stream = process.stderr
-    if stdout_stream is None or stderr_stream is None:
-        terminate_process_group(process, marker)
-        raise ToolError(
-            "tool process did not expose bounded output streams",
-            code="process_stream_unavailable",
-            status=500,
+    with tempfile_TemporaryFile() as stdout_file, tempfile_TemporaryFile() as stderr_file:
+        process = subprocess_Popen(
+            command,
+            shell=shell,
+            cwd=cwd or current_workspace(),
+            env=process_environment,
+            stdout=stdout_file,
+            stderr=stderr_file,
+            start_new_session=True,
+            pass_fds=inherited_descriptors,
         )
-    selector = selectors_DefaultSelector()
-    selector.register(stdout_stream, selectors_EVENT_READ, "stdout")
-    selector.register(stderr_stream, selectors_EVENT_READ, "stderr")
-    buffers = {"stdout": bytearray(), "stderr": bytearray()}
-    captured = 0
-    timed_out = False
-    output_limited = False
-    deadline = started + timeout
-
-    try:
-        while selector.get_map():
-            remaining_time = deadline - time_monotonic()
-            if remaining_time <= 0:
-                timed_out = True
-                terminate_process_group(process, marker)
-                break
-            leader_exited = process.poll() is not None
-            # After the direct child exits, drain what is already buffered and stop: a background
-            # descendant holding the pipe open must not turn a finished tool into a timeout.
-            events = selector.select(timeout=0 if leader_exited else min(0.1, remaining_time))
-            if leader_exited and not events:
-                break
-            for key, _ in events:
-                file_descriptor = key.fileobj
-                if not isinstance(file_descriptor, int):
-                    file_descriptor = file_descriptor.fileno()
-                chunk = os_read(file_descriptor, 65_536)
-                if not chunk:
-                    selector.unregister(key.fileobj)
-                    continue
-                available = max(0, MAX_OUTPUT_BYTES - captured)
-                channel = str(key.data)
-                buffer = buffers.get(channel, bytearray())
-                buffer.extend(chunk[:available])
-                captured += min(len(chunk), available)
-                if len(chunk) > available:
-                    output_limited = True
-                    terminate_process_group(process, marker)
-                    break
-            if output_limited:
-                break
-    finally:
-        selector.close()
-
-    terminate_process_group(process, marker)
-    return_code = process.wait()
-    if timed_out:
-        return_code = -1
-    elif output_limited:
-        return_code = -2
-
-    computed_return_value = {
-        "ok": return_code == 0,
-        "stdout": buffers.get("stdout", b"").decode("utf-8", errors="replace"),
-        "stderr": buffers.get("stderr", b"").decode("utf-8", errors="replace"),
-        "exitCode": return_code,
-        "timedOut": timed_out,
-        "outputLimited": output_limited,
-        "durationMs": round((time_monotonic() - started) * 1000, 3),
-    }
+        outputs = (stdout_file, stderr_file)
+        activity = invocation_activity(process, marker, outputs)
+        active_at = time_monotonic()
+        stalled = False
+        while not stalled and process.poll() is None:
+            try:
+                process.wait(timeout=WATCHDOG_POLL_SECONDS)
+            except subprocess_TimeoutExpired:
+                observed = invocation_activity(process, marker, outputs)
+                now = time_monotonic()
+                if observed != activity:
+                    activity, active_at = observed, now
+                stalled = now - active_at >= PROCESS_WATCHDOG_SECONDS
+        if stalled:
+            LOGGER.warning(
+                "tool invocation %s ended by the watchdog: no CPU time or output for %s s",
+                process.pid,
+                PROCESS_WATCHDOG_SECONDS,
+            )
+        terminate_process_group(process, marker)
+        return_code = process.wait()
+        if stalled:
+            return_code = -1
+        stdout_file.seek(0)
+        stderr_file.seek(0)
+        computed_return_value = {
+            "ok": return_code == 0,
+            "stdout": stdout_file.read().decode("utf-8", errors="replace"),
+            "stderr": stderr_file.read().decode("utf-8", errors="replace"),
+            "exitCode": return_code,
+            "stalled": stalled,
+            "durationMs": round((time_monotonic() - started) * 1000, 3),
+        }
     return computed_return_value
 
 
-def run_git(arguments, timeout: float = 30.0):
+def run_git(arguments):
     """Run Git without allowing an interactive credential prompt."""
     command = ["git", *arguments]
-    result = internal_run_process(command, timeout=timeout, environment=GIT_ENV)
+    result = internal_run_process(command, environment=GIT_ENV)
     return result
 
 
 def require_process_success(result, operation):
     if result.get("ok", False):
         return result
-    if result.get("timedOut", False):
-        code = "timeout"
-    elif result.get("outputLimited", False):
-        code = "output_limit"
-    else:
-        code = "process_failed"
+    code = "stalled" if result.get("stalled", False) else "process_failed"
     detail = (result.get("stderr", "") or result.get("stdout", "")).strip()
     raise ToolError(
         f"{operation} failed with exit code {result.get('exitCode', -1)}" + (f": {detail}" if detail else ""),
@@ -469,7 +422,7 @@ def require_network(operation):
 
 @tool
 def file_read(path: str):
-    """Read bounded UTF-8 contents of a file."""
+    """Read the whole UTF-8 contents of a file."""
     target = resolve_path(path)
     with FILE_LOCK:
         content = workspace_file_text(target)
@@ -477,15 +430,13 @@ def file_read(path: str):
 
 
 def workspace_file_text(target) -> str:
-    """Read bounded regular-file bytes through the canonical descriptor owner."""
+    """Read whole regular-file bytes through the canonical descriptor owner."""
     try:
-        source = scoped_repository_bytes(current_workspace(), target, MAX_FILE_BYTES)
+        source = scoped_repository_bytes(current_workspace(), target)
     except ToolError as err:
         if err.code == "bad_arguments":
             raise ToolError("Expected a regular file", code="not_file", status=400) from err
         raise
-    if len(source) > MAX_FILE_BYTES:
-        raise ToolError("File exceeds its byte allowance", code="file_too_large", status=413)
     try:
         text = source.decode("utf-8")
     except UnicodeDecodeError as err:
@@ -494,7 +445,7 @@ def workspace_file_text(target) -> str:
 
 
 @tool
-def file_read_scoped(repository_root: str, path: str, max_bytes: int = 0):
+def file_read_scoped(repository_root: str, path: str):
     """Read exact UTF-8 bytes beneath one resolved repository root with provenance."""
     if type(repository_root) is not str or not repository_root or type(path) is not str or not path:
         raise ToolError(
@@ -502,9 +453,6 @@ def file_read_scoped(repository_root: str, path: str, max_bytes: int = 0):
             code="bad_arguments",
             status=400,
         )
-    if type(max_bytes) is not int or max_bytes < 0:
-        raise ToolError("Scoped read byte limit is invalid", code="bad_arguments", status=400)
-    byte_budget = min(max_bytes, MAX_FILE_BYTES) if max_bytes else MAX_FILE_BYTES
     parts = path.split("/")
     if Path(path).is_absolute() or any(part in {"", ".", ".."} for part in parts):
         raise ToolError(
@@ -517,13 +465,7 @@ def file_read_scoped(repository_root: str, path: str, max_bytes: int = 0):
     if not root.is_dir() or not target.is_relative_to(root):
         raise ToolError("Scoped read escaped its repository root", code="path_escape", status=400)
     with FILE_LOCK:
-        source = scoped_repository_bytes(root, target, byte_budget)
-    if len(source) > byte_budget:
-        raise ToolError(
-            "Scoped source changed beyond its byte allowance",
-            code="file_too_large",
-            status=413,
-        )
+        source = scoped_repository_bytes(root, target)
     try:
         content = source.decode("utf-8")
     except UnicodeDecodeError as err:
@@ -539,8 +481,11 @@ def file_read_scoped(repository_root: str, path: str, max_bytes: int = 0):
     return scoped_read
 
 
-def scoped_repository_bytes(root: Path, target: Path, byte_limit: int) -> bytes:
-    """Open canonical path components by descriptor so later symlink swaps cannot escape."""
+def scoped_repository_bytes(root: Path, target: Path) -> bytes:
+    """Open canonical path components by descriptor so later symlink swaps cannot escape, and read the whole file.
+
+    The one refusal for size is a file that cannot be one Workspace answer, protobuf's largest message.
+    """
     directory = os_open("/", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
     try:
         relative = target.relative_to(root)
@@ -553,8 +498,19 @@ def scoped_repository_bytes(root: Path, target: Path, byte_limit: int) -> bytes:
                     O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC,
                     dir_fd=directory,
                 )
-            except PermissionError:
+            # A missing folder is not_found and a file where a folder belongs is not_directory, as for any path; only a
+            # component that became a symlink, an escape, is path_escape (D-096).
+            except (FileNotFoundError, PermissionError):
                 raise
+            except NotADirectoryError as err:
+                # O_NOFOLLOW with O_DIRECTORY reports a symlink as not a directory too, so its own type decides.
+                if not S_ISLNK(os_stat(component, dir_fd=directory, follow_symlinks=False).st_mode):
+                    raise
+                raise ToolError(
+                    "Scoped repository directory changed or is unavailable",
+                    code="path_escape",
+                    status=400,
+                ) from err
             except OSError as err:
                 raise ToolError(
                     "Scoped repository directory changed or is unavailable",
@@ -585,13 +541,11 @@ def scoped_repository_bytes(root: Path, target: Path, byte_limit: int) -> bytes:
                     code="bad_arguments",
                     status=400,
                 )
-            if state.st_size > byte_limit:
-                raise ToolError(
-                    "Scoped source exceeds its byte allowance",
-                    code="file_too_large",
-                    status=413,
-                )
-            source = opened.read(byte_limit + 1)
+            if state.st_size > PAYLOAD_LIMIT_BYTES:
+                raise ToolError("File cannot be one Workspace answer", code="file_too_large", status=413)
+            source = opened.read(PAYLOAD_LIMIT_BYTES + 1)
+            if len(source) > PAYLOAD_LIMIT_BYTES:
+                raise ToolError("File grew beyond one Workspace answer while it was read", code="file_too_large", status=413)
             return source
     finally:
         os_close(directory)
@@ -660,8 +614,13 @@ def file_delete(path: str):
 
 
 @tool
-def file_list(path: str = ".", depth: int = 2, max_results: int = DEFAULT_MAX_LIST_RESULTS):
-    """List the inspected root, files and directories with explicit recursive coverage."""
+def file_list(path: str = ".", depth: int = WHOLE_TREE_DEPTH, max_results: int = 0):
+    """List the inspected root, files and directories with explicit recursive coverage.
+
+    The listing has no entry or depth limit of its own. An omitted depth lists the whole tree, and its scan reports the
+    levels it descended; a given depth stops there, and depth 0 lists nothing. It stops early only at the caller's
+    positive `max_results` or the listing deadline. Zero `max_results` returns every entry.
+    """
     target = resolve_path(path)
     workspace = current_workspace()
     if not target.exists():
@@ -673,16 +632,18 @@ def file_list(path: str = ".", depth: int = 2, max_results: int = DEFAULT_MAX_LI
         )
     if not target.is_dir():
         raise ToolError("Path is not a directory", code="not_directory", status=400)
-    depth = max(0, min(int(depth), 64))
-    max_results = max(1, min(int(max_results), DEFAULT_MAX_LIST_RESULTS))
+    whole_tree = int(depth) < 0
+    depth = max(0, int(depth))
+    max_results = max(0, int(max_results))
     started = time_monotonic()
-    deadline = started + min(DEFAULT_LIST_TIMEOUT, MAX_TOOL_TIMEOUT)
+    deadline = started + DEFAULT_LIST_TIMEOUT
     files = []
     directories = []
     links = []
     other = []
-    depth_limited = depth == 0
-    pending = [(target, 0)] if depth else []
+    depth_limited = not whole_tree and depth == 0
+    pending = [(target, 0)] if whole_tree or depth else []
+    deepest = 0
     visited_entries = 0
     visited_directories = 0
     stop_reason = "complete"
@@ -693,9 +654,6 @@ def file_list(path: str = ".", depth: int = 2, max_results: int = DEFAULT_MAX_LI
     }
     tree_nodes = {root.get("path", ""): root}
     while pending:
-        if visited_entries >= DEFAULT_MAX_LIST_ENTRIES:
-            stop_reason = "entry_limit"
-            break
         if time_monotonic() >= deadline:
             stop_reason = "time_limit"
             break
@@ -704,9 +662,6 @@ def file_list(path: str = ".", depth: int = 2, max_results: int = DEFAULT_MAX_LI
         with os_scandir(directory) as iterator:
             visited_directories += 1
             while True:
-                if visited_entries >= DEFAULT_MAX_LIST_ENTRIES:
-                    stop_reason = "entry_limit"
-                    break
                 if time_monotonic() >= deadline:
                     stop_reason = "time_limit"
                     break
@@ -719,6 +674,7 @@ def file_list(path: str = ".", depth: int = 2, max_results: int = DEFAULT_MAX_LI
         # A partial directory cannot supply deterministic selection from its raw filesystem order.
         if stop_reason != "complete":
             break
+        deepest = max(deepest, directory_depth + 1)
         children = []
         parent_node = tree_nodes.get(str(directory.relative_to(workspace)), {})
         # A directory is queued only after its own node is recorded, so a missing parent is a broken listing.
@@ -739,7 +695,7 @@ def file_list(path: str = ".", depth: int = 2, max_results: int = DEFAULT_MAX_LI
             elif entry.is_dir(follow_symlinks=False):
                 directories.append(relative_path)
                 kind = "directory"
-                if directory_depth + 1 < depth:
+                if whole_tree or directory_depth + 1 < depth:
                     children.append((candidate, directory_depth + 1))
                 else:
                     depth_limited = True
@@ -751,7 +707,7 @@ def file_list(path: str = ".", depth: int = 2, max_results: int = DEFAULT_MAX_LI
                 node["children"] = []
                 tree_nodes[relative_path] = node
             parent_node.get("children", []).append(node)
-            if len(files) + len(directories) + len(links) + len(other) >= max_results:
+            if max_results and len(files) + len(directories) + len(links) + len(other) >= max_results:
                 stop_reason = "result_limit"
                 break
         if stop_reason != "complete":
@@ -765,7 +721,7 @@ def file_list(path: str = ".", depth: int = 2, max_results: int = DEFAULT_MAX_LI
         "links": sorted(links),
         "other": sorted(other),
         "scan": {
-            "depth": depth,
+            "depth": deepest if whole_tree else depth,
             "depthLimited": depth_limited,
             "complete": stop_reason == "complete" and not depth_limited,
         },
@@ -779,23 +735,18 @@ def file_list(path: str = ".", depth: int = 2, max_results: int = DEFAULT_MAX_LI
 
 
 @tool
-def file_search(pattern: str, path: str = ".", max_results: int = DEFAULT_MAX_SEARCH_RESULTS):
-    """Search files with ripgrep and return bounded structured matches."""
+def file_search(pattern: str, path: str = ".", max_results: int = 0):
+    """Search files with ripgrep and return structured matches: every match, or the caller's positive `max_results`."""
     target = resolve_path(path)
-    max_results = max(1, min(int(max_results), DEFAULT_MAX_SEARCH_RESULTS))
-    result = internal_run_process(["rg", "--json", "-e", pattern, "--", str(target)], timeout=30)
-    if result.get("exitCode", ()) not in (0, 1, -2):
+    max_results = max(0, int(max_results))
+    result = internal_run_process(["rg", "--json", "-e", pattern, "--", str(target)])
+    if result.get("exitCode", ()) not in (0, 1):
         require_process_success(result, "file search")
     matches = []
     for line in result.get("stdout", "").splitlines():
         if not line:
             continue
-        try:
-            data = json_loads(line)
-        except ValueError:
-            if result.get("outputLimited", False):
-                break
-            raise
+        data = json_loads(line)
         if data.get("type", "") != "match":
             continue
         match = data.get("data", {})
@@ -806,18 +757,18 @@ def file_search(pattern: str, path: str = ".", max_results: int = DEFAULT_MAX_SE
                 "content": match.get("lines", {}).get("text", "").strip(),
             }
         )
-        if len(matches) >= max_results:
+        if max_results and len(matches) >= max_results:
             break
     computed_return_value = {
         "matches": matches,
-        "truncated": len(matches) >= max_results or result.get("outputLimited", False),
+        "truncated": bool(max_results) and len(matches) >= max_results,
     }
     return computed_return_value
 
 
 @tool
 def file_search_scoped(repository_root: str, symbol: str, max_results: int = 0):
-    """Return distinct Python-source paths within configured retrieval and optional caller budgets."""
+    """Return every distinct Python-source path that names the symbol, or the caller's positive `max_results` of them."""
     if type(repository_root) is not str or not repository_root or type(symbol) is not str:
         raise ToolError(
             "Scoped Python search requires repository root and symbol",
@@ -843,20 +794,14 @@ def file_search_scoped(repository_root: str, symbol: str, max_results: int = 0):
             "--",
             str(root),
         ],
-        timeout=MAX_TOOL_TIMEOUT,
     )
-    if result.get("exitCode", -1) not in (0, 1, -2):
+    if result.get("exitCode", -1) not in (0, 1):
         require_process_success(result, "scoped Python search")
     matches_by_path = {}
     for line in result.get("stdout", "").splitlines():
         if not line:
             continue
-        try:
-            data = json_loads(line)
-        except ValueError:
-            if result.get("outputLimited", False):
-                break
-            raise
+        data = json_loads(line)
         if data.get("type", "") != "match":
             continue
         selected = Path(data.get("data", {}).get("path", {}).get("text", "")).resolve()
@@ -873,7 +818,7 @@ def file_search_scoped(repository_root: str, symbol: str, max_results: int = 0):
                 "line": data.get("data", {}).get("line_number", 0),
             }
     matches = [matches_by_path.get(path, {}) for path in sorted(matches_by_path)]
-    truncated = bool(result.get("outputLimited", False) or result.get("timedOut", False) or result.get("exitCode", 0) == -2)
+    truncated = False
     if max_results and len(matches) > max_results:
         matches = matches[:max_results]
         truncated = True
@@ -899,7 +844,7 @@ def pip_install(packages: list):
         if not isinstance(package, str) or not PACKAGE_PATTERN.fullmatch(package):
             raise ToolError(f"Invalid package: {package}", code="bad_arguments", status=400)
     command = ["pip", "install", "--no-cache-dir"]
-    result = internal_run_process([*command, *packages], timeout=MAX_TOOL_TIMEOUT)
+    result = internal_run_process([*command, *packages])
     computed_return_value = require_process_success(
         result,
         "pip install",
@@ -915,7 +860,7 @@ def pip_uninstall(packages: list):
     if any(not isinstance(package, str) or not re_fullmatch(r"[a-zA-Z0-9_.-]+", package) for package in packages):
         raise ToolError("Invalid package name", code="bad_arguments", status=400)
     computed_return_value = require_process_success(
-        internal_run_process(["pip", "uninstall", "-y", *packages], timeout=60),
+        internal_run_process(["pip", "uninstall", "-y", *packages]),
         "pip uninstall",
     )
     return computed_return_value
@@ -925,7 +870,7 @@ def pip_uninstall(packages: list):
 def pip_list():
     """List installed packages."""
     result = require_process_success(
-        internal_run_process(["pip", "list", "--format=json"], timeout=30),
+        internal_run_process(["pip", "list", "--format=json"]),
         "pip list",
     )
     computed_return_value = json_loads(result.get("stdout", ""))
@@ -935,23 +880,23 @@ def pip_list():
 @tool
 def pip_freeze():
     """Return installed packages in requirements-file form."""
-    result = require_process_success(internal_run_process(["pip", "freeze"], timeout=30), "pip freeze")
+    result = require_process_success(internal_run_process(["pip", "freeze"]), "pip freeze")
     computed_return_value = result.get("stdout", "")
     return computed_return_value
 
 
 @tool
-def run_command(command: str, timeout: float = 60.0):
-    """Execute a bounded shell command in the workspace."""
+def run_command(command: str):
+    """Execute a shell command in the workspace; the watchdog ends it only when it stalls."""
     if not isinstance(command, str) or not command.strip():
         raise ToolError("command must be a non-empty string", code="bad_arguments", status=400)
-    computed_return_value = internal_run_process(command, shell=True, timeout=timeout)
+    computed_return_value = internal_run_process(command, shell=True)
     return computed_return_value
 
 
 @tool
-def run_python(script: str, timeout: float = 60.0):
-    """Execute bounded Python code in the workspace."""
+def run_python(script: str):
+    """Execute Python code in the workspace; the watchdog ends it only when it stalls."""
     if not isinstance(script, str) or not script.strip():
         raise ToolError("script must be a non-empty string", code="bad_arguments", status=400)
     with tempfile_TemporaryFile(mode="w+b") as source:
@@ -964,7 +909,7 @@ def run_python(script: str, timeout: float = 60.0):
             "del source\n"
             "exec(globals().pop('source_code'))"
         )
-        result = internal_run_process([sys_executable, "-c", bootstrap], timeout=timeout, inherited_descriptors=(descriptor,))
+        result = internal_run_process([sys_executable, "-c", bootstrap], inherited_descriptors=(descriptor,))
     return result
 
 
@@ -1000,10 +945,7 @@ def git_clone(repo_url: str, branch: str = "main"):
     staging = workspace / f".tapestry-clone-{uuid4().hex}"
     with FILE_LOCK:
         try:
-            result = run_git(
-                ["clone", "--branch", branch, "--", repo_url, str(staging)],
-                timeout=MAX_TOOL_TIMEOUT,
-            )
+            result = run_git(["clone", "--branch", branch, "--", repo_url, str(staging)])
             require_process_success(result, "git clone")
             for item in list(workspace.iterdir()):
                 if item == staging:
@@ -1022,11 +964,11 @@ def git_clone(repo_url: str, branch: str = "main"):
 def git_status():
     """Return the current repository branch and changes."""
     branch = require_process_success(
-        run_git(["branch", "--show-current"], timeout=30),
+        run_git(["branch", "--show-current"]),
         "git branch",
     )
     status = require_process_success(
-        run_git(["status", "--porcelain"], timeout=30),
+        run_git(["status", "--porcelain"]),
         "git status",
     )
     computed_return_value = {
@@ -1038,15 +980,10 @@ def git_status():
 
 @tool
 def git_diff(staged: bool = False):
-    """Return a bounded repository diff."""
+    """Return the whole repository diff."""
     command = ["git", "diff", "--staged"] if staged else ["git", "diff"]
-    result = run_git(command[1:], timeout=30)
-    if not result.get("ok", False) and not result.get("outputLimited", False):
-        require_process_success(result, "git diff")
-    computed_return_value = {
-        "diff": result.get("stdout", ""),
-        "truncated": result.get("outputLimited", False),
-    }
+    result = require_process_success(run_git(command[1:]), "git diff")
+    computed_return_value = {"diff": result.get("stdout", "")}
     return computed_return_value
 
 
@@ -1055,9 +992,9 @@ def git_commit(message: str):
     """Stage all workspace changes and commit them locally."""
     if not isinstance(message, str) or not message.strip():
         raise ToolError("message must be a non-empty string", code="bad_arguments", status=400)
-    require_process_success(run_git(["add", "-A"], timeout=30), "git add")
+    require_process_success(run_git(["add", "-A"]), "git add")
     result = require_process_success(
-        run_git(["commit", "-m", message], timeout=60),
+        run_git(["commit", "-m", message]),
         "git commit",
     )
     computed_return_value = result.get("stdout", "")
@@ -1071,39 +1008,37 @@ def git_push(remote: str = "origin", branch: str = ""):
     validate_git_atom(remote, "remote")
     if not branch:
         current = require_process_success(
-            run_git(["branch", "--show-current"], timeout=30),
+            run_git(["branch", "--show-current"]),
             "git branch",
         )
         branch = current.get("stdout", "").strip()
     validate_git_atom(branch, "branch")
-    result = run_git(["push", "--", remote, branch], timeout=MAX_TOOL_TIMEOUT)
+    result = run_git(["push", "--", remote, branch])
     require_process_success(result, "git push")
     return {"remote": remote, "branch": branch, "pushed": True}
 
 
 @tool
 def git_log(limit: int = 20):
-    """Return bounded recent Git history as structured commit records."""
+    """Return the requested number of recent Git commits as structured commit records."""
     try:
         requested_limit = int(limit)
     except (TypeError, ValueError) as err:
         raise ToolError("limit must be an integer", code="bad_arguments", status=400) from err
     if requested_limit < 1:
         raise ToolError("limit must be positive", code="bad_arguments", status=400)
-    bounded_limit = min(requested_limit, DEFAULT_MAX_GIT_LOG_RESULTS)
     result = run_git(
         [
             "log",
-            f"--max-count={bounded_limit + 1}",
+            f"--max-count={requested_limit + 1}",
             "--format=%H%x00%h%x00%aI%x00%s",
         ],
-        timeout=30,
     )
     require_process_success(result, "git log")
     lines = result.get("stdout", "").splitlines()
-    truncated = len(lines) > bounded_limit
+    truncated = len(lines) > requested_limit
     commits = []
-    for line in lines[:bounded_limit]:
+    for line in lines[:requested_limit]:
         commit_hash, short_hash, authored_at, subject = line.split("\x00", 3)
         commits.append(
             {
@@ -1118,8 +1053,8 @@ def git_log(limit: int = 20):
 
 
 @tool
-def workspace_tree(depth: int = 3, max_results: int = 100):
-    """Return a bounded workspace file tree for initial task context."""
+def workspace_tree(depth: int = WHOLE_TREE_DEPTH, max_results: int = 0):
+    """Return the workspace file tree for initial task context: the whole tree, or the caller's depth."""
     result = file_list(".", depth=depth, max_results=max_results)
     return result
 
@@ -1278,8 +1213,6 @@ class WorkspaceService(WorkspaceServiceServicer):
     def __init__(self, auth_token: str, args):
         self.auth_token = auth_token
         self.incarnation = str(uuid4())
-        self.max_request_bytes = args.max_request_bytes
-        self.max_response_bytes = args.max_response_bytes
         self.max_concurrent_requests = args.max_concurrent_requests
         self.request_slots = threading_BoundedSemaphore(self.max_concurrent_requests)
         self.health = WorkspaceHealth(self.incarnation)
@@ -1287,8 +1220,8 @@ class WorkspaceService(WorkspaceServiceServicer):
         self.rpc = grpc_server(
             self.workers,
             options=(
-                ("grpc.max_receive_message_length", self.max_request_bytes + ENVELOPE_FRAME_BYTES),
-                ("grpc.max_send_message_length", self.max_response_bytes + ENVELOPE_FRAME_BYTES),
+                ("grpc.max_receive_message_length", PROTOBUF_MESSAGE_LIMIT_BYTES),
+                ("grpc.max_send_message_length", PROTOBUF_MESSAGE_LIMIT_BYTES),
             ),
             maximum_concurrent_rpcs=self.max_concurrent_requests + CONTROL_WORKERS,
         )
@@ -1320,7 +1253,7 @@ class WorkspaceService(WorkspaceServiceServicer):
 
     def decode(self, request, context, fields: set) -> dict:
         try:
-            payload = decode_envelope(request.payload, self.max_request_bytes, "Workspace")
+            payload = decode_envelope(request.payload, PAYLOAD_LIMIT_BYTES, "Workspace")
             if set(payload) != fields:
                 raise ValueError("Workspace RPC fields differ from its operation contract")
             if "request_id" in fields:
@@ -1334,7 +1267,7 @@ class WorkspaceService(WorkspaceServiceServicer):
         return payload
 
     def encode(self, payload: dict):
-        encoded = encode_envelope(payload, self.max_response_bytes, "Workspace")
+        encoded = encode_envelope(payload, PAYLOAD_LIMIT_BYTES, "Workspace")
         response = WorkspaceEnvelope(payload=encoded)
         return response
 
@@ -1367,7 +1300,9 @@ class WorkspaceService(WorkspaceServiceServicer):
         key = self.health.received("manifest", {"request_id": identifier})
         try:
             manifest = build_manifest()
-            manifest.update({"incarnation": self.incarnation, "request_id": identifier})
+            manifest.update(
+                {"incarnation": self.incarnation, "request_id": identifier, "runningRequests": self.health.running_requests()}
+            )
             response = self.encode(manifest)
         except (TypeError, ValueError, OSError):
             self.health.finished(key, "MANIFEST_FAILED", "manifest_failed")
@@ -1435,7 +1370,10 @@ class WorkspaceService(WorkspaceServiceServicer):
             except (TypeError, ValueError, OverflowError):
                 code = "response_too_large"
                 observation.update(
-                    {"status_code": 413, "result": {"error": {"code": code, "message": "Tool response exceeds its allowance"}}}
+                    {
+                        "status_code": 413,
+                        "result": {"error": {"code": code, "message": "Tool response cannot be one Workspace message"}},
+                    }
                 )
                 response = self.encode(observation)
             finally:
@@ -1554,12 +1492,8 @@ def parse_args(argv: list):
     parser.add_argument("--auth-token-fd", type=int, required=True)
     parser.add_argument("--egress-policy", choices=("web", "deny", "direct"), default="direct")
     parser.add_argument("--egress-enforcement", choices=("container", "deployment"), default="container")
-    parser.add_argument("--max-request-bytes", type=int, default=DEFAULT_MAX_REQUEST_BYTES)
-    parser.add_argument("--max-output-bytes", type=int, default=DEFAULT_MAX_OUTPUT_BYTES)
-    parser.add_argument("--max-file-bytes", type=int, default=DEFAULT_MAX_FILE_BYTES)
-    parser.add_argument("--max-response-bytes", type=int, default=DEFAULT_MAX_RESPONSE_BYTES)
     parser.add_argument("--max-concurrent-requests", type=int, default=DEFAULT_MAX_CONCURRENT_REQUESTS)
-    parser.add_argument("--max-tool-timeout", type=int, default=DEFAULT_MAX_TOOL_TIMEOUT)
+    parser.add_argument("--process-watchdog-seconds", type=int, default=DEFAULT_PROCESS_WATCHDOG_SECONDS)
     parser.add_argument("--request-read-timeout", type=float, default=DEFAULT_REQUEST_READ_TIMEOUT)
     parser.add_argument("--image", default="")
     computed_return_value = parser.parse_args(argv)
@@ -1584,31 +1518,20 @@ def read_auth_token(args):
 
 def configure(args):
     """Apply validated process-wide settings before accepting requests."""
-    global WORKSPACE, EGRESS_POLICY, EGRESS_ENFORCEMENT, MAX_OUTPUT_BYTES, MAX_FILE_BYTES
-    global MAX_TOOL_TIMEOUT, IMAGE
+    global WORKSPACE, EGRESS_POLICY, EGRESS_ENFORCEMENT
+    global PROCESS_WATCHDOG_SECONDS, IMAGE
     if not 1 <= args.port <= 65535 or not 1 <= args.health_port <= 65535 or args.port == args.health_port:
         raise ValueError("gRPC and health ports must be distinct ports between 1 and 65535")
-    for name in (
-        "max_request_bytes",
-        "max_output_bytes",
-        "max_file_bytes",
-        "max_response_bytes",
-        "max_concurrent_requests",
-        "max_tool_timeout",
-    ):
+    for name in ("max_concurrent_requests", "process_watchdog_seconds"):
         if getattr(args, name) < 1:
             raise ValueError(f"{name} must be positive")
-    if args.max_response_bytes < MIN_MAX_RESPONSE_BYTES:
-        raise ValueError(f"max_response_bytes must be at least {MIN_MAX_RESPONSE_BYTES}")
     if args.request_read_timeout <= 0:
         raise ValueError("request_read_timeout must be positive")
     WORKSPACE = args.workspace.resolve()
     WORKSPACE.mkdir(parents=True, exist_ok=True)
     EGRESS_POLICY = args.egress_policy
     EGRESS_ENFORCEMENT = args.egress_enforcement
-    MAX_OUTPUT_BYTES = args.max_output_bytes
-    MAX_FILE_BYTES = args.max_file_bytes
-    MAX_TOOL_TIMEOUT = args.max_tool_timeout
+    PROCESS_WATCHDOG_SECONDS = args.process_watchdog_seconds
     IMAGE = args.image
     return False
 

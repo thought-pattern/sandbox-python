@@ -9,7 +9,7 @@ from uuid import uuid4
 from grpc import RpcError, StatusCode, insecure_channel
 
 from tapestry.interfaces.envelope import decode_envelope, encode_envelope
-from tapestry.interfaces.workspace.constants import DEFAULT_MAX_REQUEST_BYTES, DEFAULT_MAX_RESPONSE_BYTES
+from tapestry.interfaces.workspace.constants import PAYLOAD_LIMIT_BYTES
 from tapestry.interfaces.workspace.workspace_pb2 import WorkspaceEnvelope
 from tapestry.interfaces.workspace.workspace_pb2_grpc import WorkspaceServiceStub
 
@@ -38,7 +38,7 @@ class WorkspaceClient:
         self.root_task_id = root_task_id
         self.channel = insecure_channel(address)
         self.stub = WorkspaceServiceStub(self.channel)
-        self.health_address = ()
+        self.health_address: tuple = ()
 
     def __enter__(self):
         return self
@@ -47,7 +47,7 @@ class WorkspaceClient:
         self.channel.close()
 
     def rpc(self, operation: str, payload: dict, timeout: float = 0.0) -> dict:
-        request = WorkspaceEnvelope(payload=encode_envelope(payload, DEFAULT_MAX_REQUEST_BYTES, "Workspace"))
+        request = WorkspaceEnvelope(payload=encode_envelope(payload, PAYLOAD_LIMIT_BYTES, "Workspace"))
         metadata = () if operation == "CheckHealth" else (("authorization", f"Bearer {self.auth_token}"),)
         try:
             response = getattr(self.stub, operation)(request, timeout=timeout or self.timeout, metadata=metadata)
@@ -58,7 +58,7 @@ class WorkspaceClient:
                 code="unauthorized" if unauthorized else "transport_error",
                 status_code=401 if unauthorized else 0,
             ) from err
-        result = decode_envelope(response.payload, DEFAULT_MAX_RESPONSE_BYTES, "Workspace")
+        result = decode_envelope(response.payload, PAYLOAD_LIMIT_BYTES, "Workspace")
         return result
 
     def health(self, timeout: float = 0.0) -> dict:
@@ -91,10 +91,6 @@ class WorkspaceClient:
         payload = self.invoke_tool(name, arguments, timeout, root_task_id=self.root_task_id)
         result = payload.get("result", {})
         if isinstance(result, dict) and result.get("ok", True) is False:
-            code = (
-                "timeout"
-                if result.get("timedOut", False)
-                else "output_limit" if result.get("outputLimited", False) else "process_failed"
-            )
+            code = "stalled" if result.get("stalled", False) else "process_failed"
             raise WorkspaceToolError("Tool process failed", code=code, status_code=payload.get("status_code", 0), result=result)
         return result

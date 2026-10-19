@@ -81,6 +81,13 @@ class WorkspaceHealth:
             self.count_received(operation, observed_at)
         return key
 
+    def running_requests(self) -> list:
+        """The request IDs of the calls still running, so a caller that lost its reply can tell whether to wait."""
+        with self.lock:
+            identifiers = {item.get("ids", {}).get("request_id", "") for item in self.items.values()}
+        running = sorted(identifiers - {""})
+        return running
+
     def count_received(self, operation: str, observed_at: str) -> None:
         """Count one call received; the lock is held."""
         self.requests["received"] = self.requests.get("received", 0) + 1
