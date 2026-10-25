@@ -171,5 +171,8 @@ packages. They need `git`, `pip` and `rg` (ripgrep) on `PATH`, the same tools
 the image installs.
 
 ```bash
-PYTHONPATH=.:container/sandbox-python/container:container/sandbox-python/tests python3 -m pytest container/sandbox-python/tests/test_smoke.py -q
+python3 -m pytest container/sandbox-python/tests -q
 ```
+
+Run it from the Tapestry repository root, or run `python3 -m pytest` from this directory.
+`pytest.ini` puts `container/` and the Tapestry repository root on the import path.

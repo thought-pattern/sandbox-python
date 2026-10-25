@@ -67,12 +67,13 @@ class ArtifactHandler(SimpleHTTPRequestHandler):
         self.server.paths.append(self.path)
         super().do_GET()
 
-    def log_message(self, format, *arguments):
+    # SimpleHTTPRequestHandler.log_message names its first parameter format; the override keeps the standard-library signature.
+    def log_message(self, format, *arguments):  # pylint: disable=redefined-builtin
         """Requests are retained by the fixture owner."""
 
 
-@fixture
-def direct_tools(tmp_path, monkeypatch):
+@fixture(name="direct_tools")
+def direct_tools_fixture(tmp_path, monkeypatch):
     """Use the real server configuration, gRPC owner, client and subprocess owner."""
     monkeypatch.setenv("PATH", f"{Path(executable).parent}:{environ.get('PATH', '')}")
     # configure() rebinds these server globals; each test starts from, and is restored to, the imported defaults.
@@ -105,8 +106,8 @@ def direct_tools(tmp_path, monkeypatch):
             assert not worker.is_alive()
 
 
-@fixture
-def artifacts(tmp_path):
+@fixture(name="artifacts")
+def artifacts_fixture(tmp_path):
     directory = tmp_path / "destinations"
     directory.mkdir()
     with ArtifactServer(directory) as endpoint:

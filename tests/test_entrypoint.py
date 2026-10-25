@@ -30,8 +30,8 @@ REPLIES = [
 DROP_POLICY = ["-P", "OUTPUT", "DROP"]
 
 
-@fixture
-def installed_rules(monkeypatch):
+@fixture(name="installed_rules")
+def installed_rules_fixture(monkeypatch):
     rules = []
     monkeypatch.setattr("entrypoint.shutil_which", lambda name: f"/usr/sbin/{name}")
     monkeypatch.setattr("entrypoint.nameserver_addresses", lambda: [RESOLVER])

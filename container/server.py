@@ -348,7 +348,8 @@ def internal_run_process(
     with tempfile_TemporaryFile() as stdout_file, tempfile_TemporaryFile() as stderr_file:
         process = subprocess_Popen(
             command,
-            shell=shell,
+            # The run-command tool executes the caller's shell command line inside the sandbox by design.
+            shell=shell,  # nosec B602
             cwd=cwd or current_workspace(),
             env=process_environment,
             stdout=stdout_file,
@@ -950,7 +951,10 @@ def git_clone(repo_url: str, branch: str = "main"):
             for item in list(workspace.iterdir()):
                 if item == staging:
                     continue
-                shutil_rmtree(item) if item.is_dir() else item.unlink()
+                if item.is_dir():
+                    shutil_rmtree(item)
+                else:
+                    item.unlink()
             for item in list(staging.iterdir()):
                 shutil_move(str(item), workspace / item.name)
             staging.rmdir()
@@ -1479,7 +1483,8 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def log_message(self, format, *args):
+    # BaseHTTPRequestHandler.log_message names its first parameter format; the override keeps the standard-library signature.
+    def log_message(self, format, *args):  # pylint: disable=redefined-builtin
         return False
 
 
@@ -1542,12 +1547,14 @@ def main(argv: list):
     auth_token = read_auth_token(args)
     configure(args)
     owner = WorkspaceService(auth_token, args)
-    server = HealthHTTPServer(("0.0.0.0", args.health_port), owner, args.request_read_timeout)
+    # The container listens on every interface of its own network namespace so the published host port reaches it.
+    server = HealthHTTPServer(("0.0.0.0", args.health_port), owner, args.request_read_timeout)  # nosec B104
     owner.start(f"0.0.0.0:{args.port}")
     stopped = threading_Event()
     shutdown = {"signal": 0}
 
-    def request_shutdown(number, frame):
+    # signal.signal calls a handler with (signum, frame); shutdown needs only the signal number.
+    def request_shutdown(number, frame):  # pylint: disable=unused-argument
         """Ask the component owner to stop accepting and drain current work."""
         shutdown["signal"] = number
         stopped.set()

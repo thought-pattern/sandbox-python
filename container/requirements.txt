@@ -3,4 +3,4 @@ grpcio==1.83.1
 protobuf==7.35.1
 msgpack==1.2.2
 # Retained component checks and generated Python deliverables use pytest.
-pytest==8.4.2
+pytest==9.1.1

@@ -65,7 +65,7 @@ def parse_policy(argv):
 
 
 def run_firewall(binary, arguments):
-    result = subprocess_run([binary, *arguments], capture_output=True, text=True)
+    result = subprocess_run([binary, *arguments], capture_output=True, text=True, check=False)
     if result.returncode != 0:
         raise RuntimeError(f"{binary} {' '.join(arguments)} failed: {result.stderr.strip()}")
     return False
@@ -74,7 +74,7 @@ def run_firewall(binary, arguments):
 def nameserver_addresses():
     """Read the resolvers the guest must reach to resolve web destinations."""
     resolv = Path("/etc/resolv.conf")
-    lines = resolv.read_text().splitlines() if resolv.exists() else []
+    lines = resolv.read_text(encoding="utf-8").splitlines() if resolv.exists() else []
     result = [line.split()[1] for line in lines if line.strip().startswith("nameserver") and len(line.split()) > 1]
     return result
 
@@ -139,7 +139,7 @@ def enforce_egress_policy(allow_web=False):
 
     interfaces = Path("/proc/net/if_inet6")
     has_external_ipv6 = interfaces.exists() and any(
-        line.split()[-1] != "lo" for line in interfaces.read_text().splitlines() if line.split()
+        line.split()[-1] != "lo" for line in interfaces.read_text(encoding="utf-8").splitlines() if line.split()
     )
     if not has_external_ipv6:
         return False
@@ -164,7 +164,7 @@ def verify_deployment_identity():
     """Start a deployment-enforced guest without retaining privilege or gaining it on exec."""
     if os_geteuid() == 0:
         raise RuntimeError("deployment-enforced Workspace must start as nonroot")
-    status = dict(line.split(":", 1) for line in Path("/proc/self/status").read_text().splitlines() if ":" in line)
+    status = dict(line.split(":", 1) for line in Path("/proc/self/status").read_text(encoding="utf-8").splitlines() if ":" in line)
     if any(int(status.get(name, "1").strip(), 16) for name in ("CapEff", "CapPrm", "CapAmb")):
         raise RuntimeError("deployment-enforced Workspace must have zero guest capabilities")
     libc = CDLL(LIBC_SONAME, use_errno=True)
