@@ -74,6 +74,7 @@ from uuid import UUID, uuid4
 from grpc import StatusCode, server as grpc_server
 from health import PAGE_HEADERS, WorkspaceHealth, page_file
 
+from engram.health_exposition import METRICS_CONTENT_TYPE, health_exposition
 from tapestry.interfaces.envelope import decode_envelope, encode_envelope
 from tapestry.interfaces.workspace.constants import CONTROL_WORKERS, PAYLOAD_LIMIT_BYTES, PROTOBUF_MESSAGE_LIMIT_BYTES
 from tapestry.interfaces.workspace.workspace_pb2 import WorkspaceEnvelope
@@ -91,8 +92,8 @@ DEFAULT_MAX_CONCURRENT_REQUESTS = 4
 DEFAULT_PROCESS_WATCHDOG_SECONDS = 120
 # How often the watchdog reads a running tool process's CPU time and output size.
 WATCHDOG_POLL_SECONDS = 1.0
-DEFAULT_REQUEST_READ_TIMEOUT = 10.0
-DEFAULT_LIST_TIMEOUT = 5.0
+# The health listener ends an observation request once its client has sent nothing for this many seconds.
+DEFAULT_REQUEST_READ_WATCHDOG_SECONDS = 10.0
 # The depth a listing has when its caller names none: the whole tree.
 WHOLE_TREE_DEPTH = -1
 # The bearer key file holds one line of at least this many characters, within this byte bound.
@@ -107,7 +108,7 @@ EGRESS_ENFORCEMENT = "container"
 # The container image the manager started this server from, shown on the health page; empty when not supplied.
 IMAGE = ""
 # Routes answered without the Workspace key: the health page, its assets and the health API.
-PUBLIC_PATHS = {"/", "/health.js", "/health-common.js", "/health.css", "/api/health", "/health/live", "/health/ready"}
+PUBLIC_PATHS = {"/", "/health.js", "/health-common.js", "/health.css", "/api/health", "/metrics", "/health/live", "/health/ready"}
 PROCESS_WATCHDOG_SECONDS = DEFAULT_PROCESS_WATCHDOG_SECONDS
 GIT_ENV = {
     **os_environ,
@@ -190,6 +191,103 @@ def wire_working_context(context: dict) -> dict:
     root_task_id = context.get("root_task_id", "")
     wire = {"rootTaskId": root_task_id} if root_task_id else {}
     return wire
+
+
+def file_change_identity(path: Path, workspace: Path) -> dict:
+    """Identify a file and the links resolving its name without treating reads as changes."""
+    resolved = path.resolve(strict=True)
+    if not resolved.is_relative_to(workspace):
+        raise ToolError("Input metadata cannot leave its Task folder", code="path_escape", status=400)
+    metadata = resolved.stat()
+    if not S_ISREG(metadata.st_mode):
+        raise ToolError("Input metadata requires a regular file", code="not_file", status=400)
+    links = []
+    cursor = workspace
+    for part in path.relative_to(workspace).parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            link = cursor.lstat()
+            links.append(
+                {
+                    "path": str(cursor.relative_to(workspace)),
+                    "target": str(cursor.readlink()),
+                    "device": link.st_dev,
+                    "inode": link.st_ino,
+                    "mtime_ns": link.st_mtime_ns,
+                    "ctime_ns": link.st_ctime_ns,
+                }
+            )
+    return {
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "mode": metadata.st_mode,
+        "mtime_ns": metadata.st_mtime_ns,
+        "ctime_ns": metadata.st_ctime_ns,
+        "links": links,
+    }
+
+
+def root_file_catalog(root_task_id: str, paths: list) -> dict:
+    """Observe complete original-input metadata, or selected current files, without retaining content."""
+    workspace = request_working_context(root_task_id).get("directory")
+    if not isinstance(workspace, Path):
+        raise ValueError("Root catalogue has no Task directory")
+    files, missing, directories = [], [], {}
+    candidates = []
+    if paths:
+        for relative in paths:
+            candidate = workspace / relative
+            if not candidate.resolve().is_relative_to(workspace):
+                raise ToolError("Input metadata cannot leave its Task folder", code="path_escape", status=400)
+            if not candidate.exists():
+                missing.append(relative)
+            else:
+                candidates.append(candidate)
+    else:
+        pending = [(workspace, frozenset())]
+        while pending:
+            directory, ancestors = pending.pop()
+            resolved = directory.resolve(strict=True)
+            if not resolved.is_relative_to(workspace) or resolved in ancestors:
+                raise ToolError("Input catalogue has an escaping or cyclic directory", code="input_catalog_invalid", status=422)
+            metadata = directory.stat()
+            directories[directory] = (metadata.st_dev, metadata.st_ino, metadata.st_mtime_ns, metadata.st_ctime_ns)
+            with os_scandir(directory) as entries:
+                children = sorted((Path(entry.path) for entry in entries), key=lambda entry: entry.name)
+            for candidate in children:
+                if candidate.is_dir():
+                    pending.append((candidate, ancestors | {resolved}))
+                elif candidate.is_file():
+                    candidates.append(candidate)
+                else:
+                    raise ToolError(
+                        "Input catalogue contains an unreadable file or special entry", code="input_catalog_invalid", status=422
+                    )
+    for candidate in sorted(candidates):
+        identity = file_change_identity(candidate, workspace)
+        digest = hashlib_sha256()
+        size = 0
+        with candidate.open("rb") as stream:
+            opened = os_fstat(stream.fileno())
+            if (opened.st_dev, opened.st_ino) != (identity.get("device"), identity.get("inode")):
+                raise ToolError("Input file changed while opening", code="input_catalog_changed", status=409)
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+                size += len(chunk)
+        if identity != file_change_identity(candidate, workspace) or candidate.stat().st_size != size:
+            raise ToolError("Input file changed during its metadata read", code="input_catalog_changed", status=409)
+        files.append(
+            {"path": str(candidate.relative_to(workspace)), "bytes": size, "sha256": digest.hexdigest(), "identity": identity}
+        )
+    # Recheck every observed identity after the last hash, so a changing tree never establishes initial authority.
+    for entry in files:
+        if entry.get("identity") != file_change_identity(workspace / entry.get("path", ""), workspace):
+            raise ToolError("Input file changed during catalogue capture", code="input_catalog_changed", status=409)
+    for directory, identity in directories.items():
+        metadata = directory.stat()
+        if identity != (metadata.st_dev, metadata.st_ino, metadata.st_mtime_ns, metadata.st_ctime_ns):
+            raise ToolError("Input directory changed during catalogue capture", code="input_catalog_changed", status=409)
+    return {"root_task_id": root_task_id, "files": files, "missing": sorted(missing)}
 
 
 def resolve_path(path):
@@ -620,7 +718,7 @@ def file_list(path: str = ".", depth: int = WHOLE_TREE_DEPTH, max_results: int =
 
     The listing has no entry or depth limit of its own. An omitted depth lists the whole tree, and its scan reports the
     levels it descended; a given depth stops there, and depth 0 lists nothing. It stops early only at the caller's
-    positive `max_results` or the listing deadline. Zero `max_results` returns every entry.
+    positive `max_results`. Zero `max_results` returns every entry.
     """
     target = resolve_path(path)
     workspace = current_workspace()
@@ -637,7 +735,6 @@ def file_list(path: str = ".", depth: int = WHOLE_TREE_DEPTH, max_results: int =
     depth = max(0, int(depth))
     max_results = max(0, int(max_results))
     started = time_monotonic()
-    deadline = started + DEFAULT_LIST_TIMEOUT
     files = []
     directories = []
     links = []
@@ -655,26 +752,11 @@ def file_list(path: str = ".", depth: int = WHOLE_TREE_DEPTH, max_results: int =
     }
     tree_nodes = {root.get("path", ""): root}
     while pending:
-        if time_monotonic() >= deadline:
-            stop_reason = "time_limit"
-            break
         directory, directory_depth = pending.pop()
-        entries = []
         with os_scandir(directory) as iterator:
-            visited_directories += 1
-            while True:
-                if time_monotonic() >= deadline:
-                    stop_reason = "time_limit"
-                    break
-                try:
-                    entry = next(iterator)
-                except StopIteration:
-                    break
-                visited_entries += 1
-                entries.append(entry)
-        # A partial directory cannot supply deterministic selection from its raw filesystem order.
-        if stop_reason != "complete":
-            break
+            entries = list(iterator)
+        visited_directories += 1
+        visited_entries += len(entries)
         deepest = max(deepest, directory_depth + 1)
         children = []
         parent_node = tree_nodes.get(str(directory.relative_to(workspace)), {})
@@ -682,9 +764,6 @@ def file_list(path: str = ".", depth: int = WHOLE_TREE_DEPTH, max_results: int =
         if not parent_node:
             raise RuntimeError("workspace listing lost the node of a queued directory")
         for entry in sorted(entries, key=lambda item: item.name):
-            if time_monotonic() >= deadline:
-                stop_reason = "time_limit"
-                break
             candidate = Path(entry.path)
             relative_path = str(candidate.relative_to(workspace))
             if entry.is_symlink():
@@ -1226,6 +1305,9 @@ class WorkspaceService(WorkspaceServiceServicer):
             options=(
                 ("grpc.max_receive_message_length", PROTOBUF_MESSAGE_LIMIT_BYTES),
                 ("grpc.max_send_message_length", PROTOBUF_MESSAGE_LIMIT_BYTES),
+                # A client's keepalive watchdog pings through a long silent tool call; the server answers every ping
+                # instead of counting it as abuse and closing the connection.
+                ("grpc.http2.max_ping_strikes", 0),
             ),
             maximum_concurrent_rpcs=self.max_concurrent_requests + CONTROL_WORKERS,
         )
@@ -1255,12 +1337,13 @@ class WorkspaceService(WorkspaceServiceServicer):
             self.health.refused(operation, "UNAUTHORIZED", "unauthorized")
             context.abort(StatusCode.UNAUTHENTICATED, "A valid Workspace service key is required")
 
-    def decode(self, request, context, fields: set) -> dict:
+    def decode(self, request, context, fields: set | tuple) -> dict:
         try:
             payload = decode_envelope(request.payload, PAYLOAD_LIMIT_BYTES, "Workspace")
-            if set(payload) != fields:
+            purposes = fields if type(fields) is tuple else (fields,)
+            if set(payload) not in purposes:
                 raise ValueError("Workspace RPC fields differ from its operation contract")
-            if "request_id" in fields:
+            if "request_id" in payload:
                 identifier = payload.get("request_id", "")
                 if type(identifier) is not str or not re_fullmatch(r"[A-Za-z0-9._:-]{1,128}", identifier):
                     raise ValueError("Workspace request ID is invalid")
@@ -1299,15 +1382,43 @@ class WorkspaceService(WorkspaceServiceServicer):
 
     def Describe(self, request, context):
         self.authorize(context, "manifest")
-        payload = self.decode(request, context, {"request_id"})
+        payload = self.decode(request, context, ({"request_id"}, {"request_id", "root_task_id", "paths"}))
         identifier = payload.get("request_id", "")
+        root, paths = payload.get("root_task_id", ""), payload.get("paths", [])
+        if (
+            type(root) is not str
+            or "root_task_id" in payload
+            and not root
+            or type(paths) is not list
+            or any(
+                type(path) is not str
+                or not path
+                or path == "."
+                or Path(path).is_absolute()
+                or "\\" in path
+                or any(part in {"", ".", ".."} for part in path.split("/"))
+                or any(ord(character) < 32 for character in path)
+                for path in paths
+            )
+            or len(set(paths)) != len(paths)
+            or paths
+            and not root
+        ):
+            context.abort(StatusCode.INVALID_ARGUMENT, "Root metadata requires distinct canonical relative paths")
         key = self.health.received("manifest", {"request_id": identifier})
         try:
             manifest = build_manifest()
             manifest.update(
                 {"incarnation": self.incarnation, "request_id": identifier, "runningRequests": self.health.running_requests()}
             )
+            if root:
+                with FILE_LOCK:
+                    manifest["file_catalog"] = root_file_catalog(root, paths)
             response = self.encode(manifest)
+        except ToolError as err:
+            self.health.finished(key, "CATALOGUE_FAILED", err.code)
+            context.abort(StatusCode.FAILED_PRECONDITION, str(err))
+            raise
         except (TypeError, ValueError, OSError):
             self.health.finished(key, "MANIFEST_FAILED", "manifest_failed")
             context.abort(StatusCode.INTERNAL, "Workspace manifest is unavailable")
@@ -1432,9 +1543,9 @@ class HealthHTTPServer(ThreadingHTTPServer):
 
     daemon_threads = False
 
-    def __init__(self, address: tuple, owner: WorkspaceService, request_read_timeout: float):
+    def __init__(self, address: tuple, owner: WorkspaceService, request_read_watchdog_seconds: float):
         self.owner = owner
-        self.request_read_timeout = request_read_timeout
+        self.request_read_watchdog_seconds = request_read_watchdog_seconds
         super().__init__(address, HealthHandler)
 
     def server_bind(self):
@@ -1457,11 +1568,15 @@ class HealthHandler(BaseHTTPRequestHandler):
 
     def setup(self):
         super().setup()
-        self.connection.settimeout(self.server.request_read_timeout)
+        # Each read waits until the client sends again or has been silent for the watchdog interval.
+        self.connection.settimeout(self.server.request_read_watchdog_seconds)
 
     def do_GET(self):
         body, media_type = page_file(self.path)
         status = 200
+        if self.path == "/metrics":
+            body = health_exposition(self.server.owner.health_snapshot()).encode("utf-8")
+            media_type = METRICS_CONTENT_TYPE
         if not media_type:
             media_type = "application/json"
             if self.path == "/api/health":
@@ -1499,7 +1614,7 @@ def parse_args(argv: list):
     parser.add_argument("--egress-enforcement", choices=("container", "deployment"), default="container")
     parser.add_argument("--max-concurrent-requests", type=int, default=DEFAULT_MAX_CONCURRENT_REQUESTS)
     parser.add_argument("--process-watchdog-seconds", type=int, default=DEFAULT_PROCESS_WATCHDOG_SECONDS)
-    parser.add_argument("--request-read-timeout", type=float, default=DEFAULT_REQUEST_READ_TIMEOUT)
+    parser.add_argument("--request-read-watchdog-seconds", type=float, default=DEFAULT_REQUEST_READ_WATCHDOG_SECONDS)
     parser.add_argument("--image", default="")
     computed_return_value = parser.parse_args(argv)
     return computed_return_value
@@ -1530,8 +1645,8 @@ def configure(args):
     for name in ("max_concurrent_requests", "process_watchdog_seconds"):
         if getattr(args, name) < 1:
             raise ValueError(f"{name} must be positive")
-    if args.request_read_timeout <= 0:
-        raise ValueError("request_read_timeout must be positive")
+    if args.request_read_watchdog_seconds <= 0:
+        raise ValueError("request_read_watchdog_seconds must be positive")
     WORKSPACE = args.workspace.resolve()
     WORKSPACE.mkdir(parents=True, exist_ok=True)
     EGRESS_POLICY = args.egress_policy
@@ -1548,7 +1663,7 @@ def main(argv: list):
     configure(args)
     owner = WorkspaceService(auth_token, args)
     # The container listens on every interface of its own network namespace so the published host port reaches it.
-    server = HealthHTTPServer(("0.0.0.0", args.health_port), owner, args.request_read_timeout)  # nosec B104
+    server = HealthHTTPServer(("0.0.0.0", args.health_port), owner, args.request_read_watchdog_seconds)  # nosec B104
     owner.start(f"0.0.0.0:{args.port}")
     stopped = threading_Event()
     shutdown = {"signal": 0}

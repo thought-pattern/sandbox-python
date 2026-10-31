@@ -92,7 +92,7 @@ def direct_tools_fixture(tmp_path, monkeypatch):
     configure(args)
     owner = WorkspaceService(TOKEN, args)
     owner.start("127.0.0.1:0")
-    with HealthHTTPServer(("127.0.0.1", 0), owner, args.request_read_timeout) as endpoint:
+    with HealthHTTPServer(("127.0.0.1", 0), owner, args.request_read_watchdog_seconds) as endpoint:
         worker = Thread(target=endpoint.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         worker.start()
         try:
@@ -102,8 +102,7 @@ def direct_tools_fixture(tmp_path, monkeypatch):
         finally:
             owner.close()
             endpoint.shutdown()
-            worker.join(timeout=5)
-            assert not worker.is_alive()
+            worker.join()
 
 
 @fixture(name="artifacts")
@@ -117,8 +116,7 @@ def artifacts_fixture(tmp_path):
             yield endpoint
         finally:
             endpoint.shutdown()
-            worker.join(timeout=5)
-            assert not worker.is_alive()
+            worker.join()
 
 
 def test_authenticated_direct_interface_runs_real_tools_and_preserves_failures(direct_tools, tmp_path):
@@ -414,7 +412,7 @@ def test_pip_downloads_from_the_actual_index_without_forwarding(direct_tools, ar
         "PIP_REQUIRE_VENV",
     ):
         monkeypatch.delenv(name, raising=False)
-    result = direct_tools.call_tool("pip_install", {"packages": ["workspace-fixture==1.0"]}, timeout=30)
+    result = direct_tools.call_tool("pip_install", {"packages": ["workspace-fixture==1.0"]})
     assert result.get("ok", False) and result.get("exitCode", -1) == 0
     assert (target / "workspace_fixture.py").read_text() == "VALUE = 42\n"
     assert "/simple/workspace-fixture/" in artifacts.paths

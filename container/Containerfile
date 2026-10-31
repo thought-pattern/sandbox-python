@@ -20,6 +20,7 @@ ENV PATH=$PATH:/home/sandbox/.local/bin
 COPY container/sandbox-python/container/server.py container/sandbox-python/container/entrypoint.py container/sandbox-python/container/health.py /opt/tapestry/
 COPY container/sandbox-python/container/assets /opt/tapestry/assets/
 COPY tapestry/__init__.py /opt/workspace-interface/tapestry/
+COPY component/engram/engram/health_exposition.py /opt/workspace-interface/engram/health_exposition.py
 COPY tapestry/interfaces/__init__.py tapestry/interfaces/envelope.py /opt/workspace-interface/tapestry/interfaces/
 COPY tapestry/interfaces/workspace/__init__.py tapestry/interfaces/workspace/constants.py tapestry/interfaces/workspace/workspace_pb2.py tapestry/interfaces/workspace/workspace_pb2_grpc.py /opt/workspace-interface/tapestry/interfaces/workspace/
 ENV PYTHONPATH=/opt/workspace-interface

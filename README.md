@@ -65,12 +65,10 @@ workspace = ExecutionSandbox(
         "application_security_group": "sg-...",
         "endpoint_ids": ["vpce-ecr-api", "vpce-ecr-registry", "vpce-logs", "vpce-s3"],
         "dns_rule_group_id": "rslvr-frg-...",
-        "startup_timeout": 90,
-        "cleanup_timeout": 60,
     },
 )
 with workspace.session() as run_probe:
-    result = run_probe("print(6 * 7)", 5)
+    result = run_probe("print(6 * 7)")
 ```
 
 The adapter verifies deployment resources before creating a session's security
