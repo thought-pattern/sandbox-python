@@ -215,6 +215,7 @@ export function renderStandard(component, snapshot) {
     ["Incarnation", element("span", snapshot.incarnation || "Not observed", "mono")],
     ["Fault", snapshot.fault_type || "None"],
     ["Health page listener", listener(snapshot.http)],
+    ["gRPC listener", listener(snapshot.grpc)],
   ]);
   const requests = snapshot.requests || {};
   const timing = snapshot.timing || {};

@@ -55,7 +55,10 @@ def operation_counts() -> dict:
 
 
 class WorkspaceHealth:
-    """The tool server's figures since it started; every method takes the lock only briefly, from any request thread."""
+    """The tool server's figures since it started; every method takes the lock only briefly, from any request thread.
+
+    `grpc_state` is the tool transport's listener state, which the server keeps.
+    """
 
     def __init__(self, incarnation: str):
         self.incarnation = incarnation
@@ -71,6 +74,7 @@ class WorkspaceHealth:
         self.recent = deque(maxlen=RECENT_OUTCOMES)
         self.history = deque(maxlen=HISTORY_SAMPLES)
         self.last_sample = self.began - SAMPLE_SECONDS
+        self.grpc_state = {"enabled": True, "available": False, "error_type": "", "error_code": ""}
 
     def received(self, operation: str, ids: dict = DEFAULT_IDS) -> str:
         """Count one call arriving and hold it as running until `finished`; return its key."""
@@ -214,6 +218,7 @@ class WorkspaceHealth:
             "stopping": False,
             "fault_type": "",
             "http": {"enabled": True, "available": True, "error_type": "", "error_code": ""},
+            "grpc": dict(self.grpc_state),
             "refresh_seconds": SAMPLE_SECONDS,
             "requests": requests,
             "timing": timing,

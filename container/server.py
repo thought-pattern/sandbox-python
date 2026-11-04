@@ -1321,12 +1321,14 @@ class WorkspaceService(WorkspaceServiceServicer):
         if not self.port:
             raise RuntimeError("Workspace gRPC address could not bind")
         self.rpc.start()
+        self.health.grpc_state.update(available=True, url=address.rpartition(":")[0] + ":" + str(self.port))
         return self.port
 
     def close(self) -> None:
         """Stop admission and drain actual tool functions even after their RPCs disconnected."""
         if not self.closed:
             self.closed = True
+            self.health.grpc_state["available"] = False
             self.rpc.stop(0).wait()
             self.workers.shutdown(wait=True)
 
