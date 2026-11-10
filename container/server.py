@@ -5,13 +5,14 @@ Accepted tool functions drain even when their caller disconnects.
 """
 
 from argparse import ArgumentParser as argparse_ArgumentParser
-from concurrent.futures import ThreadPoolExecutor
+from codecs import getincrementaldecoder as codecs_getincrementaldecoder
 from contextvars import ContextVar
+from ctypes import CDLL as ctypes_CDLL, get_errno as ctypes_get_errno
+from functools import partial as functools_partial
 from hashlib import sha256 as hashlib_sha256
 from hmac import compare_digest as hmac_compare_digest
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from inspect import Parameter as inspect_Parameter, signature as inspect_signature
-from json import dumps as json_dumps, loads as json_loads
+from json import loads as json_loads
 from logging import (
     INFO as logging_INFO,
     basicConfig as logging_basicConfig,
@@ -29,9 +30,6 @@ from os import (
     fdopen as os_fdopen,
     fstat as os_fstat,
     fsync as os_fsync,
-    getpid as os_getpid,
-    kill as os_kill,
-    killpg as os_killpg,
     open as os_open,
     scandir as os_scandir,
     stat as os_stat,
@@ -40,18 +38,12 @@ from os import (
 from pathlib import Path
 from re import compile as re_compile, fullmatch as re_fullmatch, sub as re_sub
 from shutil import (
+    copyfileobj as shutil_copyfileobj,
     disk_usage as shutil_disk_usage,
     move as shutil_move,
     rmtree as shutil_rmtree,
     which as shutil_which,
 )
-from signal import (
-    SIGINT as signal_SIGINT,
-    SIGKILL as signal_SIGKILL,
-    SIGTERM as signal_SIGTERM,
-    signal as signal_signal,
-)
-from socketserver import TCPServer
 from stat import S_ISLNK, S_ISREG
 from subprocess import (
     Popen as subprocess_Popen,
@@ -65,24 +57,41 @@ from tempfile import (
 )
 from threading import (
     TIMEOUT_MAX as threading_TIMEOUT_MAX,
-    BoundedSemaphore as threading_BoundedSemaphore,
-    Event as threading_Event,
     RLock as threading_RLock,
+    Thread as threading_Thread,
 )
 from time import monotonic as time_monotonic
 from uuid import UUID, uuid4
 
+from call_admission import CallThreads, ToolTurns
+from first_process import FirstProcess, hold_signals, program_command
 from grpc import StatusCode, server as grpc_server
-from health import PAGE_HEADERS, WorkspaceHealth, page_file
+from health import HealthHTTPServer, WorkspaceHealth
+from part_write import PART_WRITE_FOLDERS, PartWriteRefusal, remove_unfinished_writes, write_part
+from process_output import (
+    RUN_OUTPUT_FOLDERS,
+    json_document,
+    keep_output,
+    log_commits,
+    output_detail,
+    output_lines,
+    remove_unowned_run_outputs,
+    search_matches,
+    text_lines,
+)
+from tool_process import INVOCATION_MARKER_VARIABLE, invocation_activity, terminate_process_group
 
-from engram.health_exposition import METRICS_CONTENT_TYPE, health_exposition
 from tapestry.interfaces.envelope import decode_envelope, encode_envelope
-from tapestry.interfaces.workspace.constants import CONTROL_WORKERS, PAYLOAD_LIMIT_BYTES, PROTOBUF_MESSAGE_LIMIT_BYTES
+from tapestry.interfaces.workspace.constants import (
+    PAYLOAD_LIMIT_BYTES,
+    PROTOBUF_MESSAGE_LIMIT_BYTES,
+    READ_PART_LIMIT_BYTES,
+    RUN_OUTPUT_STREAMS,
+)
 from tapestry.interfaces.workspace.workspace_pb2 import WorkspaceEnvelope
 from tapestry.interfaces.workspace.workspace_pb2_grpc import WorkspaceServiceServicer, add_WorkspaceServiceServicer_to_server
 
 DEFAULT_ARGUMENT_DICT = {}
-INVOCATION_MARKER_VARIABLE = "TAPESTRY_TOOL_INVOCATION"
 
 PROTOCOL_NAME = "tapestry.workspace.grpc"
 DEFAULT_WORKSPACE = Path("/workspace")
@@ -100,6 +109,8 @@ WHOLE_TREE_DEPTH = -1
 # The bearer key file holds one line of at least this many characters, within this byte bound.
 MIN_AUTH_TOKEN_LENGTH = 32
 MAX_AUTH_TOKEN_FILE_BYTES = 4096
+# The prctl option that sets whether a process is dumpable (linux/prctl.h).
+PR_SET_DUMPABLE = 4
 
 WORKSPACE = DEFAULT_WORKSPACE
 # Outside a request the context is the shared empty mapping; each request sets its own resolved mapping.
@@ -111,31 +122,44 @@ IMAGE = ""
 # Routes answered without the Workspace key: the health page, its assets and the health API.
 PUBLIC_PATHS = {"/", "/health.js", "/health-common.js", "/health.css", "/api/health", "/metrics", "/health/live", "/health/ready"}
 PROCESS_WATCHDOG_SECONDS = DEFAULT_PROCESS_WATCHDOG_SECONDS
+# The Workspace's own Git configuration, beside this file and read-only with it: the identity of a commit whose
+# repository names none (D-1186). No system or host configuration reaches a Git tool.
+GIT_CONFIG_FILE = Path(__file__).resolve().parent / "gitconfig"
 GIT_ENV = {
     **os_environ,
     "GIT_CONFIG_NOSYSTEM": "1",
-    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_CONFIG_GLOBAL": str(GIT_CONFIG_FILE),
     "GIT_TERMINAL_PROMPT": "0",
     "GCM_INTERACTIVE": "never",
 }
 TOOLS = {}
 FILE_LOCK = threading_RLock()
+# The server's signals and orphans as its container's first process, and the tool leaders it holds from the reaper.
+FIRST_PROCESS = FirstProcess()
 # The container's cgroup v2 memory limit and use, read before a whole-file read.
 CGROUP_MEMORY_MAX = "/sys/fs/cgroup/memory.max"
 CGROUP_MEMORY_CURRENT = "/sys/fs/cgroup/memory.current"
 # The copies of a file a whole read holds at once: its bytes, its decoded text, its MessagePack payload, its protobuf
 # message and gRPC's send buffer.
 WHOLE_READ_COPIES = 5
+# A request's identity: it names the request's reply and, for a run, the run's kept output.
+REQUEST_ID_PATTERN = r"[A-Za-z0-9._:-]{1,128}"
+# The folder that holds a folder per root Task, the Task folder its Tasks work in.
+TASK_FOLDERS = ".tapestry-work"
+# The bytes read at a time when a file or a finished output is copied or checked on disk.
+COPY_BLOCK_BYTES = 1024 * 1024
 LOGGER = logging_getLogger("tapestry.workspace.server")
 
 
 class ToolError(RuntimeError):
     """An expected tool/API failure with a stable machine-readable code."""
 
-    def __init__(self, message, *, code="tool_error", status=422):
+    def __init__(self, message, *, code="tool_error", status=422, details=DEFAULT_ARGUMENT_DICT):
         super().__init__(message)
         self.code = code
         self.status = status
+        # Fields the error names beside its code and message, such as the bytes a write in parts holds.
+        self.details = dict(details)
 
 
 def tool(fn):
@@ -173,7 +197,7 @@ def request_working_context(root_task_id: str) -> dict:
             code="invalid_working_context",
             status=400,
         )
-    parent = WORKSPACE / ".tapestry-work"
+    parent = WORKSPACE / TASK_FOLDERS
     directory = parent / root_task_id
     with FILE_LOCK:
         parent.mkdir(exist_ok=True)
@@ -306,124 +330,20 @@ def resolve_path(path):
     return target
 
 
-def atomic_write_text(target, content):
-    """Replace a text file atomically after fully writing its new content."""
+def atomic_write(target, write) -> None:
+    """Replace a file atomically once `write(handle)` has written all its new bytes to a temporary file beside it."""
     target.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile_mkstemp(prefix=".tapestry-write-", dir=target.parent)
     temporary = Path(temporary_name)
     try:
-        with os_fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(content)
+        with os_fdopen(descriptor, "wb") as handle:
+            write(handle)
             handle.flush()
             os_fsync(handle.fileno())
         temporary.replace(target)
     except Exception:
         temporary.unlink(missing_ok=True)
         raise
-    return False
-
-
-def invocation_process_ids(root_pid, marker):
-    """Collect a tool invocation's live processes by parent links and its inherited marker.
-
-    A descendant that calls setsid or is reparented after its parent exits leaves the original
-    process group and parent chain, but still inherits the invocation marker in its environment.
-    """
-    proc = Path("/proc")
-    if not proc.is_dir():
-        no_processes = set()
-        return no_processes
-    marker_entry = f"{INVOCATION_MARKER_VARIABLE}={marker}".encode("utf-8")
-    parents = {}
-    marked = set()
-    for entry in proc.iterdir():
-        if not entry.name.isdigit():
-            continue
-        pid = int(entry.name)
-        try:
-            stat = (entry / "stat").read_text(encoding="utf-8", errors="replace")
-            parents[pid] = int(stat[stat.rindex(")") + 2 :].split()[1])
-            if marker_entry in (entry / "environ").read_bytes().split(b"\0"):
-                marked.add(pid)
-        except (OSError, ValueError, IndexError):
-            continue
-    descendants = set()
-    frontier = [root_pid]
-    while frontier:
-        current = frontier.pop()
-        for pid, parent in parents.items():
-            if parent == current and pid not in descendants:
-                descendants.add(pid)
-                frontier.append(pid)
-    invocation_ids = (descendants | marked | {root_pid}) - {os_getpid()}
-    return invocation_ids
-
-
-def signal_invocation(process, marker, signal_number):
-    """Signal the invocation's process group and every collected invocation process."""
-    try:
-        os_killpg(process.pid, signal_number)
-    except ProcessLookupError:
-        # The group has already exited; marked invocation processes that left it are still signalled below.
-        LOGGER.debug(
-            "Invocation process group %s exited before signal %s",
-            process.pid,
-            signal_number,
-        )
-    except PermissionError:
-        # Some kernels refuse a group signal once the reaped leader leaves only exited members.
-        if process.poll() is None:
-            raise
-    for pid in invocation_process_ids(process.pid, marker):
-        try:
-            os_kill(pid, signal_number)
-        except ProcessLookupError:
-            continue
-
-
-def terminate_process_group(process, marker):
-    """Terminate a tool invocation and all descendants, always escalating to SIGKILL."""
-    signal_invocation(process, marker, signal_SIGTERM)
-    try:
-        process.wait(timeout=0.25)
-    except (ChildProcessError, subprocess_TimeoutExpired):
-        LOGGER.warning(
-            "tool invocation %s did not fully stop after SIGTERM; sending SIGKILL",
-            process.pid,
-        )
-    # The leader may exit on SIGTERM while a descendant ignores it, so the kill never depends on the leader.
-    signal_invocation(process, marker, signal_SIGKILL)
-    if process.poll() is None:
-        try:
-            process.wait(timeout=0.25)
-        except ChildProcessError:
-            return False
-        except subprocess_TimeoutExpired as err:
-            raise ToolError(
-                f"tool process group {process.pid} remained alive after SIGKILL",
-                code="process_termination_failed",
-                status=500,
-            ) from err
-    return False
-
-
-def invocation_activity(process, marker, outputs: tuple) -> tuple:
-    """Read how far a running tool invocation has got: its processes' CPU ticks and its output sizes.
-
-    The ticks are each live invocation process's own and its reaped children's user and system time. Without /proc only
-    the output sizes are read. Any change between two readings is activity.
-    """
-    ticks = 0
-    proc = Path("/proc")
-    if proc.is_dir():
-        for pid in invocation_process_ids(process.pid, marker):
-            try:
-                stat = (proc / str(pid) / "stat").read_text(encoding="utf-8", errors="replace")
-                ticks += sum(int(value) for value in stat[stat.rindex(")") + 2 :].split()[11:15])
-            except (OSError, ValueError, IndexError):
-                continue
-    activity = (ticks, *(os_fstat(output.fileno()).st_size for output in outputs))
-    return activity
 
 
 def internal_run_process(
@@ -433,14 +353,22 @@ def internal_run_process(
     cwd="",
     environment=DEFAULT_ARGUMENT_DICT,
     inherited_descriptors: tuple = (),
+    stdout_parser=None,
+    parsed_exit_codes: tuple = (0,),
 ):
-    """Run one process until it ends or stalls and return a structured camelCase result with its whole output.
+    """Run one process until it ends or stalls and return a structured camelCase result with its output.
 
     The output goes to anonymous files on disk while the process runs, so a large output costs disk space, not memory.
+    Each output in the result is its text when one of the caller's read parts holds it, else the reference of the
+    output kept for the caller (`run_output`), so no output is held whole. With `stdout_parser`, a run that ended with
+    one of `parsed_exit_codes` has its stdout read from disk a line at a time by the parser (`output_lines`), and the
+    parser's value is the result's stdout; any other run's stdout is answered as an output is.
     A watchdog ends a process that has stopped making progress: once neither the invocation's CPU time nor its output
     has moved for PROCESS_WATCHDOG_SECONDS, the invocation is ended and the result is `stalled`. A process that keeps
     working runs to its end. When the direct child exits, its process group is ended: a background descendant still
     holding the output open cannot keep a finished tool running.
+    The program starts with the signals the server holds unblocked (`program_command`), and its leader is held from the
+    server's orphan reaper until this wait has its exit status (`FIRST_PROCESS`).
     """
     if environment is DEFAULT_ARGUMENT_DICT:
         environment = DEFAULT_ARGUMENT_DICT.copy()
@@ -451,46 +379,56 @@ def internal_run_process(
         INVOCATION_MARKER_VARIABLE: marker,
     }
     with tempfile_TemporaryFile() as stdout_file, tempfile_TemporaryFile() as stderr_file:
-        process = subprocess_Popen(
-            command,
-            # The run-command tool executes the caller's shell command line inside the sandbox by design.
-            shell=shell,  # nosec B602
-            cwd=cwd or current_workspace(),
-            env=process_environment,
-            stdout=stdout_file,
-            stderr=stderr_file,
-            start_new_session=True,
-            pass_fds=inherited_descriptors,
+        process = FIRST_PROCESS.start(
+            functools_partial(
+                subprocess_Popen,
+                # The run-command tool executes the caller's shell command line inside the sandbox by design.
+                program_command(command, shell, process_environment),
+                cwd=cwd or current_workspace(),
+                env=process_environment,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                start_new_session=True,
+                pass_fds=inherited_descriptors,
+            )
         )
         outputs = (stdout_file, stderr_file)
-        activity = invocation_activity(process, marker, outputs)
-        active_at = time_monotonic()
-        stalled = False
-        while not stalled and process.poll() is None:
-            try:
-                process.wait(timeout=WATCHDOG_POLL_SECONDS)
-            except subprocess_TimeoutExpired:
-                observed = invocation_activity(process, marker, outputs)
-                now = time_monotonic()
-                if observed != activity:
-                    activity, active_at = observed, now
-                stalled = now - active_at >= PROCESS_WATCHDOG_SECONDS
-        if stalled:
-            LOGGER.warning(
-                "tool invocation %s ended by the watchdog: no CPU time or output for %s s",
-                process.pid,
-                PROCESS_WATCHDOG_SECONDS,
-            )
-        terminate_process_group(process, marker)
-        return_code = process.wait()
+        try:
+            activity = invocation_activity(process, marker, outputs)
+            active_at = time_monotonic()
+            stalled = False
+            while not stalled and process.poll() is None:
+                try:
+                    process.wait(timeout=WATCHDOG_POLL_SECONDS)
+                except subprocess_TimeoutExpired:
+                    observed = invocation_activity(process, marker, outputs)
+                    now = time_monotonic()
+                    if observed != activity:
+                        activity, active_at = observed, now
+                    stalled = now - active_at >= PROCESS_WATCHDOG_SECONDS
+            if stalled:
+                LOGGER.warning(
+                    "tool invocation %s ended by the watchdog: no CPU time or output for %s s",
+                    process.pid,
+                    PROCESS_WATCHDOG_SECONDS,
+                )
+            terminate_process_group(process, marker)
+            return_code = process.wait()
+        finally:
+            FIRST_PROCESS.release(process)
         if stalled:
             return_code = -1
-        stdout_file.seek(0)
-        stderr_file.seek(0)
+        texts = {}
+        for stream, output in zip(RUN_OUTPUT_STREAMS, outputs):
+            output.seek(0)
+            if stream == "stdout" and stdout_parser is not None and not stalled and return_code in parsed_exit_codes:
+                texts[stream] = stdout_parser(output_lines(output))
+            else:
+                texts[stream] = run_output(output, stream, return_code)
         computed_return_value = {
             "ok": return_code == 0,
-            "stdout": stdout_file.read().decode("utf-8", errors="replace"),
-            "stderr": stderr_file.read().decode("utf-8", errors="replace"),
+            "stdout": texts.get("stdout", ""),
+            "stderr": texts.get("stderr", ""),
             "exitCode": return_code,
             "stalled": stalled,
             "durationMs": round((time_monotonic() - started) * 1000, 3),
@@ -498,10 +436,59 @@ def internal_run_process(
     return computed_return_value
 
 
-def run_git(arguments):
+def run_output_folder(root_task_id: str) -> Path:
+    """The folder that keeps the large run outputs of one root Task, beside the Task folders; the root Task is the
+    request's own, already held to a canonical UUIDv7 (`request_working_context`)."""
+    folder = WORKSPACE / RUN_OUTPUT_FOLDERS / root_task_id
+    return folder
+
+
+def run_output(output, stream: str, exit_code: int):
+    """One finished output of a run as its reply carries it: its text when one of the caller's read parts holds it,
+    else its reference, `{"text_by_reference": {"sha256", "utf8_bytes"}}`, the shape a stage result names a large text
+    by (tapestry/evidence/result_text.py).
+
+    A larger output is kept as UTF-8, invalid bytes replaced as a carried text replaces them, under the run's request
+    and stream in its root Task's output folder, for the caller to read a part at a time (`run_output_read`) and hold to
+    the reference. It is copied and measured a block at a time, so the Workspace never holds it whole, and replaces a
+    kept output of the same request only once it is whole. A tool that runs several processes names at most one run's
+    output of each stream in its reply, the one whose kept output is current.
+
+    An output is answered only within a tool request; outside one nobody reads it. Naming a read part is how a caller
+    says it reads by reference; a caller that named none reads text only, so an output larger than the shared part is
+    refused it as 413/`response_too_large`, which says the process ran and how it ended, since its effects stand.
+    """
+    context = WORKING_CONTEXT.get()
+    part = context.get("read_part_bytes", 0)
+    if type(part) is not int or part < 1:
+        raise RuntimeError("A process output is answered only within a tool request, which names its read part")
+    size = os_fstat(output.fileno()).st_size
+    if size <= part:
+        text = output.read().decode("utf-8", errors="replace")
+        # A replaced byte takes three bytes in UTF-8, so a text decoded from a part can still be larger than one.
+        if len(text) * 4 <= part or len(text.encode("utf-8")) <= part:
+            return text
+        output.seek(0)
+    if not context.get("reads_references", False):
+        raise ToolError(
+            f"The process ran and ended with exit code {exit_code}, and its {stream} of {size} bytes is larger than one "
+            "read part; this call names no read part to read it in",
+            code="response_too_large",
+            status=413,
+        )
+    folder = run_output_folder(context.get("root_task_id", ""))
+    with FILE_LOCK:
+        folder.mkdir(parents=True, exist_ok=True)
+        if folder.resolve() != folder:
+            raise ToolError("A run's kept output cannot leave its folder", code="path_escape", status=400)
+    reference = keep_output(output, folder / f"{context.get('request_id', '')}.{stream}", COPY_BLOCK_BYTES)
+    return reference
+
+
+def run_git(arguments, stdout_parser=None):
     """Run Git without allowing an interactive credential prompt."""
     command = ["git", *arguments]
-    result = internal_run_process(command, environment=GIT_ENV)
+    result = internal_run_process(command, environment=GIT_ENV, stdout_parser=stdout_parser)
     return result
 
 
@@ -509,7 +496,7 @@ def require_process_success(result, operation):
     if result.get("ok", False):
         return result
     code = "stalled" if result.get("stalled", False) else "process_failed"
-    detail = (result.get("stderr", "") or result.get("stdout", "")).strip()
+    detail = output_detail(result.get("stderr", "")) or output_detail(result.get("stdout", ""))
     raise ToolError(
         f"{operation} failed with exit code {result.get('exitCode', -1)}" + (f": {detail}" if detail else ""),
         code=code,
@@ -534,24 +521,48 @@ def file_read(path: str, offset: int = -1, length: int = 0):
         with FILE_LOCK:
             content = workspace_file_text(target)
         return content
+    require_part_bounds(offset, length)
+    with FILE_LOCK:
+        part = workspace_file_part(target, offset, length, current_workspace())
+    return part
+
+
+@tool
+def run_output_read(run_request_id: str, stream: str, offset: int, length: int):
+    """Read one part of a process's stdout or stderr that a tool's reply, or its error, named as kept under the request
+    `run_request_id`: up to `length` UTF-8 bytes from `offset`, with the kept output's size and identity, as a part read
+    of a file answers."""
+    if type(run_request_id) is not str or not re_fullmatch(REQUEST_ID_PATTERN, run_request_id) or stream not in RUN_OUTPUT_STREAMS:
+        raise ToolError("A run output read names a run's request and its stdout or stderr", code="bad_arguments", status=400)
+    require_part_bounds(offset, length)
+    folder = run_output_folder(WORKING_CONTEXT.get().get("root_task_id", ""))
+    part = workspace_file_part(folder / f"{run_request_id}.{stream}", offset, length, WORKSPACE)
+    return part
+
+
+def require_part_bounds(offset: object, length: object) -> None:
+    """Refuse a part read whose offset or length is not one answer's, or whose part the Workspace's memory cannot hold."""
     if type(offset) is not int or type(length) is not int or offset < 0 or not 0 < length <= PAYLOAD_LIMIT_BYTES:
         raise ToolError("A part read needs an offset of 0 or more and a length within one answer", code="bad_arguments", status=400)
     if not whole_read_fits(length):
         raise ToolError("A part this long is larger than the Workspace's memory can answer", code="file_too_large", status=413)
-    with FILE_LOCK:
-        part = workspace_file_part(target, offset, length)
-    return part
 
 
-def workspace_file_part(target, offset: int, length: int) -> dict:
-    """Read up to `length` raw bytes of a regular file from `offset`, with the file's size and identity as opened, so a
-    reader assembles a file of any size in parts and knows when the file changed between them."""
+def workspace_regular_file(root: Path, target: Path) -> tuple:
+    """The regular file `target` beneath `root`, opened by descriptor, and its state; anything else is `not_file`."""
     try:
-        opened, state = scoped_repository_file(current_workspace(), target)
+        opened_file = scoped_repository_file(root, target)
     except ToolError as err:
         if err.code == "bad_arguments":
             raise ToolError("Expected a regular file", code="not_file", status=400) from err
         raise
+    return opened_file
+
+
+def workspace_file_part(target, offset: int, length: int, root: Path) -> dict:
+    """Read up to `length` raw bytes of a regular file beneath `root` from `offset`, with the file's size and identity as
+    opened, so a reader assembles a file of any size in parts and knows when the file changed between them."""
+    opened, state = workspace_regular_file(root, target)
     with opened:
         opened.seek(offset)
         data = opened.read(length)
@@ -586,12 +597,7 @@ def whole_read_fits(size: int) -> bool:
 
 def workspace_file_text(target) -> str:
     """Read whole regular-file bytes through the canonical descriptor owner."""
-    try:
-        opened, state = scoped_repository_file(current_workspace(), target)
-    except ToolError as err:
-        if err.code == "bad_arguments":
-            raise ToolError("Expected a regular file", code="not_file", status=400) from err
-        raise
+    opened, state = workspace_regular_file(current_workspace(), target)
     with opened:
         if not whole_read_fits(state.st_size):
             raise ToolError(
@@ -608,8 +614,9 @@ def workspace_file_text(target) -> str:
 
 
 @tool
-def file_read_scoped(repository_root: str, path: str):
-    """Read exact UTF-8 bytes beneath one resolved repository root with provenance."""
+def file_read_scoped(repository_root: str, path: str, offset: int = -1, length: int = 0):
+    """Read exact UTF-8 bytes beneath one resolved repository root with provenance; with `offset` and `length`, one part
+    of the file's raw bytes, as `file_read` answers a part, with the same provenance."""
     if type(repository_root) is not str or not repository_root or type(path) is not str or not path:
         raise ToolError(
             "Scoped read requires repository root and relative path",
@@ -627,6 +634,12 @@ def file_read_scoped(repository_root: str, path: str):
     target = (root / path).resolve()
     if not root.is_dir() or not target.is_relative_to(root):
         raise ToolError("Scoped read escaped its repository root", code="path_escape", status=400)
+    provenance = {"repository_root": str(root), "resolved_path": str(target), "relative_path": str(target.relative_to(root))}
+    if offset != -1 or length != 0:
+        require_part_bounds(offset, length)
+        with FILE_LOCK:
+            part = workspace_file_part(target, offset, length, root)
+        return {**provenance, **part}
     with FILE_LOCK:
         source = scoped_repository_bytes(root, target)
     try:
@@ -634,9 +647,7 @@ def file_read_scoped(repository_root: str, path: str):
     except UnicodeDecodeError as err:
         raise ToolError("Scoped source is not UTF-8", code="invalid_source_encoding", status=422) from err
     scoped_read = {
-        "repository_root": str(root),
-        "resolved_path": str(target),
-        "relative_path": str(target.relative_to(root)),
+        **provenance,
         "content": content,
         "content_sha256": hashlib_sha256(source).hexdigest(),
         "byte_count": len(source),
@@ -656,9 +667,16 @@ def whole_file_bytes(opened, state) -> bytes:
 
 
 def scoped_repository_bytes(root: Path, target: Path) -> bytes:
-    """The whole of a file beneath `root`, opened by descriptor (`scoped_repository_file`)."""
+    """The whole of a file beneath `root`, opened by descriptor (`scoped_repository_file`); a file larger than the
+    Workspace's memory can answer whole is refused, naming the part form that reads it."""
     opened, state = scoped_repository_file(root, target)
     with opened:
+        if not whole_read_fits(state.st_size):
+            raise ToolError(
+                "File is larger than the Workspace's memory can answer whole; read it in parts with offset and length",
+                code="file_too_large",
+                status=413,
+            )
         source = whole_file_bytes(opened, state)
     return source
 
@@ -733,47 +751,111 @@ def file_write(path: str, content: str):
     if not isinstance(content, str):
         raise ToolError("content must be a string", code="bad_arguments", status=400)
     target = resolve_path(path)
+    encoded = content.encode("utf-8")
     with FILE_LOCK:
-        atomic_write_text(target, content)
+        atomic_write(target, functools_partial(write_bytes, encoded))
     computed_return_value = {
         "path": str(target.relative_to(current_workspace())),
-        "bytesWritten": len(content.encode("utf-8")),
+        "bytesWritten": len(encoded),
     }
     return computed_return_value
 
 
 @tool
 def file_patch(path: str, patches: list):
-    """Atomically apply ordered find/replace patches to a file."""
+    """Atomically apply ordered find/replace patches to a UTF-8 file: each replaces the first occurrence of its `old`
+    text in the file as the patches before it left it. The file is checked and patched a block at a time on disk, one
+    pass per patch, so a file of any size is patched without the Workspace holding it whole."""
     target = resolve_path(path)
     if not isinstance(patches, list):
         raise ToolError("patches must be a list", code="bad_arguments", status=400)
+    replacements = [patch_replacement(patch) for patch in patches]
     with FILE_LOCK:
-        content = workspace_file_text(target)
-        for patch in patches:
-            if not isinstance(patch, dict) or "old" not in patch or "new" not in patch:
-                raise ToolError(
-                    "each patch requires old and new strings",
-                    code="bad_arguments",
-                    status=400,
-                )
-            old = patch.get("old", "")
-            new = patch.get("new", "")
-            if not isinstance(old, str) or not isinstance(new, str) or not old:
-                raise ToolError(
-                    "patch old/new values must be strings and old must not be empty",
-                    code="bad_arguments",
-                    status=400,
-                )
-            if old not in content:
-                raise ToolError(f"Not found: {old[:50]}...", code="patch_target_missing")
-            content = content.replace(old, new, 1)
-        atomic_write_text(target, content)
+        current = workspace_regular_file(current_workspace(), target)[0]
+        try:
+            require_utf8(current)
+            for old, new in replacements:
+                patched = tempfile_TemporaryFile(dir=target.parent)
+                found = replace_first(current, patched, old, new)
+                current.close()
+                current = patched
+                if not found:
+                    raise ToolError(f"Not found: {old.decode('utf-8')[:50]}...", code="patch_target_missing")
+                current.seek(0)
+            atomic_write(target, functools_partial(shutil_copyfileobj, current, length=COPY_BLOCK_BYTES))
+        finally:
+            current.close()
     computed_return_value = {
         "path": str(target.relative_to(current_workspace())),
         "patchesApplied": len(patches),
     }
     return computed_return_value
+
+
+@tool
+def file_write_part(path: str, offset: int, data: bytes, size: int, sha256: str):
+    """Write one part of a file of any content and size: `data`, raw bytes as a part read's `data` carries them, at
+    `offset` of the file of `size` bytes whose SHA-256 is `sha256`. A part at offset 0 begins the write, and each later
+    part starts where the bytes received end. The file appears whole under `path`, replacing any file there, when its
+    last part is in and its bytes have that size and SHA-256; until then nothing of it is under `path` (`part_write`)."""
+    target = resolve_path(path)
+    folder = WORKSPACE / PART_WRITE_FOLDERS / WORKING_CONTEXT.get().get("root_task_id", "")
+    relative = str(target.relative_to(current_workspace()))
+    with FILE_LOCK:
+        try:
+            written = write_part(folder, target, relative, offset, data, size, sha256)
+        except PartWriteRefusal as err:
+            raise ToolError(str(err), code=err.code, status=err.status, details=err.details) from err
+    return written
+
+
+def patch_replacement(patch) -> tuple:
+    """A patch's `old` and `new` texts as UTF-8 bytes; `old` is not empty."""
+    if not isinstance(patch, dict) or "old" not in patch or "new" not in patch:
+        raise ToolError("each patch requires old and new strings", code="bad_arguments", status=400)
+    old, new = patch.get("old", ""), patch.get("new", "")
+    if not isinstance(old, str) or not isinstance(new, str) or not old:
+        raise ToolError("patch old/new values must be strings and old must not be empty", code="bad_arguments", status=400)
+    return old.encode("utf-8"), new.encode("utf-8")
+
+
+def require_utf8(opened) -> None:
+    """Refuse a file that is not UTF-8, decoding it a block at a time, and return to its start."""
+    decoder = codecs_getincrementaldecoder("utf-8")()
+    try:
+        while block := opened.read(COPY_BLOCK_BYTES):
+            decoder.decode(block)
+        decoder.decode(b"", final=True)
+    except UnicodeDecodeError as err:
+        raise ToolError("File is not UTF-8", code="invalid_source_encoding", status=422) from err
+    opened.seek(0)
+
+
+def replace_first(source, destination, old: bytes, new: bytes) -> bool:
+    """Copy `source` to `destination` a block at a time with the first occurrence of `old` replaced by `new`; whether it
+    occurred. Only the last `len(old) - 1` bytes of what was read can begin a match not yet seen, so only they are held
+    back. In UTF-8 a whole character's bytes never match inside another character's, so a byte match is a text match."""
+    window, found = b"", False
+    while block := source.read(COPY_BLOCK_BYTES):
+        if found:
+            destination.write(block)
+            continue
+        window += block
+        position = window.find(old)
+        if position >= 0:
+            destination.write(window[:position] + new + window[position + len(old) :])
+            window, found = b"", True
+            continue
+        settled = len(window) - (len(old) - 1)
+        if settled > 0:
+            destination.write(window[:settled])
+            window = window[settled:]
+    destination.write(window)
+    return found
+
+
+def write_bytes(data: bytes, handle) -> None:
+    handle.write(data)
 
 
 @tool
@@ -896,26 +978,14 @@ def file_search(pattern: str, path: str = ".", max_results: int = 0):
     """Search files with ripgrep and return structured matches: every match, or the caller's positive `max_results`."""
     target = resolve_path(path)
     max_results = max(0, int(max_results))
-    result = internal_run_process(["rg", "--json", "-e", pattern, "--", str(target)])
+    result = internal_run_process(
+        ["rg", "--json", "-e", pattern, "--", str(target)],
+        stdout_parser=functools_partial(search_matches, max_results=max_results, base=current_workspace()),
+        parsed_exit_codes=(0, 1),
+    )
     if result.get("exitCode", ()) not in (0, 1):
         require_process_success(result, "file search")
-    matches = []
-    for line in result.get("stdout", "").splitlines():
-        if not line:
-            continue
-        data = json_loads(line)
-        if data.get("type", "") != "match":
-            continue
-        match = data.get("data", {})
-        matches.append(
-            {
-                "file": str(Path(match.get("path", {}).get("text", "")).relative_to(current_workspace())),
-                "line": match.get("line_number", 0),
-                "content": match.get("lines", {}).get("text", "").strip(),
-            }
-        )
-        if max_results and len(matches) >= max_results:
-            break
+    matches = result.get("stdout", [])
     computed_return_value = {
         "matches": matches,
         "truncated": bool(max_results) and len(matches) >= max_results,
@@ -951,14 +1021,31 @@ def file_search_scoped(repository_root: str, symbol: str, max_results: int = 0):
             "--",
             str(root),
         ],
+        stdout_parser=functools_partial(scoped_matches, root=root),
+        parsed_exit_codes=(0, 1),
     )
     if result.get("exitCode", -1) not in (0, 1):
         require_process_success(result, "scoped Python search")
+    matches = result.get("stdout", [])
+    truncated = False
+    if max_results and len(matches) > max_results:
+        matches = matches[:max_results]
+        truncated = True
+    search = {
+        "repository_root": str(root),
+        "symbol": symbol,
+        "matches": matches,
+        "truncated": truncated,
+    }
+    return search
+
+
+def scoped_matches(lines, root: Path) -> list:
+    """Each distinct Python-source path beneath `root` that ripgrep's JSON lines name, with its first matching line,
+    read one line at a time and sorted by path."""
     matches_by_path = {}
-    for line in result.get("stdout", "").splitlines():
-        if not line:
-            continue
-        data = json_loads(line)
+    for line in lines:
+        data = json_loads(line) if line.strip() else {}
         if data.get("type", "") != "match":
             continue
         selected = Path(data.get("data", {}).get("path", {}).get("text", "")).resolve()
@@ -971,21 +1058,11 @@ def file_search_scoped(repository_root: str, symbol: str, max_results: int = 0):
         relative = str(selected.relative_to(root))
         if relative not in matches_by_path:
             matches_by_path[relative] = {
-                "relative_path": str(selected.relative_to(root)),
+                "relative_path": relative,
                 "line": data.get("data", {}).get("line_number", 0),
             }
     matches = [matches_by_path.get(path, {}) for path in sorted(matches_by_path)]
-    truncated = False
-    if max_results and len(matches) > max_results:
-        matches = matches[:max_results]
-        truncated = True
-    search = {
-        "repository_root": str(root),
-        "symbol": symbol,
-        "matches": matches,
-        "truncated": truncated,
-    }
-    return search
+    return matches
 
 
 PACKAGE_PATTERN = re_compile(r"^[a-zA-Z0-9_.-]+([=<>!~\[\]][a-zA-Z0-9._,<>=!~\[\]]*)?$")
@@ -1027,10 +1104,10 @@ def pip_uninstall(packages: list):
 def pip_list():
     """List installed packages."""
     result = require_process_success(
-        internal_run_process(["pip", "list", "--format=json"]),
+        internal_run_process(["pip", "list", "--format=json"], stdout_parser=json_document),
         "pip list",
     )
-    computed_return_value = json_loads(result.get("stdout", ""))
+    computed_return_value = result.get("stdout", [])
     return computed_return_value
 
 
@@ -1082,12 +1159,12 @@ def git_init(branch: str = "main"):
     validate_git_atom(branch, "branch")
     validation = run_git(["check-ref-format", "--branch", branch])
     require_process_success(validation, "git branch validation")
-    result = run_git(["init", f"--initial-branch={branch}"])
+    result = run_git(["init", f"--initial-branch={branch}"], text_lines)
     require_process_success(result, "git init")
     output = {
         "branch": branch,
         "initialized": True,
-        "message": result.get("stdout", "").strip(),
+        "message": "\n".join(result.get("stdout", [])),
     }
     return output
 
@@ -1124,16 +1201,16 @@ def git_clone(repo_url: str, branch: str = "main"):
 def git_status():
     """Return the current repository branch and changes."""
     branch = require_process_success(
-        run_git(["branch", "--show-current"]),
+        run_git(["branch", "--show-current"], text_lines),
         "git branch",
     )
     status = require_process_success(
-        run_git(["status", "--porcelain"]),
+        run_git(["status", "--porcelain"], text_lines),
         "git status",
     )
     computed_return_value = {
-        "branch": branch.get("stdout", "").strip(),
-        "changes": [line for line in status.get("stdout", "").splitlines() if line],
+        "branch": "".join(branch.get("stdout", [])[:1]),
+        "changes": status.get("stdout", []),
     }
     return computed_return_value
 
@@ -1168,10 +1245,10 @@ def git_push(remote: str = "origin", branch: str = ""):
     validate_git_atom(remote, "remote")
     if not branch:
         current = require_process_success(
-            run_git(["branch", "--show-current"]),
+            run_git(["branch", "--show-current"], text_lines),
             "git branch",
         )
-        branch = current.get("stdout", "").strip()
+        branch = "".join(current.get("stdout", [])[:1])
     validate_git_atom(branch, "branch")
     result = run_git(["push", "--", remote, branch])
     require_process_success(result, "git push")
@@ -1179,35 +1256,21 @@ def git_push(remote: str = "origin", branch: str = ""):
 
 
 @tool
-def git_log(limit: int = 20):
-    """Return the requested number of recent Git commits as structured commit records."""
+def git_log(limit: int = 0):
+    """Return the repository's Git commits, newest first, as structured commit records: every commit, or the caller's
+    positive `limit` of the most recent."""
     try:
         requested_limit = int(limit)
     except (TypeError, ValueError) as err:
         raise ToolError("limit must be an integer", code="bad_arguments", status=400) from err
-    if requested_limit < 1:
-        raise ToolError("limit must be positive", code="bad_arguments", status=400)
-    result = run_git(
-        [
-            "log",
-            f"--max-count={requested_limit + 1}",
-            "--format=%H%x00%h%x00%aI%x00%s",
-        ],
-    )
+    if requested_limit < 0:
+        raise ToolError("limit must be 0 for every commit or a positive count", code="bad_arguments", status=400)
+    count = [f"--max-count={requested_limit + 1}"] if requested_limit else []
+    result = run_git(["log", *count, "--format=%H%x00%h%x00%aI%x00%s"], log_commits)
     require_process_success(result, "git log")
-    lines = result.get("stdout", "").splitlines()
-    truncated = len(lines) > requested_limit
-    commits = []
-    for line in lines[:requested_limit]:
-        commit_hash, short_hash, authored_at, subject = line.split("\x00", 3)
-        commits.append(
-            {
-                "hash": commit_hash,
-                "shortHash": short_hash,
-                "authoredAt": authored_at,
-                "subject": subject,
-            }
-        )
+    listed = result.get("stdout", [])
+    truncated = bool(requested_limit) and len(listed) > requested_limit
+    commits = listed[:requested_limit] if requested_limit else listed
     output = {"commits": commits, "truncated": truncated}
     return output
 
@@ -1368,15 +1431,18 @@ def build_readiness_report():
 
 
 class WorkspaceService(WorkspaceServiceServicer):
-    """Own authenticated RPC admission, accepted work, tool slots and one health projection."""
+    """Own authenticated RPC admission, accepted work, tool slots and one health projection.
+
+    Every call runs on a thread of its own, and a tool call that finds every tool slot taken waits its turn in arrival
+    order (`call_admission`), so no call is refused for want of a thread or a slot."""
 
     def __init__(self, auth_token: str, args):
         self.auth_token = auth_token
         self.incarnation = str(uuid4())
         self.max_concurrent_requests = args.max_concurrent_requests
-        self.request_slots = threading_BoundedSemaphore(self.max_concurrent_requests)
+        self.turns = ToolTurns(self.max_concurrent_requests)
         self.health = WorkspaceHealth(self.incarnation)
-        self.workers = ThreadPoolExecutor(max_workers=self.max_concurrent_requests + CONTROL_WORKERS)
+        self.workers = CallThreads()
         self.rpc = grpc_server(
             self.workers,
             options=(
@@ -1386,7 +1452,6 @@ class WorkspaceService(WorkspaceServiceServicer):
                 # instead of counting it as abuse and closing the connection.
                 ("grpc.http2.max_ping_strikes", 0),
             ),
-            maximum_concurrent_rpcs=self.max_concurrent_requests + CONTROL_WORKERS,
         )
         add_WorkspaceServiceServicer_to_server(self, self.rpc)
         self.port = 0
@@ -1403,7 +1468,8 @@ class WorkspaceService(WorkspaceServiceServicer):
 
     def close(self) -> None:
         """Stop admission and wait for every call in progress to finish and send its reply, with no grace after which a
-        call is cancelled; a call whose caller disconnected still runs its tool function to its end."""
+        call is cancelled; a tool call still waiting for its turn takes it and runs, and a call whose caller disconnected
+        still runs its tool function to its end."""
         if not self.closed:
             self.closed = True
             self.health.grpc_state["available"] = False
@@ -1417,7 +1483,7 @@ class WorkspaceService(WorkspaceServiceServicer):
             self.health.refused(operation, "UNAUTHORIZED", "unauthorized")
             context.abort(StatusCode.UNAUTHENTICATED, "A valid Workspace service key is required")
 
-    def decode(self, request, context, fields: set | tuple) -> dict:
+    def decode(self, request, context, fields) -> dict:
         try:
             payload = decode_envelope(request.payload, PAYLOAD_LIMIT_BYTES, "Workspace")
             purposes = fields if type(fields) is tuple else (fields,)
@@ -1425,8 +1491,12 @@ class WorkspaceService(WorkspaceServiceServicer):
                 raise ValueError("Workspace RPC fields differ from its operation contract")
             if "request_id" in payload:
                 identifier = payload.get("request_id", "")
-                if type(identifier) is not str or not re_fullmatch(r"[A-Za-z0-9._:-]{1,128}", identifier):
+                if type(identifier) is not str or not re_fullmatch(REQUEST_ID_PATTERN, identifier):
                     raise ValueError("Workspace request ID is invalid")
+            if "read_part_bytes" in payload:
+                part = payload.get("read_part_bytes", 0)
+                if type(part) is not int or not 0 < part <= PAYLOAD_LIMIT_BYTES:
+                    raise ValueError("Workspace read part is not a length within one answer")
         except (TypeError, ValueError, OverflowError) as err:
             self.health.refused("request", "INVALID_ARGUMENT", "invalid_request")
             context.abort(StatusCode.INVALID_ARGUMENT, str(err))
@@ -1508,7 +1578,16 @@ class WorkspaceService(WorkspaceServiceServicer):
 
     def InvokeTool(self, request, context):
         self.authorize(context, "tool")
-        payload = self.decode(request, context, {"name", "arguments", "request_id", "root_task_id"})
+        # A call may name the read part its caller reads in; one that names none is answered in the shared read part and,
+        # having no part reader, is refused an output larger than it. A run's reply carries at most one part of each output.
+        payload = self.decode(
+            request,
+            context,
+            (
+                {"name", "arguments", "request_id", "root_task_id"},
+                {"name", "arguments", "request_id", "root_task_id", "read_part_bytes"},
+            ),
+        )
         name = payload.get("name", "")
         arguments = payload.get("arguments", {})
         root = payload.get("root_task_id", "")
@@ -1530,11 +1609,12 @@ class WorkspaceService(WorkspaceServiceServicer):
         if fn is False:
             response = self.refuse(identifier, operation, 404, "unknown_tool", "Workspace tool is unknown", working)
             return response
-        if not self.request_slots.acquire(blocking=False):
-            response = self.refuse(identifier, operation, 429, "busy", "Workspace tool concurrency limit reached", working)
-            return response
+        arrived = time_monotonic()
+        key = self.health.received(name, {"request_id": identifier, "root_task_id": root}, waits=True)
+        # Accepted: the call waits here, with no limit, until every tool call that arrived before it has taken a slot.
+        self.turns.take()
+        self.health.admitted(key)
         started = time_monotonic()
-        key = self.health.received(name, {"request_id": identifier, "root_task_id": root})
         context_token = False
         observation = {"request_id": identifier, "status_code": 200, "result": {}, "workspace_context": working}
         code = ""
@@ -1544,11 +1624,18 @@ class WorkspaceService(WorkspaceServiceServicer):
                 raise ToolError("Tool arguments repeat a normalized name", code="bad_arguments", status=400)
             inspect_signature(fn).bind(**normalized)
             resolved = request_working_context(root)
-            context_token = WORKING_CONTEXT.set(resolved)
+            context_token = WORKING_CONTEXT.set(
+                {
+                    **resolved,
+                    "request_id": identifier,
+                    "read_part_bytes": payload.get("read_part_bytes", READ_PART_LIMIT_BYTES),
+                    "reads_references": "read_part_bytes" in payload,
+                }
+            )
             observation["result"] = fn(**normalized)
         except ToolError as err:
             code = err.code
-            observation.update({"status_code": err.status, "result": {"error": {"code": code, "message": str(err)}}})
+            observation.update({"status_code": err.status, "result": {"error": {**err.details, "code": code, "message": str(err)}}})
         except (OSError, TypeError, ValueError) as err:
             status, code, message = tool_failure(err)
             observation.update({"status_code": status, "result": {"error": {"code": code, "message": message}}})
@@ -1572,18 +1659,19 @@ class WorkspaceService(WorkspaceServiceServicer):
                 )
                 response = self.encode(observation)
             finally:
-                self.request_slots.release()
+                self.turns.leave()
                 result = observation.get("result", {})
                 outcome = (
                     code.upper() if code else "PROCESS_FAILED" if type(result) is dict and result.get("ok", True) is False else "OK"
                 )
                 self.health.finished(key, outcome, code)
                 LOGGER.info(
-                    "tool_request request_id=%s tool=%s status=%s outcome=%s duration_ms=%.3f",
+                    "tool_request request_id=%s tool=%s status=%s outcome=%s waited_ms=%.3f duration_ms=%.3f",
                     identifier,
                     name,
                     observation.get("status_code", 0),
                     outcome,
+                    (started - arrived) * 1000,
                     (time_monotonic() - started) * 1000,
                 )
         return response
@@ -1618,71 +1706,6 @@ def tool_failure(error: Exception) -> tuple:
     return failure
 
 
-class HealthHTTPServer(ThreadingHTTPServer):
-    """Own the observation listener while the gRPC service owns its safe snapshot."""
-
-    daemon_threads = False
-
-    def __init__(self, address: tuple, owner: WorkspaceService, request_read_watchdog_seconds: float):
-        self.owner = owner
-        self.request_read_watchdog_seconds = request_read_watchdog_seconds
-        super().__init__(address, HealthHandler)
-
-    def server_bind(self):
-        TCPServer.server_bind(self)
-        address = self.server_address
-        if not isinstance(address, tuple) or len(address) != 2:
-            raise RuntimeError("Workspace health listener requires an internet address")
-        host, port = address
-        if type(host) is not str or type(port) is not int:
-            raise RuntimeError("Workspace health listener returned an invalid address")
-        self.server_name = host
-        self.server_port = port
-
-
-class HealthHandler(BaseHTTPRequestHandler):
-    """Public observation only; tools and manifests have no HTTP routes."""
-
-    server: HealthHTTPServer
-    server_version = "TapestryWorkspace"
-
-    def setup(self):
-        super().setup()
-        # Each read waits until the client sends again or has been silent for the watchdog interval.
-        self.connection.settimeout(self.server.request_read_watchdog_seconds)
-
-    def do_GET(self):
-        body, media_type = page_file(self.path)
-        status = 200
-        if self.path == "/metrics":
-            body = health_exposition(self.server.owner.health_snapshot()).encode("utf-8")
-            media_type = METRICS_CONTENT_TYPE
-        if not media_type:
-            media_type = "application/json"
-            if self.path == "/api/health":
-                payload = self.server.owner.health_snapshot()
-            elif self.path == "/health/live":
-                payload = {"status": "running"}
-            elif self.path == "/health/ready":
-                payload = self.server.owner.readiness()
-                status = 200 if payload.get("status", "") == "healthy" else 503
-            else:
-                payload = {"error": "not_found"}
-                status = 404
-            body = json_dumps(payload, separators=(",", ":")).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", media_type)
-        self.send_header("Content-Length", str(len(body)))
-        for name, value in PAGE_HEADERS.items():
-            self.send_header(name, value)
-        self.end_headers()
-        self.wfile.write(body)
-
-    # BaseHTTPRequestHandler.log_message names its first parameter format; the override keeps the standard-library signature.
-    def log_message(self, format, *args):  # pylint: disable=redefined-builtin
-        return False
-
-
 def parse_args(argv: list):
     """Parse explicit server settings supplied by the container manager."""
     parser = argparse_ArgumentParser(description=__doc__)
@@ -1698,6 +1721,21 @@ def parse_args(argv: list):
     parser.add_argument("--image", default="")
     computed_return_value = parser.parse_args(argv)
     return computed_return_value
+
+
+def withhold_process_access() -> None:
+    """Close the server's own process to every other process of its account before it reads its key (D-1181).
+
+    Tool processes run under the server's account, and processes of one account can otherwise open each other's memory,
+    descriptors and environment through /proc and ptrace, so code a Task runs could read the key out of the server's
+    memory or rewrite the running server. A process that is not dumpable is reachable that way only with CAP_SYS_PTRACE,
+    which no process in the container holds. Each tool process is an exec of its own program and so is dumpable again:
+    the watchdog still reads its processes.
+    """
+    libc = ctypes_CDLL(None, use_errno=True)
+    if libc.prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0:
+        number = ctypes_get_errno()
+        raise OSError(number, "the Workspace server could not close its process to tool processes")
 
 
 def read_auth_token(args):
@@ -1729,6 +1767,8 @@ def configure(args):
         raise ValueError("request_read_watchdog_seconds must be positive")
     WORKSPACE = args.workspace.resolve()
     WORKSPACE.mkdir(parents=True, exist_ok=True)
+    remove_unowned_run_outputs(WORKSPACE, TASK_FOLDERS, LOGGER)
+    remove_unfinished_writes(WORKSPACE, LOGGER)
     EGRESS_POLICY = args.egress_policy
     EGRESS_ENFORCEMENT = args.egress_enforcement
     PROCESS_WATCHDOG_SECONDS = args.process_watchdog_seconds
@@ -1737,7 +1777,10 @@ def configure(args):
 
 
 def main(argv: list):
+    # Before any thread exists, so every thread and tool process the server starts inherits the block (first_process).
+    hold_signals()
     logging_basicConfig(level=logging_INFO, format="%(asctime)s %(levelname)s %(message)s")
+    withhold_process_access()
     args = parse_args(argv)
     auth_token = read_auth_token(args)
     configure(args)
@@ -1745,34 +1788,22 @@ def main(argv: list):
     # The container listens on every interface of its own network namespace so the published host port reaches it.
     server = HealthHTTPServer(("0.0.0.0", args.health_port), owner, args.request_read_watchdog_seconds)  # nosec B104
     owner.start(f"0.0.0.0:{args.port}")
-    stopped = threading_Event()
-    shutdown = {"signal": 0}
-
-    # signal.signal calls a handler with (signum, frame); shutdown needs only the signal number.
-    def request_shutdown(number, frame):  # pylint: disable=unused-argument
-        """Ask the component owner to stop accepting and drain current work."""
-        shutdown["signal"] = number
-        stopped.set()
-
-    previous_handlers = {}
+    # The signal reader runs for the server's life; the process ends with the main thread once the server has drained.
+    threading_Thread(target=FIRST_PROCESS.serve, name="workspace-signals", daemon=True).start()
     try:
-        for number in (signal_SIGTERM, signal_SIGINT):
-            previous_handlers[number] = signal_signal(number, request_shutdown)
         server.timeout = 0.25
-        while not stopped.is_set():
+        while not FIRST_PROCESS.stopped.is_set():
             server.handle_request()
             owner.health.sample()
         LOGGER.info(
             "workspace_shutdown requested signal=%s; draining accepted requests",
-            shutdown.get("signal", 0),
+            FIRST_PROCESS.stop_signal,
         )
     finally:
         try:
             owner.close()
-            server.server_close()
         finally:
-            for number, handler in previous_handlers.items():
-                signal_signal(number, handler)
+            server.server_close()
     LOGGER.info("workspace_shutdown completed accepted requests drained")
     return False
 

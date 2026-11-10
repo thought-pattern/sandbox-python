@@ -9,7 +9,7 @@ from uuid import uuid4
 from grpc import RpcError, StatusCode, insecure_channel
 
 from tapestry.interfaces.envelope import decode_envelope, encode_envelope
-from tapestry.interfaces.workspace.constants import PAYLOAD_LIMIT_BYTES
+from tapestry.interfaces.workspace.constants import PAYLOAD_LIMIT_BYTES, READ_PART_LIMIT_BYTES
 from tapestry.interfaces.workspace.workspace_pb2 import WorkspaceEnvelope
 from tapestry.interfaces.workspace.workspace_pb2_grpc import WorkspaceServiceStub
 
@@ -73,9 +73,14 @@ class WorkspaceClient:
         return payload
 
     def invoke_tool(self, name: str, arguments: dict = DEFAULT_ARGUMENT_DICT, *, root_task_id: str = "") -> dict:
-        payload = self.rpc(
-            "InvokeTool", {"name": name, "arguments": arguments, "request_id": uuid4().hex, "root_task_id": root_task_id}
-        )
+        envelope = {
+            "name": name,
+            "arguments": arguments,
+            "request_id": uuid4().hex,
+            "root_task_id": root_task_id,
+            "read_part_bytes": READ_PART_LIMIT_BYTES,
+        }
+        payload = self.rpc("InvokeTool", envelope)
         status = payload.get("status_code", 0)
         result = payload.get("result", {})
         if status >= 400:

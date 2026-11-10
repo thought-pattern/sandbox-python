@@ -26,6 +26,8 @@ from subprocess import run as subprocess_run
 from sys import argv as sys_argv, executable as sys_executable
 from tempfile import mkdtemp as tempfile_mkdtemp
 
+from first_process import hold_signals
+
 SERVER = Path(__file__).with_name("server.py")
 COMMAND_LINE_ARGUMENTS = []
 KEY_FILE_OPTION = "--auth-token-file"
@@ -245,4 +247,8 @@ def main(argv=COMMAND_LINE_ARGUMENTS):
 
 
 if __name__ == "__main__":
+    # The entrypoint is the container's first process and execs the server in its place. A stop signal that arrives
+    # before the server reads its signals stays pending for it instead of being dropped, as a first process drops a
+    # signal it has no handler for (first_process.py).
+    hold_signals()
     main()

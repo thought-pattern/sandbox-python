@@ -17,7 +17,7 @@ RUN pip install --no-cache-dir -r /opt/tapestry/requirements.txt
 # pip list/freeze into --user listings that hide build-time packages.
 ENV PATH=$PATH:/home/sandbox/.local/bin
 
-COPY container/sandbox-python/container/server.py container/sandbox-python/container/entrypoint.py container/sandbox-python/container/health.py /opt/tapestry/
+COPY container/sandbox-python/container/server.py container/sandbox-python/container/entrypoint.py container/sandbox-python/container/health.py container/sandbox-python/container/call_admission.py container/sandbox-python/container/tool_process.py container/sandbox-python/container/process_output.py container/sandbox-python/container/part_write.py container/sandbox-python/container/first_process.py container/sandbox-python/container/gitconfig /opt/tapestry/
 COPY container/sandbox-python/container/assets /opt/tapestry/assets/
 COPY tapestry/__init__.py /opt/workspace-interface/tapestry/
 COPY component/engram/engram/engram/health_exposition.py /opt/workspace-interface/engram/health_exposition.py

@@ -10,6 +10,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from json import loads
 from os import dup, environ, mkfifo
 from pathlib import Path
+from subprocess import run as subprocess_run
 from sys import executable
 from threading import Thread
 from uuid import UUID
@@ -18,6 +19,7 @@ from zipfile import ZipFile
 from pytest import fixture, raises
 from server import (
     EGRESS_POLICY,
+    GIT_ENV,
     PROCESS_WATCHDOG_SECONDS,
     WORKSPACE,
     HealthHTTPServer,
@@ -26,14 +28,19 @@ from server import (
     configure,
     parse_args,
     read_auth_token,
-    require_process_success,
-    run_git,
     scoped_repository_bytes,
     shutil_which,
 )
 from workspace_client import WorkspaceClient, WorkspaceToolError
 
 TOKEN = "direct-interface-test-" + "t" * 32
+
+
+def fixture_git(arguments: list) -> str:
+    """Run the fixture's own Git, outside any tool request, as the server runs Git, and return its stdout; a failure
+    fails the test."""
+    completed = subprocess_run(["git", *arguments], env=GIT_ENV, capture_output=True, text=True, check=True)
+    return completed.stdout
 
 
 def configured_workspace(tmp_path: Path) -> Path:
@@ -423,7 +430,7 @@ def test_pip_downloads_from_the_actual_index_without_forwarding(direct_tools, ar
 def test_git_uses_original_http_destination_and_native_remote_with_real_process_results(direct_tools, artifacts, tmp_path):
     seed = artifacts.directory / "seed"
     origin = artifacts.directory / "origin.git"
-    require_process_success(run_git(["init", "--initial-branch=main", str(seed)]), "fixture init")
+    fixture_git(["init", "--initial-branch=main", str(seed)])
     (seed / "sample.txt").write_text("initial\n", encoding="utf-8")
     for arguments in (
         ["-C", str(seed), "add", "sample.txt"],
@@ -441,26 +448,26 @@ def test_git_uses_original_http_destination_and_native_remote_with_real_process_
         ["clone", "--bare", str(seed), str(origin)],
         ["--git-dir", str(origin), "update-server-info"],
     ):
-        require_process_success(run_git(arguments), "fixture setup")
+        fixture_git(arguments)
     destination = f"http://127.0.0.1:{artifacts.server_port}/origin.git"
     cloned = direct_tools.call_tool("git_clone", {"repoUrl": destination, "branch": "main"})
     assert cloned == {"repository": destination, "branch": "main", "cloned": True}
     assert direct_tools.call_tool("file_read", {"path": "sample.txt"}) == "initial\n"
-    # Outside a request the server's own Git runs in the Workspace root, so it names the Task folder the clone went to.
+    # The fixture's own Git names the Task folder the clone went to.
     folder = str(task_folder(tmp_path, direct_tools))
-    assert run_git(["-C", folder, "remote", "get-url", "origin"]).get("stdout", "").strip() == destination
+    assert fixture_git(["-C", folder, "remote", "get-url", "origin"]).strip() == destination
     assert artifacts.paths and all(path.startswith("/origin.git/") for path in artifacts.paths)
     for arguments in (
         ["-C", folder, "config", "user.name", "Fixture"],
         ["-C", folder, "config", "user.email", "fixture@example.test"],
         ["-C", folder, "remote", "set-url", "origin", str(origin)],
     ):
-        require_process_success(run_git(arguments), "fixture remote")
+        fixture_git(arguments)
     direct_tools.call_tool("file_write", {"path": "sample.txt", "content": "changed\n"})
     direct_tools.call_tool("git_commit", {"message": "changed"})
     pushed = direct_tools.call_tool("git_push", {"remote": "origin", "branch": "main"})
     assert pushed == {"remote": "origin", "branch": "main", "pushed": True}
-    assert run_git(["--git-dir", str(origin), "show", "main:sample.txt"]).get("stdout", "") == "changed\n"
+    assert fixture_git(["--git-dir", str(origin), "show", "main:sample.txt"]) == "changed\n"
     with raises(WorkspaceToolError) as missing:
         direct_tools.call_tool("git_clone", {"repoUrl": destination + "-missing", "branch": "main"})
     assert missing.value.code == "process_failed"

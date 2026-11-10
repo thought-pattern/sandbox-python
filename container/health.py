@@ -1,8 +1,8 @@
 """The Workspace server's read-only health figures and page, served on its own port without the Workspace key.
 
-The tool server reports each tool call and manifest request here as it arrives and answers. The figures keep the calls
-by tool and outcome, the calls in progress, the latest finished calls, the errors by kind and a sample of recent
-activity every SAMPLE_SECONDS. Only tool names, outcomes, error codes, times and the UUIDv7 request and root Task IDs
+The tool server reports each tool call and manifest request here as it arrives, as a tool call takes its tool slot, and
+as each answers. The figures keep the calls by tool and outcome, the tool calls waiting for a slot in arrival order, the
+calls in progress, the latest finished calls, the errors by kind and a sample of recent activity every SAMPLE_SECONDS. Only tool names, outcomes, error codes, times and the UUIDv7 request and root Task IDs
 in ID_FIELDS are kept, never arguments, results, file contents or the key. Every figure covers the running server only.
 
 The page assets in `assets/` are copies of Tapestry's shared health page assets (`tapestry/health_assets/`) with this
@@ -12,12 +12,17 @@ as every Tapestry component's, so the shared renderer draws it unchanged. The Wo
 
 from collections import deque
 from datetime import UTC, datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from json import dumps
 from os import getpid
 from pathlib import Path
 from re import fullmatch
+from socketserver import TCPServer
 from threading import Lock
 from time import monotonic
 from uuid import uuid4
+
+from engram.health_exposition import METRICS_CONTENT_TYPE, health_exposition
 
 RECENT_OUTCOMES = 32
 SAMPLE_SECONDS = 5.0
@@ -76,17 +81,33 @@ class WorkspaceHealth:
         self.last_sample = self.began - SAMPLE_SECONDS
         self.grpc_state = {"enabled": True, "available": False, "error_type": "", "error_code": ""}
 
-    def received(self, operation: str, ids: dict = DEFAULT_IDS) -> str:
-        """Count one call arriving and hold it as running until `finished`; return its key."""
+    def received(self, operation: str, ids: dict = DEFAULT_IDS, *, waits: bool = False) -> str:
+        """Count one call arriving and hold it until `finished`; return its key.
+
+        A tool call that `waits` for a tool slot is held as waiting until `admitted`; any other call runs at once.
+        """
         key = uuid4().hex
+        now = monotonic()
         observed_at = datetime.now(UTC).isoformat()
+        item = {"operation": operation, "ids": health_ids(ids), "accepted": now, "accepted_at": observed_at}
+        if not waits:
+            item["started"] = now
         with self.lock:
-            self.items[key] = {"operation": operation, "ids": health_ids(ids), "started": monotonic(), "accepted_at": observed_at}
+            self.items[key] = item
             self.count_received(operation, observed_at)
         return key
 
+    def admitted(self, key: str) -> None:
+        """Hold a waiting tool call as running from now, when it takes its tool slot."""
+        now = monotonic()
+        with self.lock:
+            item = self.items.get(key, {})
+            if item:
+                item["started"] = now
+
     def running_requests(self) -> list:
-        """The request IDs of the calls still running, so a caller that lost its reply can tell whether to wait."""
+        """The request IDs of the calls accepted and not yet answered, waiting for a tool slot or running, so a caller
+        that lost its reply can tell whether to wait: a waiting call runs when its turn comes."""
         with self.lock:
             identifiers = {item.get("ids", {}).get("request_id", "") for item in self.items.values()}
         running = sorted(identifiers - {""})
@@ -121,9 +142,11 @@ class WorkspaceHealth:
             if not item:
                 return False
             operation = item.get("operation", "")
-            elapsed = max(0.0, now - item.get("started", now))
+            started = item.get("started", now)
+            elapsed = max(0.0, now - started)
+            waited = max(0.0, started - item.get("accepted", started))
             self.count_answer(operation, outcome, error_kind, observed_at)
-            for name, value in (("total_seconds", elapsed), ("execution_seconds", elapsed)):
+            for name, value in (("total_seconds", waited + elapsed), ("execution_seconds", elapsed)):
                 self.timing[name] = self.timing.get(name, 0.0) + value
             for name in ("terminal_count", "execution_count"):
                 self.timing[name] = self.timing.get(name, 0) + 1
@@ -135,17 +158,17 @@ class WorkspaceHealth:
                     "outcome": outcome,
                     "error_kind": error_kind,
                     "finished_at": observed_at,
-                    "queue_seconds": 0.0,
+                    "queue_seconds": waited,
                     "executed": True,
                     "execution_seconds": elapsed,
-                    "total_seconds": elapsed,
+                    "total_seconds": waited + elapsed,
                     "ids": dict(item.get("ids", {})),
                 }
             )
         return True
 
     def refused(self, operation: str, outcome: str, error_kind: str) -> None:
-        """Count a call answered without running: no key, an unknown tool, or every tool slot in use."""
+        """Count a call answered without running: no key, an invalid request, no root Task or an unknown tool."""
         observed_at = datetime.now(UTC).isoformat()
         with self.lock:
             self.count_received(operation, observed_at)
@@ -164,7 +187,7 @@ class WorkspaceHealth:
                 {
                     "observed_at": datetime.now(UTC).isoformat(),
                     "elapsed_seconds": now - self.began,
-                    "queue_depth": 0,
+                    "queue_depth": sum(1 for item in self.items.values() if "started" not in item),
                     "finished": self.finished_count,
                     "responses": self.requests.get("responses", 0),
                     "provider_calls": 0,
@@ -177,10 +200,20 @@ class WorkspaceHealth:
     def snapshot(self, readiness: dict, members: dict) -> dict:
         """The standard snapshot every Tapestry page shows, then the Workspace's readiness and `members`.
 
-        A tool call never waits: one beyond the concurrency limit is refused as busy, so the queue is always empty.
+        The queue is every tool call waiting for a tool slot, oldest first, each served in that order.
         """
         now = monotonic()
         with self.lock:
+            queue = [
+                {
+                    "operation": item.get("operation", ""),
+                    "wait_seconds": max(0.0, now - item.get("accepted", now)),
+                    "accepted_at": item.get("accepted_at", ""),
+                    "ids": dict(item.get("ids", {})),
+                }
+                for item in self.items.values()
+                if "started" not in item
+            ]
             active = [
                 {
                     "operation": item.get("operation", ""),
@@ -191,6 +224,7 @@ class WorkspaceHealth:
                     "ids": dict(item.get("ids", {})),
                 }
                 for item in self.items.values()
+                if "started" in item
             ]
             by_operation = {
                 operation: {**row, "outcomes": dict(row.get("outcomes", {}))}
@@ -222,9 +256,9 @@ class WorkspaceHealth:
             "refresh_seconds": SAMPLE_SECONDS,
             "requests": requests,
             "timing": timing,
-            "queue_depth": 0,
-            "oldest_wait_seconds": 0.0,
-            "queue": [],
+            "queue_depth": len(queue),
+            "oldest_wait_seconds": queue[0].get("wait_seconds", 0.0) if queue else 0.0,
+            "queue": queue,
             "queue_display_clipped": False,
             "active_work": active,
             "work": {"by_operation": {}},
@@ -247,3 +281,69 @@ def page_file(path: str) -> tuple:
         return nothing
     page = ((ASSETS / name).read_bytes(), media_type)
     return page
+
+
+class HealthHTTPServer(ThreadingHTTPServer):
+    """Own the observation listener while the gRPC service owns its safe snapshot; `owner` is that service, which
+    answers `health_snapshot()` and `readiness()`."""
+
+    daemon_threads = False
+
+    def __init__(self, address: tuple, owner, request_read_watchdog_seconds: float):
+        self.owner = owner
+        self.request_read_watchdog_seconds = request_read_watchdog_seconds
+        super().__init__(address, HealthHandler)
+
+    def server_bind(self):
+        TCPServer.server_bind(self)
+        address = self.server_address
+        if not isinstance(address, tuple) or len(address) != 2:
+            raise RuntimeError("Workspace health listener requires an internet address")
+        host, port = address
+        if type(host) is not str or type(port) is not int:
+            raise RuntimeError("Workspace health listener returned an invalid address")
+        self.server_name = host
+        self.server_port = port
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    """Public observation only; tools and manifests have no HTTP routes."""
+
+    server: HealthHTTPServer
+    server_version = "TapestryWorkspace"
+
+    def setup(self):
+        super().setup()
+        # Each read waits until the client sends again or has been silent for the watchdog interval.
+        self.connection.settimeout(self.server.request_read_watchdog_seconds)
+
+    def do_GET(self):
+        body, media_type = page_file(self.path)
+        status = 200
+        if self.path == "/metrics":
+            body = health_exposition(self.server.owner.health_snapshot()).encode("utf-8")
+            media_type = METRICS_CONTENT_TYPE
+        if not media_type:
+            media_type = "application/json"
+            if self.path == "/api/health":
+                payload = self.server.owner.health_snapshot()
+            elif self.path == "/health/live":
+                payload = {"status": "running"}
+            elif self.path == "/health/ready":
+                payload = self.server.owner.readiness()
+                status = 200 if payload.get("status", "") == "healthy" else 503
+            else:
+                payload = {"error": "not_found"}
+                status = 404
+            body = dumps(payload, separators=(",", ":")).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", media_type)
+        self.send_header("Content-Length", str(len(body)))
+        for name, value in PAGE_HEADERS.items():
+            self.send_header(name, value)
+        self.end_headers()
+        self.wfile.write(body)
+
+    # BaseHTTPRequestHandler.log_message names its first parameter format; the override keeps the standard-library signature.
+    def log_message(self, format, *args):  # pylint: disable=redefined-builtin
+        return False

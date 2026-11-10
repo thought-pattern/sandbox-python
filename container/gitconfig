@@ -1,0 +1,7 @@
+# The Workspace's own Git configuration, which its Git tools read in place of any global configuration
+# (GIT_CONFIG_GLOBAL in server.py). It names the identity a commit carries when the repository names none. The
+# identity names no real human, and `.invalid` is a reserved name that is never a mailbox. A repository's own
+# configuration is read over this file, so an author the repository names is kept.
+[user]
+	name = Tapestry Workspace
+	email = workspace@tapestry.invalid
