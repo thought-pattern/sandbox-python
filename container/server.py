@@ -64,6 +64,7 @@ from tempfile import (
     mkstemp as tempfile_mkstemp,
 )
 from threading import (
+    TIMEOUT_MAX as threading_TIMEOUT_MAX,
     BoundedSemaphore as threading_BoundedSemaphore,
     Event as threading_Event,
     RLock as threading_RLock,
@@ -119,6 +120,12 @@ GIT_ENV = {
 }
 TOOLS = {}
 FILE_LOCK = threading_RLock()
+# The container's cgroup v2 memory limit and use, read before a whole-file read.
+CGROUP_MEMORY_MAX = "/sys/fs/cgroup/memory.max"
+CGROUP_MEMORY_CURRENT = "/sys/fs/cgroup/memory.current"
+# The copies of a file a whole read holds at once: its bytes, its decoded text, its MessagePack payload, its protobuf
+# message and gRPC's send buffer.
+WHOLE_READ_COPIES = 5
 LOGGER = logging_getLogger("tapestry.workspace.server")
 
 
@@ -520,22 +527,79 @@ def require_network(operation):
 
 
 @tool
-def file_read(path: str):
+def file_read(path: str, offset: int = -1, length: int = 0):
     """Read the whole UTF-8 contents of a file."""
     target = resolve_path(path)
+    if offset == -1 and length == 0:
+        with FILE_LOCK:
+            content = workspace_file_text(target)
+        return content
+    if type(offset) is not int or type(length) is not int or offset < 0 or not 0 < length <= PAYLOAD_LIMIT_BYTES:
+        raise ToolError("A part read needs an offset of 0 or more and a length within one answer", code="bad_arguments", status=400)
+    if not whole_read_fits(length):
+        raise ToolError("A part this long is larger than the Workspace's memory can answer", code="file_too_large", status=413)
     with FILE_LOCK:
-        content = workspace_file_text(target)
-    return content
+        part = workspace_file_part(target, offset, length)
+    return part
+
+
+def workspace_file_part(target, offset: int, length: int) -> dict:
+    """Read up to `length` raw bytes of a regular file from `offset`, with the file's size and identity as opened, so a
+    reader assembles a file of any size in parts and knows when the file changed between them."""
+    try:
+        opened, state = scoped_repository_file(current_workspace(), target)
+    except ToolError as err:
+        if err.code == "bad_arguments":
+            raise ToolError("Expected a regular file", code="not_file", status=400) from err
+        raise
+    with opened:
+        opened.seek(offset)
+        data = opened.read(length)
+    part = {
+        "data": data,
+        "offset": offset,
+        "size": state.st_size,
+        "identity": {
+            "device": state.st_dev,
+            "inode": state.st_ino,
+            "modified_ns": state.st_mtime_ns,
+            "changed_ns": state.st_ctime_ns,
+        },
+    }
+    return part
+
+
+def whole_read_fits(size: int) -> bool:
+    """Whether a whole read of `size` bytes fits the memory this container has left: the read holds the file's bytes, its
+    decoded text, its MessagePack payload, its protobuf message and gRPC's send buffer at once. Without a cgroup memory
+    limit to read, the read is attempted."""
+    try:
+        limit = Path(CGROUP_MEMORY_MAX).read_text(encoding="ascii").strip()
+        used = int(Path(CGROUP_MEMORY_CURRENT).read_text(encoding="ascii").strip())
+    except (OSError, ValueError):
+        return True
+    if not limit.isdigit():
+        return True
+    fits = size * WHOLE_READ_COPIES <= int(limit) - used
+    return fits
 
 
 def workspace_file_text(target) -> str:
     """Read whole regular-file bytes through the canonical descriptor owner."""
     try:
-        source = scoped_repository_bytes(current_workspace(), target)
+        opened, state = scoped_repository_file(current_workspace(), target)
     except ToolError as err:
         if err.code == "bad_arguments":
             raise ToolError("Expected a regular file", code="not_file", status=400) from err
         raise
+    with opened:
+        if not whole_read_fits(state.st_size):
+            raise ToolError(
+                "File is larger than the Workspace's memory can answer whole; read it in parts",
+                code="file_too_large",
+                status=413,
+            )
+        source = whole_file_bytes(opened, state)
     try:
         text = source.decode("utf-8")
     except UnicodeDecodeError as err:
@@ -580,11 +644,28 @@ def file_read_scoped(repository_root: str, path: str):
     return scoped_read
 
 
-def scoped_repository_bytes(root: Path, target: Path) -> bytes:
-    """Open canonical path components by descriptor so later symlink swaps cannot escape, and read the whole file.
+def whole_file_bytes(opened, state) -> bytes:
+    """The whole of an opened regular file; the one refusal for size is a file that cannot be one Workspace answer,
+    protobuf's largest message."""
+    if state.st_size > PAYLOAD_LIMIT_BYTES:
+        raise ToolError("File cannot be one Workspace answer", code="file_too_large", status=413)
+    source = opened.read(PAYLOAD_LIMIT_BYTES + 1)
+    if len(source) > PAYLOAD_LIMIT_BYTES:
+        raise ToolError("File grew beyond one Workspace answer while it was read", code="file_too_large", status=413)
+    return source
 
-    The one refusal for size is a file that cannot be one Workspace answer, protobuf's largest message.
-    """
+
+def scoped_repository_bytes(root: Path, target: Path) -> bytes:
+    """The whole of a file beneath `root`, opened by descriptor (`scoped_repository_file`)."""
+    opened, state = scoped_repository_file(root, target)
+    with opened:
+        source = whole_file_bytes(opened, state)
+    return source
+
+
+def scoped_repository_file(root: Path, target: Path) -> tuple:
+    """Open canonical path components by descriptor so later symlink swaps cannot escape; return the opened regular file
+    and its state, for the caller to read and close."""
     directory = os_open("/", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
     try:
         relative = target.relative_to(root)
@@ -632,20 +713,16 @@ def scoped_repository_bytes(root: Path, target: Path) -> bytes:
                 code="path_escape",
                 status=400,
             ) from err
-        with os_fdopen(descriptor, "rb") as opened:
-            state = os_fstat(opened.fileno())
-            if not S_ISREG(state.st_mode):
-                raise ToolError(
-                    "Scoped source is not a regular file",
-                    code="bad_arguments",
-                    status=400,
-                )
-            if state.st_size > PAYLOAD_LIMIT_BYTES:
-                raise ToolError("File cannot be one Workspace answer", code="file_too_large", status=413)
-            source = opened.read(PAYLOAD_LIMIT_BYTES + 1)
-            if len(source) > PAYLOAD_LIMIT_BYTES:
-                raise ToolError("File grew beyond one Workspace answer while it was read", code="file_too_large", status=413)
-            return source
+        opened = os_fdopen(descriptor, "rb")
+        state = os_fstat(opened.fileno())
+        if not S_ISREG(state.st_mode):
+            opened.close()
+            raise ToolError(
+                "Scoped source is not a regular file",
+                code="bad_arguments",
+                status=400,
+            )
+        return opened, state
     finally:
         os_close(directory)
 
@@ -1325,11 +1402,12 @@ class WorkspaceService(WorkspaceServiceServicer):
         return self.port
 
     def close(self) -> None:
-        """Stop admission and drain actual tool functions even after their RPCs disconnected."""
+        """Stop admission and wait for every call in progress to finish and send its reply, with no grace after which a
+        call is cancelled; a call whose caller disconnected still runs its tool function to its end."""
         if not self.closed:
             self.closed = True
             self.health.grpc_state["available"] = False
-            self.rpc.stop(0).wait()
+            self.rpc.stop(threading_TIMEOUT_MAX).wait()
             self.workers.shutdown(wait=True)
 
     def authorize(self, context, operation: str) -> None:

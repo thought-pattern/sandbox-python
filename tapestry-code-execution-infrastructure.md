@@ -63,8 +63,9 @@ then force-removes it and deletes the key file. If work and cleanup both fail,
 the original work failure is preserved and annotated with the cleanup failure.
 
 The configured engine applies fractional CPU limits, `--cap-drop ALL`,
-`no-new-privileges`, a PID limit and the `SETGID`/`SETUID` capabilities needed to
-drop identity. The `web` and `deny` egress policies add `NET_ADMIN`, which only
+`no-new-privileges`, a PID limit, the `SETGID`/`SETUID` capabilities needed to
+drop identity, and `KILL`, which the engine's root init needs to pass the stop
+signal to the server under the non-root account. The `web` and `deny` egress policies add `NET_ADMIN`, which only
 the root entrypoint uses to install the firewall before privileges drop; the
 `direct` policy leaves egress to the host and does not add it.
 The entrypoint clears groups and changes permanently to
