@@ -774,13 +774,17 @@ def file_patch(path: str, patches: list):
         current = workspace_regular_file(current_workspace(), target)[0]
         try:
             require_utf8(current)
-            for old, new in replacements:
+            for number, (old, new) in enumerate(replacements, start=1):
                 patched = tempfile_TemporaryFile(dir=target.parent)
                 found = replace_first(current, patched, old, new)
                 current.close()
                 current = patched
                 if not found:
-                    raise ToolError(f"Not found: {old.decode('utf-8')[:50]}...", code="patch_target_missing")
+                    raise ToolError(
+                        f"Not found: the old text of patch {number} of {len(replacements)}, {len(old)} bytes, is not in "
+                        "the file as the patches before it left it",
+                        code="patch_target_missing",
+                    )
                 current.seek(0)
             atomic_write(target, functools_partial(shutil_copyfileobj, current, length=COPY_BLOCK_BYTES))
         finally:
