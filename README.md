@@ -6,8 +6,7 @@ image, tool server, lifecycle manager, and verification suite.
 
 ## Boundary
 
-- The host port is bound to `127.0.0.1`: the instance Workspace's
-  `sandbox.host_port`, or a dynamically allocated one for a disposable session.
+- The host port is bound to `127.0.0.1`: the gRPC port the Manager issues a repository's Workspace sandbox, or a dynamically allocated one for a disposable session.
 - Every tool endpoint requires the instance's one Workspace key,
   `sandbox.auth_token` in Tapestry's `config.yml`, as a bearer key.
 - Every tool call names its root Task in the native `root_task_id` field (a canonical UUIDv7); a call that names none is refused with
@@ -72,8 +71,7 @@ with workspace.session() as run_probe:
 ```
 
 The adapter verifies deployment resources before creating a session's security
-group. It removes broad default egress, grants only resolved public destination
-and declared bootstrap traffic, launches one private task with no guest AWS
+group. It removes broad default egress, under `web` opens outbound TCP 80/443 to `0.0.0.0/0` by port and relies on the DNS Firewall allow list to limit which names resolve, grants the declared bootstrap traffic, launches one private task with no guest AWS
 role, and stops the task before deleting the group. Cleanup preserves primary
 failures and waits for ENI release. Fargate starts the server as nonroot with
 `--egress-enforcement deployment`; it does not request NET_ADMIN. Health and
@@ -99,8 +97,8 @@ sandbox-python/
 
 ## Build and run
 
-Start the instance Workspace from Tapestry's repository root; it reads the
-`sandbox` block of `config.yml` and publishes at `sandbox.host_port` on loopback:
+Start each registered repository's Workspace sandbox from Tapestry's repository root; the script reads the
+`sandbox` block of `config.yml` and publishes each sandbox on loopback at the gRPC and HTTP ports the Manager issues it:
 
 ```bash
 python3 scripts/workspace_start.py --config config.yml
@@ -115,7 +113,7 @@ from tapestry.config import reload_config
 from tapestry.workspace.execution_sandbox import ExecutionSandbox
 
 with ExecutionSandbox(reload_config().get("sandbox", {}), egress_policy="deny").session() as run_probe:
-    print(run_probe("print(6 * 7)", 5))
+    print(run_probe("print(6 * 7)"))
 ```
 
 Build the image with the configured engine (`podman build` takes the same
@@ -128,17 +126,18 @@ docker build -t python-sandbox:latest \
 
 ## Service interfaces
 
-`WorkspaceService` exposes `CheckHealth`, `Describe` and `InvokeTool` with protobuf envelopes carrying native MessagePack mappings. Tools use `sandbox.port` (8080), published at `sandbox.host_port`, and authenticate with `authorization: Bearer <Workspace key>` metadata. `Describe` takes `request_id`; `InvokeTool` takes exactly `name`, `arguments`, `request_id` and `root_task_id`. An observation contains `request_id`, `status_code`, `result` and `workspace_context`. Tool errors are `result.error` with `code` and `message`; gRPC transport/authentication failures remain separate. Accepted tool functions retain their slot and drain even when the requester disconnects or its deadline expires.
+`WorkspaceService` exposes `CheckHealth`, `Describe` and `InvokeTool` with protobuf envelopes carrying native MessagePack mappings. Tools use `sandbox.port` (8080), published at the gRPC port the Manager issues, and authenticate with `authorization: Bearer <Workspace key>` metadata. `Describe` takes `request_id`; `InvokeTool` takes exactly `name`, `arguments`, `request_id` and `root_task_id`. An observation contains `request_id`, `status_code`, `result` and `workspace_context`. Tool errors are `result.error` with `code` and `message`; gRPC transport/authentication failures remain separate. Accepted tool functions retain their slot and drain even when the requester disconnects or its deadline expires.
 
-The HTTP health listener uses `sandbox.health_port` (8081), published independently at `sandbox.health_host_port`. DEV assigns 8104; a disposable session requests a fresh loopback port. It serves `/`, `/health.js`, `/health-common.js`, `/health.css`, `/api/health`, `/health/live` and `/health/ready` without a key. The page and API share the owner's safe snapshot and carry no tool arguments, results, file contents or key.
+The HTTP health listener uses `sandbox.health_port` (8081), published independently at the HTTP port the Manager issues; a disposable session requests a fresh loopback port. It serves `/`, `/health.js`, `/health-common.js`, `/health.css`, `/api/health`, `/metrics` (Prometheus text exposition), `/health/live` and `/health/ready` without a key. The page and API share the owner's safe snapshot and carry no tool arguments, results, file contents or key.
 
 Shell and Python tools return an explicit process result so clients can
 distinguish command failure from a transport or service failure.
 
 ## Tools
 
-- Files: `file_read`, `file_write`, `file_patch`, `file_delete`, `file_list`,
+- Files: `file_read`, `file_write`, `file_write_part`, `file_patch`, `file_delete`, `file_list`,
   `file_search`, `workspace_tree`
+- Kept process output: `run_output_read` (one part of a run's stdout or stderr that a reply or error named as kept)
 - Repository-scoped reads: `file_read_scoped` (UTF-8 bytes beneath one
   resolved repository root, with provenance) and `file_search_scoped` (bounded
   Python-source leads for one symbol in that repository)
