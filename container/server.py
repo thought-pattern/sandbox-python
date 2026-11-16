@@ -79,7 +79,7 @@ from process_output import (
     search_matches,
     text_lines,
 )
-from tool_process import INVOCATION_MARKER_VARIABLE, invocation_activity, terminate_process_group
+from tool_process import INVOCATION_MARKER_VARIABLE, STALL_CHECKS, invocation_activity, terminate_process_group
 
 from tapestry.interfaces.envelope import decode_envelope, encode_envelope
 from tapestry.interfaces.workspace.constants import (
@@ -98,11 +98,13 @@ DEFAULT_WORKSPACE = Path("/workspace")
 DEFAULT_PORT = 8080
 DEFAULT_HEALTH_PORT = 8081
 DEFAULT_MAX_CONCURRENT_REQUESTS = 4
-# The watchdog ends a tool process once neither its CPU time nor its output has moved for this many seconds.
+# The interval at which the watchdog checks a running tool process's CPU time and output size; it ends the process at
+# STALL_CHECKS checks in a row in which neither moved (D-907).
 DEFAULT_PROCESS_WATCHDOG_SECONDS = 120
-# How often the watchdog reads a running tool process's CPU time and output size.
+# How often a running tool process is looked at for its exit between the watchdog's checks.
 WATCHDOG_POLL_SECONDS = 1.0
-# The health listener ends an observation request once its client has sent nothing for this many seconds.
+# The interval at which the health listener checks a client's read for bytes; it ends the read at STALL_CHECKS checks in
+# a row in which no byte arrived (D-907).
 DEFAULT_REQUEST_READ_WATCHDOG_SECONDS = 10.0
 # The depth a listing has when its caller names none: the whole tree.
 WHOLE_TREE_DEPTH = -1
@@ -363,9 +365,10 @@ def internal_run_process(
     output kept for the caller (`run_output`), so no output is held whole. With `stdout_parser`, a run that ended with
     one of `parsed_exit_codes` has its stdout read from disk a line at a time by the parser (`output_lines`), and the
     parser's value is the result's stdout; any other run's stdout is answered as an output is.
-    A watchdog ends a process that has stopped making progress: once neither the invocation's CPU time nor its output
-    has moved for PROCESS_WATCHDOG_SECONDS, the invocation is ended and the result is `stalled`. A process that keeps
-    working runs to its end. When the direct child exits, its process group is ended: a background descendant still
+    A watchdog ends a process that has stopped making progress: every PROCESS_WATCHDOG_SECONDS it reads the invocation's
+    CPU time and output sizes, a check that sees either move resets the count, and at STALL_CHECKS checks in a row in
+    which neither moved the invocation is ended and the result is `stalled` (D-907). A process that keeps working runs
+    to its end. When the direct child exits, its process group is ended: a background descendant still
     holding the output open cannot keep a finished tool running.
     The program starts with the signals the server holds unblocked (`program_command`), and its leader is held from the
     server's orphan reaper until this wait has its exit status (`FIRST_PROCESS`).
@@ -395,21 +398,24 @@ def internal_run_process(
         outputs = (stdout_file, stderr_file)
         try:
             activity = invocation_activity(process, marker, outputs)
-            active_at = time_monotonic()
-            stalled = False
-            while not stalled and process.poll() is None:
+            next_check = time_monotonic() + PROCESS_WATCHDOG_SECONDS
+            without_progress = 0
+            while without_progress < STALL_CHECKS and process.poll() is None:
                 try:
-                    process.wait(timeout=WATCHDOG_POLL_SECONDS)
+                    process.wait(timeout=min(WATCHDOG_POLL_SECONDS, PROCESS_WATCHDOG_SECONDS))
                 except subprocess_TimeoutExpired:
+                    if time_monotonic() < next_check:
+                        continue
+                    next_check = time_monotonic() + PROCESS_WATCHDOG_SECONDS
                     observed = invocation_activity(process, marker, outputs)
-                    now = time_monotonic()
-                    if observed != activity:
-                        activity, active_at = observed, now
-                    stalled = now - active_at >= PROCESS_WATCHDOG_SECONDS
+                    without_progress = 0 if observed != activity else without_progress + 1
+                    activity = observed
+            stalled = without_progress >= STALL_CHECKS
             if stalled:
                 LOGGER.warning(
-                    "tool invocation %s ended by the watchdog: no CPU time or output for %s s",
+                    "tool invocation %s ended by the watchdog: no CPU time or output at %d checks in a row, %s s apart",
                     process.pid,
+                    STALL_CHECKS,
                     PROCESS_WATCHDOG_SECONDS,
                 )
             terminate_process_group(process, marker)

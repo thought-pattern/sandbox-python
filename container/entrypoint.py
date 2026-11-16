@@ -33,6 +33,9 @@ COMMAND_LINE_ARGUMENTS = []
 KEY_FILE_OPTION = "--auth-token-file"
 KEY_DESCRIPTOR_OPTION = "--auth-token-fd"
 KEY_MOUNT_DIRECTORY = Path("/run/secrets")
+# The key file a start that names none reads, as a plain run of the image does: the file mounted read-only here, at the
+# same container path Tapestry's sandbox manager mounts and names.
+DEFAULT_KEY_FILE = KEY_MOUNT_DIRECTORY / "workspace-key"
 # A deployment controller with no host file to mount passes the key in this one bootstrap environment value;
 # Tapestry's Fargate controller names the same variable.
 KEY_BOOTSTRAP_VARIABLE = "TAPESTRY_WORKSPACE_KEY"
@@ -174,6 +177,12 @@ def verify_deployment_identity():
         raise RuntimeError(f"Workspace could not install no-new-privileges: errno {get_errno()}")
 
 
+def key_file_arguments(arguments):
+    """Name the canonical key file when the start names none, so a plain run of the image reads the mounted key."""
+    result = list(arguments) if KEY_FILE_OPTION in arguments else [*arguments, KEY_FILE_OPTION, str(DEFAULT_KEY_FILE)]
+    return result
+
+
 def key_file_position(arguments):
     """Return the position of the one key file option's value."""
     if arguments.count(KEY_FILE_OPTION) != 1 or arguments.index(KEY_FILE_OPTION) + 1 >= len(arguments):
@@ -198,7 +207,10 @@ def pass_key_descriptor(arguments):
 def protect_key_directory(arguments) -> None:
     """Keep the mounted key unreachable by tool processes even when file sharing maps its owner to the sandbox UID."""
     position = key_file_position(arguments)
-    directory = Path(arguments[position]).parent
+    key_file = Path(arguments[position])
+    if not key_file.is_file():
+        raise RuntimeError(f"no Workspace key file at {key_file}: mount the key file read-only there")
+    directory = key_file.parent
     if directory != KEY_MOUNT_DIRECTORY or directory.resolve() != directory:
         raise RuntimeError("mounted Workspace key must be inside the canonical service-secret directory")
     if not directory.is_dir() or directory.stat().st_uid != 0:
@@ -222,7 +234,7 @@ def write_bootstrap_key(arguments):
 
 def main(argv=COMMAND_LINE_ARGUMENTS):
     selected_arguments = sys_argv[1:] if argv is COMMAND_LINE_ARGUMENTS else argv
-    arguments = list(selected_arguments)
+    arguments = key_file_arguments(selected_arguments)
     policy = parse_policy(arguments)
     if policy.egress_enforcement == "deployment":
         if policy.egress_policy not in {"web", "deny"}:
@@ -251,4 +263,8 @@ if __name__ == "__main__":
     # before the server reads its signals stays pending for it instead of being dropped, as a first process drops a
     # signal it has no handler for (first_process.py).
     hold_signals()
-    main()
+    try:
+        main()
+    except RuntimeError as err:
+        # A start the entrypoint refuses ends with its reason on one line and exit status 1, not a traceback.
+        raise SystemExit(f"Workspace entrypoint refused the start: {err}") from err

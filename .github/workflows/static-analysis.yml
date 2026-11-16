@@ -1,0 +1,125 @@
+name: Static Analysis
+
+on:
+  pull_request:
+    paths:
+      - "**/*.py"
+      - "pyproject.toml"
+      - "pytest.ini"
+      - "container/requirements.txt"
+      - "container/Containerfile"
+      - ".github/workflows/static-analysis.yml"
+  push:
+    branches: [develop, main]
+    paths:
+      - "**/*.py"
+      - "pyproject.toml"
+      - "pytest.ini"
+      - "container/requirements.txt"
+      - "container/Containerfile"
+      - ".github/workflows/static-analysis.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: static-analysis-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-security:
+    name: Lint and Security
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install analysis tools
+        run: python -m pip install --upgrade bandit isort ruff vulture
+
+      - name: Import-order check
+        run: isort --check-only container tests
+
+      - name: Run Ruff
+        run: ruff check container tests
+
+      - name: Bytecode compilation check
+        run: python -m compileall -q container tests
+
+      - name: Security scan
+        run: python -m bandit --configfile pyproject.toml -q -ii -lll -r container
+
+      - name: Dead-code scan
+        run: python -m vulture
+
+  typecheck-and-tests:
+    name: Pyright and Boundary Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: container/requirements.txt
+
+      - name: Install dependencies
+        run: python -m pip install --requirement container/requirements.txt pyright==1.1.411
+
+      - name: Verify dependency compatibility
+        run: python -m pip check
+
+      - name: Run Pyright
+        run: |
+          python - <<'EOF'
+          import json
+          import re
+          import subprocess
+          import sys
+
+          # tapestry.interfaces.* and engram.health_exposition are mounted into /opt/workspace-interface by Containerfile.
+          PARENT_PACKAGES = {"engram", "tapestry"}
+          MISSING_IMPORT_RE = re.compile(r'Import "([^".]+)(?:\.[^"]*)?" could not be resolved')
+
+          proc = subprocess.run([sys.executable, "-m", "pyright", "--outputjson"], capture_output=True, text=True)
+          if proc.returncode not in (0, 1):
+              raise SystemExit(proc.stderr or proc.stdout or f"pyright exited with {proc.returncode}")
+          report = json.loads(proc.stdout)
+          analyzed = report.get("summary", {}).get("filesAnalyzed", 0)
+          if analyzed <= 0:
+              raise SystemExit("Pyright analyzed no files")
+
+          blocking = []
+          for item in report.get("generalDiagnostics", []):
+              rule = item.get("rule", "")
+              msg = item.get("message", "")
+              if rule in {"reportMissingImports", "reportMissingModuleSource"}:
+                  match = MISSING_IMPORT_RE.search(msg)
+                  if match and match.group(1) in PARENT_PACKAGES:
+                      continue
+              if item.get("severity") in {"error", "warning"}:
+                  loc = item.get("range", {}).get("start", {})
+                  blocking.append(
+                      f"{item.get('file')}:{loc.get('line', 0) + 1}:{loc.get('character', 0) + 1}: "
+                      f"{item.get('severity')} [{rule}] {msg}"
+                  )
+
+          if blocking:
+              print("\n".join(blocking))
+              raise SystemExit(1)
+          print(f"Pyright checked {analyzed} files: 0 blocking diagnostics.")
+          EOF
+
+      - name: Run standalone entrypoint boundary tests
+        env:
+          PYTHONPATH: container
+        run: python -m pytest -o pythonpath=container tests/test_entrypoint.py

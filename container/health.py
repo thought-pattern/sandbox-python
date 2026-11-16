@@ -13,6 +13,7 @@ as every Tapestry component's, so the shared renderer draws it unchanged. The Wo
 from collections import deque
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import BufferedReader, RawIOBase
 from json import dumps
 from os import getpid
 from pathlib import Path
@@ -21,6 +22,8 @@ from socketserver import TCPServer
 from threading import Lock
 from time import monotonic
 from uuid import uuid4
+
+from tool_process import STALL_CHECKS
 
 from engram.health_exposition import METRICS_CONTENT_TYPE, health_exposition
 
@@ -306,6 +309,33 @@ class HealthHTTPServer(ThreadingHTTPServer):
         self.server_port = port
 
 
+class PatientSocketReader(RawIOBase):
+    """A health client's socket read as a stream that only lack of progress ends (D-907).
+
+    Each receive waits one watchdog interval (the socket's timeout). An interval in which bytes arrive answers the read;
+    one in which none arrive is a check without progress, and at STALL_CHECKS such checks in a row the read fails as
+    timed out, which ends the request as the standard handler ends a timed-out one.
+    """
+
+    def __init__(self, connection):
+        super().__init__()
+        self.connection = connection
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer) -> int:
+        without_progress = 0
+        while True:
+            try:
+                received = self.connection.recv_into(buffer)
+                return received
+            except TimeoutError:
+                without_progress += 1
+                if without_progress >= STALL_CHECKS:
+                    raise
+
+
 class HealthHandler(BaseHTTPRequestHandler):
     """Public observation only; tools and manifests have no HTTP routes."""
 
@@ -314,8 +344,9 @@ class HealthHandler(BaseHTTPRequestHandler):
 
     def setup(self):
         super().setup()
-        # Each read waits until the client sends again or has been silent for the watchdog interval.
+        # Each receive waits one watchdog interval; the request's reads end only at STALL_CHECKS silent intervals in a row.
         self.connection.settimeout(self.server.request_read_watchdog_seconds)
+        self.rfile = BufferedReader(PatientSocketReader(self.connection))
 
     def do_GET(self):
         body, media_type = page_file(self.path)

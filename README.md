@@ -29,7 +29,7 @@ image, tool server, lifecycle manager, and verification suite.
   The explicit `deny` option is offline. There is no forwarding service or
   Workspace SQLite dependency.
 
-The entrypoint consumes `--auth-token-file` and passes the opened descriptor as `--auth-token-fd` to the server. The manager mounts the configured host key read-only at `/run/secrets/workspace-key`. The root entrypoint verifies that `/run/secrets` is canonical and root-owned, restricts it to mode 0700 and passes only the opened descriptor across the privilege drop. This protects the key even when file sharing maps its owner onto the sandbox UID. The server reads and closes that descriptor before accepting tools. The physical directory-mount manifest excludes inaccessible paths without granting source access.
+The entrypoint consumes `--auth-token-file` and passes the opened descriptor as `--auth-token-fd` to the server. The manager mounts the configured host key read-only at `/run/secrets/workspace-key`. The root entrypoint verifies that `/run/secrets` is canonical and root-owned, restricts it to mode 0700 and passes only the opened descriptor across the privilege drop. This protects the key even when file sharing maps its owner onto the sandbox UID. The server reads and closes that descriptor before accepting tools. A start that names no key file, such as a plain run of the image, reads `/run/secrets/workspace-key`; when no key file is mounted there, the entrypoint refuses the start with that reason on one line and exit status 1. The physical directory-mount manifest excludes inaccessible paths without granting source access.
 
 On Fargate the controller supplies `TAPESTRY_WORKSPACE_KEY` for bootstrap. The nonroot entrypoint removes that environment value, writes its temporary key file, opens a descriptor and removes the file and its directory before service exec. The server receives only the descriptor. Existing entrypoint checks pass in the rebuilt image, and the [native DEV boundary](../../logs/alt-plan-20261016/dev-workspace-key-adoption-20261017.yml) verifies that generated tool code cannot reopen the key while ordinary Task-folder work succeeds.
 
@@ -88,7 +88,7 @@ sandbox-python/
 ├── container/
 │   ├── Containerfile
 │   ├── assets/             # health page, its renderer and copies of Tapestry's shared page assets
-│   ├── entrypoint.py       # privilege drop, optional offline mode, server exec
+│   ├── entrypoint.py       # key descriptor, privilege drop, optional offline mode, server exec
 │   ├── health.py           # health figures and page files
 │   ├── requirements.txt    # image dependencies
 │   └── server.py           # standard-library gRPC server
@@ -116,12 +116,20 @@ with ExecutionSandbox(reload_config().get("sandbox", {}), egress_policy="deny").
     print(run_probe("print(6 * 7)"))
 ```
 
-Build the image with the configured engine (`podman build` takes the same
-arguments), from the repository root. The root `.dockerignore` admits only Workspace implementation/assets and the declared protobuf/codec library; application sources, data and configuration are excluded:
+Build the image with the configured engine (`podman build` takes the same arguments), from the repository root. The root `.dockerignore` admits only the server directory `container/sandbox-python/container` (the directory DEV mounts read-only as `sandbox.implementation_directory`), the Workspace protobuf/codec interface files and Engram's health exposition module; application sources, data and configuration are excluded. The image copies every module of the server directory, so its own server matches the mounted one once rebuilt:
 
 ```bash
 docker build -t python-sandbox:latest \
   -f container/sandbox-python/container/Containerfile .
+```
+
+The image also starts on its own, with no arguments, given only its key file mounted read-only at the canonical path; it then serves with the server's defaults (`/workspace`, tool port 8080, health port 8081, `direct` egress):
+
+```bash
+docker run --rm \
+  --volume <host key file>:/run/secrets/workspace-key:ro \
+  --publish 127.0.0.1::8080 --publish 127.0.0.1::8081 \
+  python-sandbox:latest
 ```
 
 ## Service interfaces
