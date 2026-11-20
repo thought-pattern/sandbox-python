@@ -1075,7 +1075,7 @@ def scoped_matches(lines, root: Path) -> list:
     return matches
 
 
-PACKAGE_PATTERN = re_compile(r"^[a-zA-Z0-9_.-]+([=<>!~\[\]][a-zA-Z0-9._,<>=!~\[\]]*)?$")
+PACKAGE_PATTERN = re_compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*([=<>!~\[\]][a-zA-Z0-9._,<>=!~\[\]]*)?$")
 
 
 @tool
@@ -1087,8 +1087,8 @@ def pip_install(packages: list):
     for package in packages:
         if not isinstance(package, str) or not PACKAGE_PATTERN.fullmatch(package):
             raise ToolError(f"Invalid package: {package}", code="bad_arguments", status=400)
-    command = ["pip", "install", "--no-cache-dir"]
-    result = internal_run_process([*command, *packages])
+    command = ["pip", "install", "--no-cache-dir", "--", *packages]
+    result = internal_run_process(command)
     computed_return_value = require_process_success(
         result,
         "pip install",
@@ -1101,10 +1101,10 @@ def pip_uninstall(packages: list):
     """Uninstall packages that pip_install added at runtime."""
     if not isinstance(packages, list) or not packages:
         raise ToolError("packages must be a non-empty list", code="bad_arguments", status=400)
-    if any(not isinstance(package, str) or not re_fullmatch(r"[a-zA-Z0-9_.-]+", package) for package in packages):
+    if any(not isinstance(package, str) or not re_fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*", package) for package in packages):
         raise ToolError("Invalid package name", code="bad_arguments", status=400)
     computed_return_value = require_process_success(
-        internal_run_process(["pip", "uninstall", "-y", *packages]),
+        internal_run_process(["pip", "uninstall", "-y", "--", *packages]),
         "pip uninstall",
     )
     return computed_return_value
@@ -1194,10 +1194,10 @@ def git_clone(repo_url: str, branch: str = "main"):
             for item in list(workspace.iterdir()):
                 if item == staging:
                     continue
-                if item.is_dir():
-                    shutil_rmtree(item)
-                else:
+                if item.is_symlink() or not item.is_dir():
                     item.unlink()
+                else:
+                    shutil_rmtree(item)
             for item in list(staging.iterdir()):
                 shutil_move(str(item), workspace / item.name)
             staging.rmdir()

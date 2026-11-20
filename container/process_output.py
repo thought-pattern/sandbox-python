@@ -5,11 +5,13 @@ The server runs each tool process with its stdout and stderr written to anonymou
 here holds an output whole: a parser reads one line at a time, and a kept copy is made a block at a time.
 """
 
+from base64 import b64decode
 from codecs import getincrementaldecoder
 from hashlib import sha256
 from json import loads as json_loads
-from os import fdopen, fsync, scandir
+from os import fdopen, fsencode, fsync, scandir
 from pathlib import Path
+from posixpath import normpath, relpath
 from shutil import rmtree
 from tempfile import mkstemp
 
@@ -51,6 +53,47 @@ def log_commits(lines) -> list:
     return commits
 
 
+def ripgrep_text(field: object) -> str:
+    """Decode a ripgrep JSON text or base64 bytes field into UTF-8 text."""
+    decoded = ""
+    if isinstance(field, dict):
+        text_value = field.get("text", "")
+        bytes_value = field.get("bytes", "")
+        if "text" in field and isinstance(text_value, str):
+            decoded = text_value
+        elif "bytes" in field and isinstance(bytes_value, str):
+            decoded = b64decode(bytes_value).decode("utf-8", errors="replace")
+    return decoded
+
+
+def ripgrep_relative_path(field: object, base: Path) -> str:
+    """Resolve a ripgrep JSON path field (`text` or base64 `bytes`) relative to `base`."""
+    if isinstance(field, dict):
+        text_value = field.get("text", "")
+        if "text" in field and isinstance(text_value, str) and text_value:
+            relative_text = str(Path(text_value).relative_to(base))
+            return relative_text
+        bytes_value = field.get("bytes", "")
+        if "bytes" in field and isinstance(bytes_value, str):
+            raw = b64decode(bytes_value)
+            if not raw:
+                empty_relative = str(Path("").relative_to(base))
+                return empty_relative
+            raw_path = normpath(raw)
+            base_bytes = normpath(fsencode(base))
+            if base_bytes == b".":
+                in_base = not raw_path.startswith(b"/") and raw_path != b".." and not raw_path.startswith(b"../")
+            else:
+                prefix = b"/" if base_bytes == b"/" else base_bytes.rstrip(b"/") + b"/"
+                in_base = raw_path == base_bytes or raw_path.startswith(prefix)
+            if not in_base:
+                raise ValueError(f"{raw!r} is not in the subpath of {str(base)!r}")
+            relative_bytes = relpath(raw_path, base_bytes).decode("utf-8", errors="replace")
+            return relative_bytes
+    fallback = str(Path("").relative_to(base))
+    return fallback
+
+
 def search_matches(lines, max_results: int, base: Path) -> list:
     """The matches of ripgrep's JSON lines, read one line at a time, each file named relative to `base`: every match,
     or the first `max_results`."""
@@ -62,9 +105,9 @@ def search_matches(lines, max_results: int, base: Path) -> list:
         match = data.get("data", {})
         matches.append(
             {
-                "file": str(Path(match.get("path", {}).get("text", "")).relative_to(base)),
+                "file": ripgrep_relative_path(match.get("path", {}), base),
                 "line": match.get("line_number", 0),
-                "content": match.get("lines", {}).get("text", "").strip(),
+                "content": ripgrep_text(match.get("lines", {})).strip(),
             }
         )
         if max_results and len(matches) >= max_results:
@@ -75,9 +118,10 @@ def search_matches(lines, max_results: int, base: Path) -> list:
 def output_detail(value) -> str:
     """A failed run's output as its error message gives it: the text a read part holds, or where the larger kept output
     is read."""
-    if type(value) is str:
-        return value.strip()
-    reference = value.get(TEXT_REFERENCE_FIELD, {}) if type(value) is dict else {}
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped
+    reference = value.get(TEXT_REFERENCE_FIELD, {}) if isinstance(value, dict) else {}
     detail = f"its output of {reference.get('utf8_bytes', 0)} UTF-8 bytes is kept for run_output_read under this request"
     return detail
 
