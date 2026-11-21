@@ -1,4 +1,4 @@
 # The tool server uses only the Python standard library; no third-party
 # dependencies. Task-time packages are installed into the sandbox user's home
 # directory at runtime through the pip_install tool.
-pytest==9.1.1
+pytest==9.2.0
