@@ -6,12 +6,10 @@
 from copy import deepcopy
 from uuid import uuid4
 
+from envelope import PAYLOAD_LIMIT_BYTES, READ_PART_LIMIT_BYTES, decode_envelope, encode_envelope
 from grpc import RpcError, StatusCode, insecure_channel
-
-from tapestry.interfaces.envelope import decode_envelope, encode_envelope
-from tapestry.interfaces.workspace.constants import PAYLOAD_LIMIT_BYTES, READ_PART_LIMIT_BYTES
-from tapestry.interfaces.workspace.workspace_pb2 import WorkspaceEnvelope
-from tapestry.interfaces.workspace.workspace_pb2_grpc import WorkspaceServiceStub
+from workspace_pb2 import WorkspaceEnvelope
+from workspace_pb2_grpc import WorkspaceServiceStub
 
 DEFAULT_ARGUMENT_DICT = {}
 DEFAULT_ROOT_TASK_ID = "019cdc3d-a855-74f7-b720-f730ead81438"

@@ -8,6 +8,7 @@ on:
       - "pytest.ini"
       - "container/requirements.txt"
       - "container/Containerfile"
+      - "container/workspace.proto"
       - ".github/workflows/static-analysis.yml"
   push:
     branches: [develop, main]
@@ -17,6 +18,7 @@ on:
       - "pytest.ini"
       - "container/requirements.txt"
       - "container/Containerfile"
+      - "container/workspace.proto"
       - ".github/workflows/static-analysis.yml"
   workflow_dispatch:
 
@@ -73,53 +75,16 @@ jobs:
           cache-dependency-path: container/requirements.txt
 
       - name: Install dependencies
-        run: python -m pip install --requirement container/requirements.txt pyright==1.1.411
+        run: python -m pip install --requirement container/requirements.txt pyright
 
       - name: Verify dependency compatibility
         run: python -m pip check
 
       - name: Run Pyright
-        run: |
-          python - <<'EOF'
-          import json
-          import re
-          import subprocess
-          import sys
+        run: python -m pyright --warnings
 
-          # tapestry.interfaces.* and engram.health_exposition are mounted into /opt/workspace-interface by Containerfile.
-          PARENT_PACKAGES = {"engram", "tapestry"}
-          MISSING_IMPORT_RE = re.compile(r'Import "([^".]+)(?:\.[^"]*)?" could not be resolved')
+      - name: Install the tools the image installs
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends ripgrep
 
-          proc = subprocess.run([sys.executable, "-m", "pyright", "--outputjson"], capture_output=True, text=True)
-          if proc.returncode not in (0, 1):
-              raise SystemExit(proc.stderr or proc.stdout or f"pyright exited with {proc.returncode}")
-          report = json.loads(proc.stdout)
-          analyzed = report.get("summary", {}).get("filesAnalyzed", 0)
-          if analyzed <= 0:
-              raise SystemExit("Pyright analyzed no files")
-
-          blocking = []
-          for item in report.get("generalDiagnostics", []):
-              rule = item.get("rule", "")
-              msg = item.get("message", "")
-              if rule in {"reportMissingImports", "reportMissingModuleSource"}:
-                  match = MISSING_IMPORT_RE.search(msg)
-                  if match and match.group(1) in PARENT_PACKAGES:
-                      continue
-              if item.get("severity") in {"error", "warning"}:
-                  loc = item.get("range", {}).get("start", {})
-                  blocking.append(
-                      f"{item.get('file')}:{loc.get('line', 0) + 1}:{loc.get('character', 0) + 1}: "
-                      f"{item.get('severity')} [{rule}] {msg}"
-                  )
-
-          if blocking:
-              print("\n".join(blocking))
-              raise SystemExit(1)
-          print(f"Pyright checked {analyzed} files: 0 blocking diagnostics.")
-          EOF
-
-      - name: Run standalone entrypoint boundary tests
-        env:
-          PYTHONPATH: container
-        run: python -m pytest -o pythonpath=container tests/test_entrypoint.py
+      - name: Run tests
+        run: python -m pytest

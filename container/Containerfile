@@ -1,3 +1,5 @@
+# Build context: this directory. The image takes every file from it and nothing from any other repository:
+#   docker build -t python-sandbox:latest -f container/Containerfile container
 FROM docker.io/library/python:3.12-slim-bookworm
 
 RUN apt-get update && apt-get install -y \
@@ -8,7 +10,7 @@ RUN apt-get update && apt-get install -y \
 
 RUN useradd --create-home --shell /usr/sbin/nologin sandbox
 
-COPY container/sandbox-python/container/requirements.txt /opt/tapestry/
+COPY requirements.txt /opt/tapestry/
 RUN pip install --no-cache-dir -r /opt/tapestry/requirements.txt
 
 # The container is disposable, so there is no virtualenv. The system Python
@@ -18,13 +20,10 @@ RUN pip install --no-cache-dir -r /opt/tapestry/requirements.txt
 ENV PATH=$PATH:/home/sandbox/.local/bin
 
 # Every module of the server directory, as DEV mounts that directory read-only, so the image's own server never lags it.
-COPY container/sandbox-python/container/*.py container/sandbox-python/container/gitconfig /opt/tapestry/
-COPY container/sandbox-python/container/assets /opt/tapestry/assets/
-COPY tapestry/__init__.py /opt/workspace-interface/tapestry/
-COPY component/engram/engram/engram/health_exposition.py /opt/workspace-interface/engram/health_exposition.py
-COPY tapestry/interfaces/__init__.py tapestry/interfaces/envelope.py /opt/workspace-interface/tapestry/interfaces/
-COPY tapestry/interfaces/workspace/__init__.py tapestry/interfaces/workspace/constants.py tapestry/interfaces/workspace/workspace_pb2.py tapestry/interfaces/workspace/workspace_pb2_grpc.py /opt/workspace-interface/tapestry/interfaces/workspace/
-ENV PYTHONPATH=/opt/workspace-interface
+# The server's gRPC interface (workspace_pb2*.py, generated from workspace.proto), its payload codec and its metrics
+# exposition are modules of this directory like the rest, so the server imports nothing from outside it.
+COPY *.py gitconfig /opt/tapestry/
+COPY assets /opt/tapestry/assets/
 
 RUN mkdir /workspace \
     && chown -R sandbox:sandbox /workspace

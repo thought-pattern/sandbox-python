@@ -86,12 +86,16 @@ local container verification does not establish Fargate isolation.
 ```text
 sandbox-python/
 ├── container/
-│   ├── Containerfile
+│   ├── Containerfile       # builds from this directory alone
 │   ├── assets/             # health page, its renderer and copies of Tapestry's shared page assets
 │   ├── entrypoint.py       # key descriptor, privilege drop, optional offline mode, server exec
+│   ├── envelope.py         # MessagePack payload codec and the wire size bounds
 │   ├── health.py           # health figures and page files
+│   ├── health_exposition.py  # Prometheus text of the health figures
 │   ├── requirements.txt    # image dependencies
-│   └── server.py           # standard-library gRPC server
+│   ├── server.py           # standard-library gRPC server
+│   ├── workspace.proto     # the gRPC interface this server owns
+│   └── workspace_pb2*.py   # generated from workspace.proto
 └── tests/                  # direct API, subprocess, and lifecycle checks
 ```
 
@@ -116,12 +120,27 @@ with ExecutionSandbox(reload_config().get("sandbox", {}), egress_policy="deny").
     print(run_probe("print(6 * 7)"))
 ```
 
-Build the image with the configured engine (`podman build` takes the same arguments), from the repository root. The root `.dockerignore` admits only the server directory `container/sandbox-python/container` (the directory DEV mounts read-only as `sandbox.implementation_directory`), the Workspace protobuf/codec interface files and Engram's health exposition module; application sources, data and configuration are excluded. The image copies every module of the server directory, so its own server matches the mounted one once rebuilt:
+Build the image with the configured engine (`podman build` takes the same arguments). The build context is this repository's `container/` directory and nothing else: the server, its gRPC interface, its payload codec and its metrics exposition are all modules of that directory, the same directory DEV mounts read-only as `sandbox.implementation_directory`. The image copies every module of it, so its own server matches the mounted one once rebuilt. From this repository's root:
+
+```bash
+docker build -t python-sandbox:latest -f container/Containerfile container
+```
+
+From Tapestry's repository root, where this repository is the `container/sandbox-python` submodule, the same build is:
 
 ```bash
 docker build -t python-sandbox:latest \
-  -f container/sandbox-python/container/Containerfile .
+  -f container/sandbox-python/container/Containerfile container/sandbox-python/container
 ```
+
+`workspace_pb2.py`, `workspace_pb2.pyi` and `workspace_pb2_grpc.py` are generated from `container/workspace.proto` and committed. After a change to the interface, regenerate them with the `grpcio-tools` release that matches the `grpcio` pin in `container/requirements.txt`:
+
+```bash
+python3 -m grpc_tools.protoc -I container \
+  --python_out=container --pyi_out=container --grpc_python_out=container container/workspace.proto
+```
+
+A caller keeps its own stubs of the same interface; the RPC paths (`/tapestry.workspace.WorkspaceService/<method>`) and the MessagePack payload are the contract between them.
 
 The image also starts on its own, with no arguments, given only its key file mounted read-only at the canonical path; it then serves with the server's defaults (`/workspace`, tool port 8080, health port 8081, `direct` egress):
 
@@ -176,8 +195,8 @@ packages. They need `git`, `pip` and `rg` (ripgrep) on `PATH`, the same tools
 the image installs.
 
 ```bash
-python3 -m pytest container/sandbox-python/tests -q
+python3 -m pytest
 ```
 
-Run it from the Tapestry repository root, or run `python3 -m pytest` from this directory.
-`pytest.ini` puts `container/` and the Tapestry repository root on the import path.
+Run it from this repository's root. `pytest.ini` puts `container/` on the import path; nothing outside this repository
+is imported.

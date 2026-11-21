@@ -64,12 +64,20 @@ from time import monotonic as time_monotonic
 from uuid import UUID, uuid4
 
 from call_admission import CallThreads, ToolTurns
+from envelope import (
+    PAYLOAD_LIMIT_BYTES,
+    PROTOBUF_MESSAGE_LIMIT_BYTES,
+    READ_PART_LIMIT_BYTES,
+    decode_envelope,
+    encode_envelope,
+)
 from first_process import FirstProcess, hold_signals, program_command
 from grpc import StatusCode, server as grpc_server
 from health import HealthHTTPServer, WorkspaceHealth
 from part_write import PART_WRITE_FOLDERS, PartWriteRefusal, remove_unfinished_writes, write_part
 from process_output import (
     RUN_OUTPUT_FOLDERS,
+    RUN_OUTPUT_STREAMS,
     json_document,
     keep_output,
     log_commits,
@@ -80,16 +88,8 @@ from process_output import (
     text_lines,
 )
 from tool_process import INVOCATION_MARKER_VARIABLE, STALL_CHECKS, invocation_activity, terminate_process_group
-
-from tapestry.interfaces.envelope import decode_envelope, encode_envelope
-from tapestry.interfaces.workspace.constants import (
-    PAYLOAD_LIMIT_BYTES,
-    PROTOBUF_MESSAGE_LIMIT_BYTES,
-    READ_PART_LIMIT_BYTES,
-    RUN_OUTPUT_STREAMS,
-)
-from tapestry.interfaces.workspace.workspace_pb2 import WorkspaceEnvelope
-from tapestry.interfaces.workspace.workspace_pb2_grpc import WorkspaceServiceServicer, add_WorkspaceServiceServicer_to_server
+from workspace_pb2 import WorkspaceEnvelope
+from workspace_pb2_grpc import WorkspaceServiceServicer, add_WorkspaceServiceServicer_to_server
 
 DEFAULT_ARGUMENT_DICT = {}
 

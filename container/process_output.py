@@ -19,6 +19,8 @@ from tempfile import mkstemp
 # read part, named by the request and its stream. It lies outside every Task folder, so no listing, catalogue or change
 # of a Task's files includes it. A root Task's kept outputs go when its Task folder goes (`remove_unowned_run_outputs`).
 RUN_OUTPUT_FOLDERS = ".tapestry-output"
+# The streams of a process whose output is kept, in the order a tool's outputs are held.
+RUN_OUTPUT_STREAMS = ("stdout", "stderr")
 # The name a kept output's copy has until it is whole and takes the output's own name.
 KEPT_COPY_PREFIX = ".tapestry-output-"
 # The field a reply names a kept output by, the shape a stage result names a large text by

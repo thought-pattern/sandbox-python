@@ -256,6 +256,7 @@ def test_health_page_and_api_answer_without_the_key_and_count_tool_calls_without
         with raises(WorkspaceToolError):
             direct_tools.call_tool("run_python", {"script": "raise SystemExit(3)"})
         status, _, raw = fetch("/api/health")
+        metrics_status, _, metrics = fetch("/metrics")
     finally:
         connection.close()
     after = loads(raw)
@@ -268,6 +269,10 @@ def test_health_page_and_api_answer_without_the_key_and_count_tool_calls_without
     assert after.get("requests", {}).get("received", 0) == before.get("requests", {}).get("received", 0) + 2
     assert [item.get("operation", "") for item in after.get("recent_outcomes", [])][:2] == ["run_python", "file_write"]
     assert b"private file text" not in raw and b"secret.txt" not in raw and TOKEN.encode() not in raw
+    # The same figures in Prometheus text, from the server's own exposition module.
+    assert metrics_status == 200 and b'tapestry_component_ready{component="Workspace"} 1' in metrics
+    assert b'tapestry_request_outcomes_total{component="Workspace",operation="run_python",outcome="PROCESS_FAILED"} 1' in metrics
+    assert b"private file text" not in metrics and b"secret.txt" not in metrics and TOKEN.encode() not in metrics
 
 
 def test_unhealthy_readiness_names_each_failed_check(direct_tools, monkeypatch):

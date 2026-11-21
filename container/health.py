@@ -23,9 +23,8 @@ from threading import Lock
 from time import monotonic
 from uuid import uuid4
 
+from health_exposition import METRICS_CONTENT_TYPE, health_exposition
 from tool_process import STALL_CHECKS
-
-from engram.health_exposition import METRICS_CONTENT_TYPE, health_exposition
 
 RECENT_OUTCOMES = 32
 SAMPLE_SECONDS = 5.0
