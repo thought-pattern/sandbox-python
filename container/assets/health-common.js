@@ -281,17 +281,15 @@ export function renderStandard(component, snapshot) {
   table("std-token-operation-rows", Object.entries(usage.by_operation || {}), tokenColumns(), "No model calls.");
 }
 
-// Poll /api/health with one request outstanding and a four-second timeout, paused while the tab is hidden; a failed
-// poll marks the page stale, and a new incarnation shows the restart notice.
+// Poll /api/health with one request outstanding, paused while the tab is hidden; a failed poll marks the page stale,
+// and a new incarnation shows the restart notice.
 export function start(component, render) {
   const state = { snapshot: null, incarnation: "", pending: false, timer: null };
   async function load() {
     if (state.pending || document.hidden) return;
     state.pending = true;
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 4000);
     try {
-      const reply = await fetch("/api/health", { cache: "no-store", signal: controller.signal });
+      const reply = await fetch("/api/health", { cache: "no-store" });
       if (!reply.ok) throw new Error("HTTP " + reply.status);
       const snapshot = await reply.json();
       if (state.incarnation && state.incarnation !== snapshot.incarnation) {
@@ -304,10 +302,9 @@ export function start(component, render) {
       text("connection", "Live");
       byId("connection").className = "status live";
     } catch (error) {
-      text("connection", "Stale · " + (error.name === "AbortError" ? "timed out" : error.message));
+      text("connection", "Stale · " + error.message);
       byId("connection").className = "status stale";
     } finally {
-      clearTimeout(timeout);
       state.pending = false;
       clearTimeout(state.timer);
       if (!document.hidden) state.timer = setTimeout(load, 1000 * (state.snapshot?.refresh_seconds || 5));

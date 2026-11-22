@@ -14,6 +14,7 @@ from pathlib import Path
 from posixpath import normpath, relpath
 from shutil import rmtree
 from tempfile import mkstemp
+from unicodedata import normalize as unicodedata_normalize
 
 # The folder beside the Task folders that keeps, a folder per root Task, each process output larger than its caller's
 # read part, named by the request and its stream. It lies outside every Task folder, so no listing, catalogue or change
@@ -230,3 +231,40 @@ def remove_unowned_run_outputs(workspace: Path, task_folders: str, logger) -> No
                 rmtree(entry.path)
                 removed += 1
     logger.info("kept outputs of %s root Tasks whose Task folder is gone were removed", removed)
+
+
+def scoped_ripgrep_matches(lines, root: Path) -> list:
+    """Distinct canonical Python-source paths beneath `root` from ripgrep JSON lines, sorted by path."""
+    matches_by_path = {}
+    for line in lines:
+        data = json_loads(line) if line.strip() else {}
+        if data.get("type", "") != "match":
+            continue
+        raw_relative = ripgrep_relative_path(data.get("data", {}).get("path", {}), root)
+        if not raw_relative or raw_relative == ".":
+            raise ValueError("Scoped Python search escaped its repository root")
+        selected = (root / decode_path_text(raw_relative)).resolve()
+        if not selected.is_relative_to(root):
+            raise ValueError("Scoped Python search escaped its repository root")
+        relative = encode_path_bytes(fsencode(selected.relative_to(root)))
+        if relative not in matches_by_path:
+            matches_by_path[relative] = {
+                "relative_path": relative,
+                "line": data.get("data", {}).get("line_number", 0),
+            }
+    matches = [matches_by_path.get(path, {}) for path in sorted(matches_by_path)]
+    return matches
+
+
+def nfkc_stream_line(opened, canonical_symbol: str) -> int:
+    """First 1-based line number in binary `opened` whose UTF-8 NFKC text contains `canonical_symbol`, or 0."""
+    matched_line = 0
+    for line_number, raw_line in enumerate(opened, start=1):
+        try:
+            decoded = raw_line.decode("utf-8")
+        except UnicodeDecodeError:
+            return 0
+        if canonical_symbol in unicodedata_normalize("NFKC", decoded):
+            matched_line = line_number
+            break
+    return matched_line

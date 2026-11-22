@@ -12,7 +12,6 @@ from functools import partial as functools_partial
 from hashlib import sha256 as hashlib_sha256
 from hmac import compare_digest as hmac_compare_digest
 from inspect import Parameter as inspect_Parameter, signature as inspect_signature
-from json import loads as json_loads
 from logging import (
     INFO as logging_INFO,
     basicConfig as logging_basicConfig,
@@ -87,10 +86,11 @@ from process_output import (
     json_document,
     keep_output,
     log_commits,
+    nfkc_stream_line,
     output_detail,
     output_lines,
     remove_unowned_run_outputs,
-    ripgrep_relative_path,
+    scoped_ripgrep_matches,
     search_matches,
     text_lines,
 )
@@ -1089,38 +1089,11 @@ def file_search(pattern: str, path: str = ".", max_results: int = 0):
     return computed_return_value
 
 
-def nfkc_matching_line(root: Path, relative: str, canonical_symbol: str) -> int:
-    """First 1-based line number in `relative` whose UTF-8 NFKC text contains `canonical_symbol`, or 0."""
-    target = (root / decode_path_text(relative)).resolve()
-    if not target.is_relative_to(root):
-        raise ToolError("Scoped Python search escaped its repository root", code="path_escape", status=400)
-    try:
-        opened, state = scoped_repository_file(root, target)
-    except (FileNotFoundError, PermissionError, NotADirectoryError):
-        return 0
-    del state
-    matched_line = 0
-    with opened:
-        for line_number, raw_line in enumerate(opened, start=1):
-            try:
-                decoded = raw_line.decode("utf-8")
-            except UnicodeDecodeError:
-                return 0
-            if canonical_symbol in unicodedata_normalize("NFKC", decoded):
-                matched_line = line_number
-                break
-    return matched_line
-
-
 @tool
 def file_search_scoped(repository_root: str, symbol: str, max_results: int = 0):
     """Return every distinct Python-source path that names the symbol, or the caller's positive `max_results` of them."""
     if type(repository_root) is not str or not repository_root or type(symbol) is not str:
-        raise ToolError(
-            "Scoped Python search requires repository root and symbol",
-            code="bad_arguments",
-            status=400,
-        )
+        raise ToolError("Scoped Python search requires repository root and symbol", code="bad_arguments", status=400)
     if not symbol.isidentifier():
         raise ToolError("Scoped Python search symbol is invalid", code="bad_arguments", status=400)
     if type(max_results) is not int or max_results < 0:
@@ -1129,103 +1102,49 @@ def file_search_scoped(repository_root: str, symbol: str, max_results: int = 0):
     if not root.is_dir():
         raise ToolError("Scoped Python repository root is missing", code="path_missing", status=404)
     canonical_symbol = unicodedata_normalize("NFKC", symbol)
+    base_rg = ["rg", "--json", "--hidden", "--glob", "*.py", "--glob", "!**/.git/**"]
+    parser = functools_partial(scoped_matches, root=root)
     result = internal_run_process(
-        [
-            "rg",
-            "--json",
-            "--hidden",
-            "--fixed-strings",
-            "--glob",
-            "*.py",
-            "--glob",
-            "!**/.git/**",
-            "-e",
-            canonical_symbol,
-            "--",
-            str(root),
-        ],
-        stdout_parser=functools_partial(scoped_matches, root=root),
-        parsed_exit_codes=(0, 1),
+        [*base_rg, "--fixed-strings", "-e", canonical_symbol, "--", str(root)], stdout_parser=parser, parsed_exit_codes=(0, 1)
     )
     if result.get("exitCode", -1) not in (0, 1):
         require_process_success(result, "scoped Python search")
     matches_by_path = {entry.get("relative_path", ""): entry for entry in result.get("stdout", [])}
     non_ascii = internal_run_process(
-        [
-            "rg",
-            "--json",
-            "--hidden",
-            "--glob",
-            "*.py",
-            "--glob",
-            "!**/.git/**",
-            "-e",
-            r"[^\x00-\x7F]",
-            "--",
-            str(root),
-        ],
-        stdout_parser=functools_partial(scoped_matches, root=root),
-        parsed_exit_codes=(0, 1),
+        [*base_rg, "-e", r"[^\x00-\x7F]", "--", str(root)], stdout_parser=parser, parsed_exit_codes=(0, 1)
     )
     if non_ascii.get("exitCode", -1) not in (0, 1):
         require_process_success(non_ascii, "scoped Python search")
     for candidate in non_ascii.get("stdout", []):
         relative = candidate.get("relative_path", "")
-        if relative and relative not in matches_by_path:
-            matched_line = nfkc_matching_line(root, relative, canonical_symbol)
-            if matched_line > 0:
-                matches_by_path[relative] = {"relative_path": relative, "line": matched_line}
+        if not relative or relative in matches_by_path:
+            continue
+        target = (root / decode_path_text(relative)).resolve()
+        if not target.is_relative_to(root):
+            raise ToolError("Scoped Python search escaped its repository root", code="path_escape", status=400)
+        try:
+            opened, state = scoped_repository_file(root, target)
+        except (FileNotFoundError, PermissionError, NotADirectoryError):
+            continue
+        del state
+        with opened:
+            matched_line = nfkc_stream_line(opened, canonical_symbol)
+        if matched_line > 0:
+            matches_by_path[relative] = {"relative_path": relative, "line": matched_line}
     matches = [matches_by_path.get(path, {}) for path in sorted(matches_by_path)]
-    truncated = False
-    if max_results and len(matches) > max_results:
+    truncated = bool(max_results) and len(matches) > max_results
+    if truncated:
         matches = matches[:max_results]
-        truncated = True
-    search = {
-        "repository_root": str(root),
-        "symbol": symbol,
-        "matches": matches,
-        "truncated": truncated,
-    }
+    search = {"repository_root": str(root), "symbol": symbol, "matches": matches, "truncated": truncated}
     return search
 
 
 def scoped_matches(lines, root: Path) -> list:
-    """Each distinct Python-source path beneath `root` that ripgrep's JSON lines name, with its first matching line,
-    read one line at a time and sorted by path."""
-    matches_by_path = {}
-    for line in lines:
-        data = json_loads(line) if line.strip() else {}
-        if data.get("type", "") != "match":
-            continue
-        path_field = data.get("data", {}).get("path", {})
-        try:
-            raw_relative = ripgrep_relative_path(path_field, root)
-        except ValueError as err:
-            raise ToolError(
-                "Scoped Python search escaped its repository root",
-                code="path_escape",
-                status=400,
-            ) from err
-        if not raw_relative or raw_relative == ".":
-            raise ToolError(
-                "Scoped Python search escaped its repository root",
-                code="path_escape",
-                status=400,
-            )
-        selected = (root / decode_path_text(raw_relative)).resolve()
-        if not selected.is_relative_to(root):
-            raise ToolError(
-                "Scoped Python search escaped its repository root",
-                code="path_escape",
-                status=400,
-            )
-        relative = encode_path_bytes(os_fsencode(selected.relative_to(root)))
-        if relative not in matches_by_path:
-            matches_by_path[relative] = {
-                "relative_path": relative,
-                "line": data.get("data", {}).get("line_number", 0),
-            }
-    matches = [matches_by_path.get(path, {}) for path in sorted(matches_by_path)]
+    """Each distinct Python-source path beneath `root` that ripgrep's JSON lines name, sorted by path."""
+    try:
+        matches = scoped_ripgrep_matches(lines, root)
+    except ValueError as err:
+        raise ToolError("Scoped Python search escaped its repository root", code="path_escape", status=400) from err
     return matches
 
 
