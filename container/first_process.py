@@ -23,12 +23,14 @@ from os import WNOHANG, defpath as os_defpath, getpid as os_getpid, waitpid as o
 from pathlib import Path
 from shutil import which as shutil_which
 from signal import SIG_BLOCK, SIGCHLD, SIGINT, SIGTERM, pthread_sigmask as signal_pthread_sigmask
-from sys import executable as sys_executable, platform as sys_platform
+import sys
+from sys import executable as sys_executable
 from threading import Event as threading_Event, Lock as threading_Lock
 
 # sigwaitinfo exists only on Linux, where the server runs as a container's first process; the in-process uses of the
-# server on another host never serve its signals. Imported apart so Pyright checks it for Linux only.
-if sys_platform == "linux":
+# server on another host never serve its signals. Imported apart, under the platform test Pyright reads, so it is
+# checked for Linux only.
+if sys.platform == "linux":
     from signal import sigwaitinfo as signal_sigwaitinfo  # pylint: disable=ungrouped-imports
 
 # The signals the server holds blocked in every thread and reads itself; a tool program gets them unblocked.
@@ -133,7 +135,7 @@ class FirstProcess:
     def serve(self) -> None:
         """Read the held signals for the server's life: reap orphans on SIGCHLD, stop on a stop signal from outside the
         container, refuse one from a process inside it."""
-        if sys_platform != "linux":
+        if sys.platform != "linux":
             raise RuntimeError("the Workspace server reads its signals only on Linux")
         try:
             while True:

@@ -140,6 +140,8 @@ python3 -m grpc_tools.protoc -I container \
   --python_out=container --pyi_out=container --grpc_python_out=container container/workspace.proto
 ```
 
+grpc's public experimental API is a separately imported module, and the emitted convenience methods name it: after regenerating, add `import grpc.experimental` on the line after `import grpc` in `workspace_pb2_grpc.py`.
+
 A caller keeps its own stubs of the same interface; the RPC paths (`/tapestry.workspace.WorkspaceService/<method>`) and the MessagePack payload are the contract between them.
 
 The image also starts on its own, with no arguments, given only its key file mounted read-only at the canonical path; it then serves with the server's defaults (`/workspace`, tool port 8080, health port 8081, `direct` egress):

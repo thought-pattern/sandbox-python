@@ -7,6 +7,7 @@ of tool calls wait, and a stop answers every call accepted before it.
 """
 
 from collections import deque
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from threading import Event, Lock, Thread, current_thread
 
@@ -31,13 +32,11 @@ class CallThreads(ThreadPoolExecutor):
         with self.lock:
             if self.closed:
                 raise RuntimeError("Workspace call threads are shut down")
+            try:
+                thread.start()
+            except RuntimeError as err:
+                raise RuntimeError(f"Workspace call thread could not start: {err}") from err
             self.threads.add(thread)
-        try:
-            thread.start()
-        except RuntimeError as err:
-            with self.lock:
-                self.threads.discard(thread)
-            raise RuntimeError(f"Workspace call thread could not start: {err}") from err
         return future
 
     def run(self, future: Future, fn, args: tuple, kwargs: dict) -> None:
@@ -76,15 +75,23 @@ class ToolTurns:
         self.free = slots
         self.waiting = deque()
 
-    def take(self) -> None:
-        """Hold a tool slot, waiting with no limit until every call that arrived earlier has taken one."""
+    def take(self, on_arrive: Callable[[bool], str]) -> str:
+        """Hold a tool slot, waiting with no limit until every call that arrived earlier has taken one.
+
+        `on_arrive` records the call's arrival in the same step that fixes its place in the order, told whether the
+        call waits; the key it returns is returned here once the slot is held."""
         with self.lock:
-            if self.free and not self.waiting:
+            immediate = bool(self.free and not self.waiting)
+            if immediate:
                 self.free -= 1
-                return
-            turn = Event()
-            self.waiting.append(turn)
-        turn.wait()
+                turn = False
+            else:
+                turn = Event()
+                self.waiting.append(turn)
+            recorded = on_arrive(not immediate)
+        if turn is not False:
+            turn.wait()
+        return recorded
 
     def leave(self) -> None:
         """Pass this call's slot to the call that has waited longest, or free it when none waits."""

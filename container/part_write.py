@@ -16,10 +16,23 @@ ends a write.
 """
 
 from hashlib import file_digest, sha256
-from os import O_APPEND, O_CLOEXEC, O_CREAT, O_NOFOLLOW, O_TRUNC, O_WRONLY, fdopen, fsync, open as os_open
+from os import (
+    O_APPEND,
+    O_CLOEXEC,
+    O_CREAT,
+    O_NOFOLLOW,
+    O_TRUNC,
+    O_WRONLY,
+    chmod as os_chmod,
+    fdopen,
+    fsync,
+    lstat as os_lstat,
+    open as os_open,
+)
 from pathlib import Path
 from re import fullmatch
 from shutil import rmtree
+from stat import S_IMODE, S_ISREG
 
 # The folder beside the Task folders that holds, a folder per root Task, the staged file of each unfinished write.
 PART_WRITE_FOLDERS = ".tapestry-parts"
@@ -118,6 +131,12 @@ def place_file(staged: Path, target: Path, digest: str) -> None:
                 {"sha256": found},
             )
         target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            existing = os_lstat(target)
+        except FileNotFoundError:
+            existing = False
+        if existing is not False and S_ISREG(existing.st_mode):
+            os_chmod(staged, S_IMODE(existing.st_mode))
         staged.replace(target)
     except Exception:
         staged.unlink(missing_ok=True)

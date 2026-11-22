@@ -9,7 +9,7 @@ from base64 import b64decode
 from codecs import getincrementaldecoder
 from hashlib import sha256
 from json import loads as json_loads
-from os import fdopen, fsencode, fsync, scandir
+from os import fdopen, fsdecode, fsencode, fsync, scandir
 from pathlib import Path
 from posixpath import normpath, relpath
 from shutil import rmtree
@@ -68,12 +68,56 @@ def ripgrep_text(field: object) -> str:
     return decoded
 
 
+PATH_BYTE_ESCAPE = "\uf700"
+PATH_PUA_START = 0xF700
+PATH_PUA_END = 0xF7FF
+
+
+def encode_path_bytes(raw: bytes) -> str:
+    """Encode raw filesystem path bytes into a lossless valid UTF-8 string."""
+    decoded = fsdecode(raw)
+    pieces = []
+    for character in decoded:
+        code = ord(character)
+        if 0xDC80 <= code <= 0xDCFF:
+            pieces.append(chr(PATH_PUA_START + (code & 0xFF)))
+        elif PATH_PUA_START <= code <= PATH_PUA_END:
+            pieces.append(PATH_BYTE_ESCAPE + character)
+        else:
+            pieces.append(character)
+    encoded = "".join(pieces)
+    return encoded
+
+
+def decode_path_text(text: str) -> str:
+    """Decode a wire UTF-8 path string back into `os.fsdecode` surrogateescape form."""
+    if not any(PATH_PUA_START <= ord(character) <= PATH_PUA_END for character in text):
+        return text
+    pieces = []
+    index = 0
+    limit = len(text)
+    while index < limit:
+        character = text[index]
+        code = ord(character)
+        if character == PATH_BYTE_ESCAPE and index + 1 < limit and PATH_PUA_START <= ord(text[index + 1]) <= PATH_PUA_END:
+            pieces.append(text[index + 1])
+            index += 2
+            continue
+        if 0xF780 <= code <= PATH_PUA_END:
+            pieces.append(chr(0xDC00 | (code & 0xFF)))
+        else:
+            pieces.append(character)
+        index += 1
+    decoded = "".join(pieces)
+    return decoded
+
+
 def ripgrep_relative_path(field: object, base: Path) -> str:
     """Resolve a ripgrep JSON path field (`text` or base64 `bytes`) relative to `base`."""
     if isinstance(field, dict):
         text_value = field.get("text", "")
         if "text" in field and isinstance(text_value, str) and text_value:
-            relative_text = str(Path(text_value).relative_to(base))
+            relative_text = encode_path_bytes(fsencode(Path(text_value).relative_to(base)))
             return relative_text
         bytes_value = field.get("bytes", "")
         if "bytes" in field and isinstance(bytes_value, str):
@@ -90,7 +134,7 @@ def ripgrep_relative_path(field: object, base: Path) -> str:
                 in_base = raw_path == base_bytes or raw_path.startswith(prefix)
             if not in_base:
                 raise ValueError(f"{raw!r} is not in the subpath of {str(base)!r}")
-            relative_bytes = relpath(raw_path, base_bytes).decode("utf-8", errors="replace")
+            relative_bytes = encode_path_bytes(relpath(raw_path, base_bytes))
             return relative_bytes
     fallback = str(Path("").relative_to(base))
     return fallback

@@ -25,11 +25,14 @@ from os import (
     O_NONBLOCK,
     O_RDONLY,
     ST_RDONLY,
+    chmod as os_chmod,
     close as os_close,
     environ as os_environ,
     fdopen as os_fdopen,
+    fsencode as os_fsencode,
     fstat as os_fstat,
     fsync as os_fsync,
+    lstat as os_lstat,
     open as os_open,
     scandir as os_scandir,
     stat as os_stat,
@@ -44,7 +47,7 @@ from shutil import (
     rmtree as shutil_rmtree,
     which as shutil_which,
 )
-from stat import S_ISLNK, S_ISREG
+from stat import S_IMODE, S_ISLNK, S_ISREG
 from subprocess import (
     Popen as subprocess_Popen,
     TimeoutExpired as subprocess_TimeoutExpired,
@@ -61,6 +64,7 @@ from threading import (
     Thread as threading_Thread,
 )
 from time import monotonic as time_monotonic
+from unicodedata import normalize as unicodedata_normalize
 from uuid import UUID, uuid4
 
 from call_admission import CallThreads, ToolTurns
@@ -78,12 +82,15 @@ from part_write import PART_WRITE_FOLDERS, PartWriteRefusal, remove_unfinished_w
 from process_output import (
     RUN_OUTPUT_FOLDERS,
     RUN_OUTPUT_STREAMS,
+    decode_path_text,
+    encode_path_bytes,
     json_document,
     keep_output,
     log_commits,
     output_detail,
     output_lines,
     remove_unowned_run_outputs,
+    ripgrep_relative_path,
     search_matches,
     text_lines,
 )
@@ -260,6 +267,14 @@ def file_change_identity(path: Path, workspace: Path) -> dict:
     }
 
 
+def nearest_existing_directory(candidate: Path, workspace: Path) -> Path:
+    """Return the deepest existing directory along `candidate`'s parents within `workspace`."""
+    current = candidate.parent
+    while current != workspace and not current.exists():
+        current = current.parent
+    return current
+
+
 def root_file_catalog(root_task_id: str, paths: list) -> dict:
     """Observe complete original-input metadata, or selected current files, without retaining content."""
     workspace = request_working_context(root_task_id).get("directory")
@@ -272,12 +287,18 @@ def root_file_catalog(root_task_id: str, paths: list) -> dict:
             candidate = workspace / relative
             if not candidate.resolve().is_relative_to(workspace):
                 raise ToolError("Input metadata cannot leave its Task folder", code="path_escape", status=400)
+            ancestor = nearest_existing_directory(candidate, workspace).resolve(strict=True)
+            if not ancestor.is_relative_to(workspace):
+                raise ToolError("Input metadata cannot leave its Task folder", code="path_escape", status=400)
+            if ancestor not in directories:
+                metadata = ancestor.stat()
+                directories[ancestor] = (metadata.st_dev, metadata.st_ino, metadata.st_mtime_ns, metadata.st_ctime_ns)
             if not candidate.exists():
                 missing.append(relative)
             else:
                 candidates.append(candidate)
     else:
-        pending = [(workspace, frozenset())]
+        pending: list = [(workspace, ())]
         while pending:
             directory, ancestors = pending.pop()
             resolved = directory.resolve(strict=True)
@@ -289,14 +310,14 @@ def root_file_catalog(root_task_id: str, paths: list) -> dict:
                 children = sorted((Path(entry.path) for entry in entries), key=lambda entry: entry.name)
             for candidate in children:
                 if candidate.is_dir():
-                    pending.append((candidate, ancestors | {resolved}))
+                    pending.append((candidate, ancestors + (resolved,)))
                 elif candidate.is_file():
                     candidates.append(candidate)
                 else:
                     raise ToolError(
                         "Input catalogue contains an unreadable file or special entry", code="input_catalog_invalid", status=422
                     )
-    for candidate in sorted(candidates):
+    for candidate in sorted(candidates, key=lambda item: str(item.relative_to(workspace))):
         identity = file_change_identity(candidate, workspace)
         digest = hashlib_sha256()
         size = 0
@@ -312,9 +333,13 @@ def root_file_catalog(root_task_id: str, paths: list) -> dict:
         files.append(
             {"path": str(candidate.relative_to(workspace)), "bytes": size, "sha256": digest.hexdigest(), "identity": identity}
         )
-    # Recheck every observed identity after the last hash, so a changing tree never establishes initial authority.
+    # Recheck every observed identity and missing path after the last hash, so a changing tree never establishes authority.
     for entry in files:
         if entry.get("identity") != file_change_identity(workspace / entry.get("path", ""), workspace):
+            raise ToolError("Input file changed during catalogue capture", code="input_catalog_changed", status=409)
+    for relative in missing:
+        missing_candidate = workspace / relative
+        if missing_candidate.exists():
             raise ToolError("Input file changed during catalogue capture", code="input_catalog_changed", status=409)
     for directory, identity in directories.items():
         metadata = directory.stat()
@@ -326,9 +351,32 @@ def root_file_catalog(root_task_id: str, paths: list) -> dict:
 def resolve_path(path):
     """Resolve a path within the workspace, rejecting anything outside it."""
     workspace = current_workspace()
-    target = (workspace / str(path)).resolve()
+    decoded = decode_path_text(str(path))
+    target = (workspace / decoded).resolve()
     if not target.is_relative_to(workspace):
         raise ToolError("Path must be within workspace", code="path_escape", status=400)
+    return target
+
+
+def resolve_entry_path(path):
+    """Resolve a workspace entry's parent without following a symbolic link at the final component."""
+    workspace = current_workspace()
+    raw_text = decode_path_text(str(path))
+    if raw_text.endswith("/"):
+        raise IsADirectoryError("Directory cannot be deleted as a file")
+    raw_path = Path(raw_text)
+    if raw_path.is_absolute():
+        raise ToolError("Path must be within workspace", code="path_escape", status=400)
+    parts = raw_path.parts
+    if not parts or parts[-1] in (".", ".."):
+        resolved = (workspace / raw_path).resolve()
+        if not resolved.is_relative_to(workspace):
+            raise ToolError("Path must be within workspace", code="path_escape", status=400)
+        raise IsADirectoryError("Directory cannot be deleted as a file")
+    parent = (workspace / Path(*parts[:-1])).resolve()
+    if not parent.is_relative_to(workspace):
+        raise ToolError("Path must be within workspace", code="path_escape", status=400)
+    target = parent / parts[-1]
     return target
 
 
@@ -342,6 +390,12 @@ def atomic_write(target, write) -> None:
             write(handle)
             handle.flush()
             os_fsync(handle.fileno())
+        try:
+            existing = os_lstat(target)
+        except FileNotFoundError:
+            existing = False
+        if existing is not False and S_ISREG(existing.st_mode):
+            os_chmod(temporary, S_IMODE(existing.st_mode))
         temporary.replace(target)
     except Exception:
         temporary.unlink(missing_ok=True)
@@ -547,11 +601,9 @@ def run_output_read(run_request_id: str, stream: str, offset: int, length: int):
 
 
 def require_part_bounds(offset: object, length: object) -> None:
-    """Refuse a part read whose offset or length is not one answer's, or whose part the Workspace's memory cannot hold."""
+    """Refuse a part read whose offset or length is not one answer's."""
     if type(offset) is not int or type(length) is not int or offset < 0 or not 0 < length <= PAYLOAD_LIMIT_BYTES:
         raise ToolError("A part read needs an offset of 0 or more and a length within one answer", code="bad_arguments", status=400)
-    if not whole_read_fits(length):
-        raise ToolError("A part this long is larger than the Workspace's memory can answer", code="file_too_large", status=413)
 
 
 def workspace_regular_file(root: Path, target: Path) -> tuple:
@@ -570,17 +622,35 @@ def workspace_file_part(target, offset: int, length: int, root: Path) -> dict:
     opened, so a reader assembles a file of any size in parts and knows when the file changed between them."""
     opened, state = workspace_regular_file(root, target)
     with opened:
+        actual_bytes = min(length, max(0, state.st_size - offset))
+        if not whole_read_fits(actual_bytes):
+            raise ToolError("A part this long is larger than the Workspace's memory can answer", code="file_too_large", status=413)
         opened.seek(offset)
-        data = opened.read(length)
+        data = opened.read(min(length, actual_bytes + 1))
+        after = os_fstat(opened.fileno())
+    if len(data) > actual_bytes or (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ) != (
+        state.st_dev,
+        state.st_ino,
+        state.st_size,
+        state.st_mtime_ns,
+        state.st_ctime_ns,
+    ):
+        raise ToolError("File changed while it was read", code="file_changed", status=409)
     part = {
         "data": data,
         "offset": offset,
-        "size": state.st_size,
+        "size": after.st_size,
         "identity": {
-            "device": state.st_dev,
-            "inode": state.st_ino,
-            "modified_ns": state.st_mtime_ns,
-            "changed_ns": state.st_ctime_ns,
+            "device": after.st_dev,
+            "inode": after.st_ino,
+            "modified_ns": after.st_mtime_ns,
+            "changed_ns": after.st_ctime_ns,
         },
     }
     return part
@@ -637,10 +707,13 @@ def file_read_scoped(repository_root: str, path: str, offset: int = -1, length: 
             status=400,
         )
     root = resolve_path(repository_root)
-    target = (root / path).resolve()
+    decoded_relative = decode_path_text(path)
+    target = (root / decoded_relative).resolve()
     if not root.is_dir() or not target.is_relative_to(root):
         raise ToolError("Scoped read escaped its repository root", code="path_escape", status=400)
-    provenance = {"repository_root": str(root), "resolved_path": str(target), "relative_path": str(target.relative_to(root))}
+    relative_wire = encode_path_bytes(os_fsencode(target.relative_to(root)))
+    resolved_wire = encode_path_bytes(os_fsencode(target))
+    provenance = {"repository_root": str(root), "resolved_path": resolved_wire, "relative_path": relative_wire}
     if offset != -1 or length != 0:
         require_part_bounds(offset, length)
         with FILE_LOCK:
@@ -669,6 +742,15 @@ def whole_file_bytes(opened, state) -> bytes:
     source = opened.read(PAYLOAD_LIMIT_BYTES + 1)
     if len(source) > PAYLOAD_LIMIT_BYTES:
         raise ToolError("File grew beyond one Workspace answer while it was read", code="file_too_large", status=413)
+    after = os_fstat(opened.fileno())
+    if len(source) != state.st_size or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) != (
+        state.st_dev,
+        state.st_ino,
+        state.st_size,
+        state.st_mtime_ns,
+        state.st_ctime_ns,
+    ):
+        raise ToolError("File changed while it was read", code="file_changed", status=409)
     return source
 
 
@@ -870,8 +952,8 @@ def write_bytes(data: bytes, handle) -> None:
 
 @tool
 def file_delete(path: str):
-    """Delete one file from the workspace."""
-    target = resolve_path(path)
+    """Delete one file or symbolic link from the workspace without following a final symbolic link."""
+    target = resolve_entry_path(path)
     with FILE_LOCK:
         target.unlink(missing_ok=False)
     computed_return_value = {
@@ -933,6 +1015,9 @@ def file_list(path: str = ".", depth: int = WHOLE_TREE_DEPTH, max_results: int =
         if not parent_node:
             raise RuntimeError("workspace listing lost the node of a queued directory")
         for entry in sorted(entries, key=lambda item: item.name):
+            if max_results and len(files) + len(directories) + len(links) + len(other) >= max_results:
+                stop_reason = "result_limit"
+                break
             candidate = Path(entry.path)
             relative_path = str(candidate.relative_to(workspace))
             if entry.is_symlink():
@@ -956,9 +1041,6 @@ def file_list(path: str = ".", depth: int = WHOLE_TREE_DEPTH, max_results: int =
                 node["children"] = []
                 tree_nodes[relative_path] = node
             parent_node.get("children", []).append(node)
-            if max_results and len(files) + len(directories) + len(links) + len(other) >= max_results:
-                stop_reason = "result_limit"
-                break
         if stop_reason != "complete":
             break
         pending.extend(reversed(children))
@@ -988,19 +1070,46 @@ def file_search(pattern: str, path: str = ".", max_results: int = 0):
     """Search files with ripgrep and return structured matches: every match, or the caller's positive `max_results`."""
     target = resolve_path(path)
     max_results = max(0, int(max_results))
+    parser_limit = max_results + 1 if max_results else 0
     result = internal_run_process(
         ["rg", "--json", "-e", pattern, "--", str(target)],
-        stdout_parser=functools_partial(search_matches, max_results=max_results, base=current_workspace()),
+        stdout_parser=functools_partial(search_matches, max_results=parser_limit, base=current_workspace()),
         parsed_exit_codes=(0, 1),
     )
     if result.get("exitCode", ()) not in (0, 1):
         require_process_success(result, "file search")
     matches = result.get("stdout", [])
+    truncated = bool(max_results) and len(matches) > max_results
+    if truncated:
+        matches = matches[:max_results]
     computed_return_value = {
         "matches": matches,
-        "truncated": bool(max_results) and len(matches) >= max_results,
+        "truncated": truncated,
     }
     return computed_return_value
+
+
+def nfkc_matching_line(root: Path, relative: str, canonical_symbol: str) -> int:
+    """First 1-based line number in `relative` whose UTF-8 NFKC text contains `canonical_symbol`, or 0."""
+    target = (root / decode_path_text(relative)).resolve()
+    if not target.is_relative_to(root):
+        raise ToolError("Scoped Python search escaped its repository root", code="path_escape", status=400)
+    try:
+        opened, state = scoped_repository_file(root, target)
+    except (FileNotFoundError, PermissionError, NotADirectoryError):
+        return 0
+    del state
+    matched_line = 0
+    with opened:
+        for line_number, raw_line in enumerate(opened, start=1):
+            try:
+                decoded = raw_line.decode("utf-8")
+            except UnicodeDecodeError:
+                return 0
+            if canonical_symbol in unicodedata_normalize("NFKC", decoded):
+                matched_line = line_number
+                break
+    return matched_line
 
 
 @tool
@@ -1012,22 +1121,26 @@ def file_search_scoped(repository_root: str, symbol: str, max_results: int = 0):
             code="bad_arguments",
             status=400,
         )
-    if re_fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", symbol) is None:
+    if not symbol.isidentifier():
         raise ToolError("Scoped Python search symbol is invalid", code="bad_arguments", status=400)
     if type(max_results) is not int or max_results < 0:
         raise ToolError("Scoped Python search limit is invalid", code="bad_arguments", status=400)
     root = resolve_path(repository_root)
     if not root.is_dir():
         raise ToolError("Scoped Python repository root is missing", code="path_missing", status=404)
+    canonical_symbol = unicodedata_normalize("NFKC", symbol)
     result = internal_run_process(
         [
             "rg",
             "--json",
+            "--hidden",
             "--fixed-strings",
             "--glob",
             "*.py",
+            "--glob",
+            "!**/.git/**",
             "-e",
-            symbol,
+            canonical_symbol,
             "--",
             str(root),
         ],
@@ -1036,7 +1149,33 @@ def file_search_scoped(repository_root: str, symbol: str, max_results: int = 0):
     )
     if result.get("exitCode", -1) not in (0, 1):
         require_process_success(result, "scoped Python search")
-    matches = result.get("stdout", [])
+    matches_by_path = {entry.get("relative_path", ""): entry for entry in result.get("stdout", [])}
+    non_ascii = internal_run_process(
+        [
+            "rg",
+            "--json",
+            "--hidden",
+            "--glob",
+            "*.py",
+            "--glob",
+            "!**/.git/**",
+            "-e",
+            r"[^\x00-\x7F]",
+            "--",
+            str(root),
+        ],
+        stdout_parser=functools_partial(scoped_matches, root=root),
+        parsed_exit_codes=(0, 1),
+    )
+    if non_ascii.get("exitCode", -1) not in (0, 1):
+        require_process_success(non_ascii, "scoped Python search")
+    for candidate in non_ascii.get("stdout", []):
+        relative = candidate.get("relative_path", "")
+        if relative and relative not in matches_by_path:
+            matched_line = nfkc_matching_line(root, relative, canonical_symbol)
+            if matched_line > 0:
+                matches_by_path[relative] = {"relative_path": relative, "line": matched_line}
+    matches = [matches_by_path.get(path, {}) for path in sorted(matches_by_path)]
     truncated = False
     if max_results and len(matches) > max_results:
         matches = matches[:max_results]
@@ -1058,14 +1197,29 @@ def scoped_matches(lines, root: Path) -> list:
         data = json_loads(line) if line.strip() else {}
         if data.get("type", "") != "match":
             continue
-        selected = Path(data.get("data", {}).get("path", {}).get("text", "")).resolve()
+        path_field = data.get("data", {}).get("path", {})
+        try:
+            raw_relative = ripgrep_relative_path(path_field, root)
+        except ValueError as err:
+            raise ToolError(
+                "Scoped Python search escaped its repository root",
+                code="path_escape",
+                status=400,
+            ) from err
+        if not raw_relative or raw_relative == ".":
+            raise ToolError(
+                "Scoped Python search escaped its repository root",
+                code="path_escape",
+                status=400,
+            )
+        selected = (root / decode_path_text(raw_relative)).resolve()
         if not selected.is_relative_to(root):
             raise ToolError(
                 "Scoped Python search escaped its repository root",
                 code="path_escape",
                 status=400,
             )
-        relative = str(selected.relative_to(root))
+        relative = encode_path_bytes(os_fsencode(selected.relative_to(root)))
         if relative not in matches_by_path:
             matches_by_path[relative] = {
                 "relative_path": relative,
@@ -1171,8 +1325,11 @@ def git_init(branch: str = "main"):
     require_process_success(validation, "git branch validation")
     result = run_git(["init", f"--initial-branch={branch}"], text_lines)
     require_process_success(result, "git init")
+    current = require_process_success(run_git(["branch", "--show-current"], text_lines), "git branch")
+    current_lines = current.get("stdout", [])
+    actual_branch = current_lines[0] if current_lines else "HEAD"
     output = {
-        "branch": branch,
+        "branch": actual_branch,
         "initialized": True,
         "message": "\n".join(result.get("stdout", [])),
     }
@@ -1187,23 +1344,40 @@ def git_clone(repo_url: str, branch: str = "main"):
     validate_git_atom(branch, "branch")
     workspace = current_workspace()
     staging = workspace / f".tapestry-clone-{uuid4().hex}"
+    displaced = workspace / f".tapestry-clone-displaced-{uuid4().hex}"
+    placed = []
     with FILE_LOCK:
         try:
             result = run_git(["clone", "--branch", branch, "--", repo_url, str(staging)])
             require_process_success(result, "git clone")
+            displaced.mkdir(parents=False, exist_ok=False)
             for item in list(workspace.iterdir()):
-                if item == staging:
+                if item in (staging, displaced):
                     continue
-                if item.is_symlink() or not item.is_dir():
-                    item.unlink()
-                else:
-                    shutil_rmtree(item)
+                item.rename(displaced / item.name)
             for item in list(staging.iterdir()):
-                shutil_move(str(item), workspace / item.name)
+                destination = workspace / item.name
+                shutil_move(str(item), destination)
+                placed.append(destination)
             staging.rmdir()
         except Exception:
+            for destination in placed:
+                if destination.is_symlink() or not destination.is_dir():
+                    destination.unlink(missing_ok=True)
+                else:
+                    shutil_rmtree(destination, ignore_errors=True)
+            if displaced.is_dir():
+                for prior in list(displaced.iterdir()):
+                    prior.rename(workspace / prior.name)
+                displaced.rmdir()
             shutil_rmtree(staging, ignore_errors=True)
             raise
+        for prior in list(displaced.iterdir()):
+            if prior.is_symlink() or not prior.is_dir():
+                prior.unlink()
+            else:
+                shutil_rmtree(prior)
+        displaced.rmdir()
     return {"repository": repo_url, "branch": branch, "cloned": True}
 
 
@@ -1564,6 +1738,7 @@ class WorkspaceService(WorkspaceServiceServicer):
             or paths
             and not root
         ):
+            self.health.refused("manifest", "INVALID_ARGUMENT", "invalid_request")
             context.abort(StatusCode.INVALID_ARGUMENT, "Root metadata requires distinct canonical relative paths")
         key = self.health.received("manifest", {"request_id": identifier})
         try:
@@ -1602,12 +1777,14 @@ class WorkspaceService(WorkspaceServiceServicer):
         arguments = payload.get("arguments", {})
         root = payload.get("root_task_id", "")
         if type(name) is not str or not re_fullmatch(r"[a-z][a-z0-9_]*", name):
+            self.health.refused("tool", "INVALID_ARGUMENT", "invalid_request")
             context.abort(StatusCode.INVALID_ARGUMENT, "Workspace tool name is invalid")
-        if type(arguments) is not dict or any(type(key) is not str for key in arguments):
-            context.abort(StatusCode.INVALID_ARGUMENT, "Workspace arguments require a string-key mapping")
-        identifier = payload.get("request_id", "")
         fn = TOOLS.get(name, False)
         operation = name if fn is not False else "unknown tool"
+        if type(arguments) is not dict or any(type(key) is not str for key in arguments):
+            self.health.refused(operation, "INVALID_ARGUMENT", "invalid_request")
+            context.abort(StatusCode.INVALID_ARGUMENT, "Workspace arguments require a string-key mapping")
+        identifier = payload.get("request_id", "")
         working = (
             {"root_task_id": root}
             if type(root) is str and re_fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", root)
@@ -1620,9 +1797,10 @@ class WorkspaceService(WorkspaceServiceServicer):
             response = self.refuse(identifier, operation, 404, "unknown_tool", "Workspace tool is unknown", working)
             return response
         arrived = time_monotonic()
-        key = self.health.received(name, {"request_id": identifier, "root_task_id": root}, waits=True)
-        # Accepted: the call waits here, with no limit, until every tool call that arrived before it has taken a slot.
-        self.turns.take()
+        # Accepted: reserve arrival order and health tracking together, then wait until earlier tool calls finish.
+        key = self.turns.take(
+            lambda waits: self.health.received(name, {"request_id": identifier, "root_task_id": root}, waits=waits)
+        )
         self.health.admitted(key)
         started = time_monotonic()
         context_token = False
@@ -1759,8 +1937,15 @@ def read_auth_token(args):
     if len(content) > MAX_AUTH_TOKEN_FILE_BYTES:
         raise ValueError("auth token file exceeds its bound")
     token = content.decode("utf-8").removesuffix("\n")
-    if len(token) < MIN_AUTH_TOKEN_LENGTH or any(character in token for character in ("\r", "\n", "\x00")):
-        raise ValueError(f"auth token must be one line of at least {MIN_AUTH_TOKEN_LENGTH} characters")
+    max_token_length = MAX_AUTH_TOKEN_FILE_BYTES - 1
+    if (
+        len(token) < MIN_AUTH_TOKEN_LENGTH
+        or len(token) > max_token_length
+        or any(not 32 <= ord(character) <= 126 for character in token)
+    ):
+        raise ValueError(
+            f"auth token must be one printable ASCII line between {MIN_AUTH_TOKEN_LENGTH} and {max_token_length} characters"
+        )
     return token
 
 

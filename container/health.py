@@ -91,7 +91,15 @@ class WorkspaceHealth:
         key = uuid4().hex
         now = monotonic()
         observed_at = datetime.now(UTC).isoformat()
-        item = {"operation": operation, "ids": health_ids(ids), "accepted": now, "accepted_at": observed_at}
+        request_id = ids.get("request_id", "")
+        tracked_request_id = request_id if type(request_id) is str else ""
+        item = {
+            "operation": operation,
+            "request_id": tracked_request_id,
+            "ids": health_ids(ids),
+            "accepted": now,
+            "accepted_at": observed_at,
+        }
         if not waits:
             item["started"] = now
         with self.lock:
@@ -111,7 +119,7 @@ class WorkspaceHealth:
         """The request IDs of the calls accepted and not yet answered, waiting for a tool slot or running, so a caller
         that lost its reply can tell whether to wait: a waiting call runs when its turn comes."""
         with self.lock:
-            identifiers = {item.get("ids", {}).get("request_id", "") for item in self.items.values()}
+            identifiers = {item.get("request_id", "") or item.get("ids", {}).get("request_id", "") for item in self.items.values()}
         running = sorted(identifiers - {""})
         return running
 

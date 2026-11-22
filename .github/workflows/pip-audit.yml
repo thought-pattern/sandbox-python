@@ -47,6 +47,7 @@ jobs:
           import tempfile
           from pathlib import Path
           from packaging.requirements import Requirement
+          from packaging.specifiers import SpecifierSet
           from packaging.utils import InvalidWheelFilename, canonicalize_name, parse_wheel_filename
           from packaging.version import InvalidVersion, Version
 
@@ -66,17 +67,17 @@ jobs:
               req = Requirement(text)
               if req.url:
                   ver = wheel_version(req.url)
-                  return f"{req.name}=={Version(ver).base_version}" if ver else f"{req.name} @ {req.url}"
+                  return f"{req.name}=={Version(ver).public}" if ver else f"{req.name} @ {req.url}"
               specs = []
               for sp in req.specifier:
                   if sp.operator == "==":
                       try:
-                          specs.append(f"=={Version(sp.version).base_version}")
+                          specs.append(f"=={Version(sp.version).public}")
                           continue
                       except InvalidVersion:
                           pass
                   specs.append(str(sp))
-              return f"{req.name}{''.join(specs)}"
+              return f"{req.name}{SpecifierSet(','.join(specs))}"
 
           lines = [audited_requirement(raw) for raw in manifest.read_text(encoding="utf-8").splitlines()]
           lines = [line for line in dict.fromkeys(lines) if line]
