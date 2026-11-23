@@ -1,0 +1,41 @@
+name: Ruff
+
+on:
+  pull_request:
+    paths:
+      - "**/*.py"
+      - "pyproject.toml"
+      - ".github/workflows/ruff.yml"
+  push:
+    branches: [develop, main]
+    paths:
+      - "**/*.py"
+      - "pyproject.toml"
+      - ".github/workflows/ruff.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ruff-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ruff:
+    name: Ruff
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install Ruff
+        run: python -m pip install ruff
+
+      - name: Run Ruff
+        run: ruff check container tests --select E9,F63,F7,F82,F401,F811,F821,F822,F823 --output-format=concise

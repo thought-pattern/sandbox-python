@@ -1,0 +1,13 @@
+syntax = "proto3";
+// The package is part of every RPC's path on the wire (/tapestry.workspace.WorkspaceService/<method>), so it is the
+// name callers already address; it names no dependency.
+package tapestry.workspace;
+
+// The payload is one MessagePack string-key mapping (envelope.py).
+message WorkspaceEnvelope { bytes payload = 1; }
+
+service WorkspaceService {
+  rpc CheckHealth(WorkspaceEnvelope) returns (WorkspaceEnvelope);
+  rpc Describe(WorkspaceEnvelope) returns (WorkspaceEnvelope);
+  rpc InvokeTool(WorkspaceEnvelope) returns (WorkspaceEnvelope);
+}

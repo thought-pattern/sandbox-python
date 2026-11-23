@@ -1,3 +1,5 @@
+# Build context: this directory. The image takes every file from it and nothing from any other repository:
+#   docker build -t python-sandbox:latest -f container/Containerfile container
 FROM docker.io/library/python:3.12-slim-bookworm
 
 RUN apt-get update && apt-get install -y \
@@ -17,16 +19,22 @@ RUN pip install --no-cache-dir -r /opt/tapestry/requirements.txt
 # pip list/freeze into --user listings that hide build-time packages.
 ENV PATH=$PATH:/home/sandbox/.local/bin
 
-COPY server.py entrypoint.py /opt/tapestry/
+# Every module of the server directory, as DEV mounts that directory read-only, so the image's own server never lags it.
+# The server's gRPC interface (workspace_pb2*.py, generated from workspace.proto), its payload codec and its metrics
+# exposition are modules of this directory like the rest, so the server imports nothing from outside it.
+COPY *.py gitconfig /opt/tapestry/
+COPY assets /opt/tapestry/assets/
 
 RUN mkdir /workspace \
     && chown -R sandbox:sandbox /workspace
 WORKDIR /workspace
 
-EXPOSE 8080
+EXPOSE 8080 8081
 
 # The entrypoint starts as root solely to install the deny-by-default OUTPUT
-# firewall, then irreversibly drops to the sandbox user before the HTTP server
-# starts or any tool code can execute.
+# firewall, then irreversibly drops to the sandbox user before the gRPC server
+# starts or any tool code can execute. A start that names no key file, such as a plain run of the image, reads the key
+# file mounted read-only at /run/secrets/workspace-key, and is refused with that reason when none is mounted.
 USER root
+STOPSIGNAL SIGTERM
 ENTRYPOINT ["python", "/opt/tapestry/entrypoint.py"]

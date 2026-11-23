@@ -1,0 +1,140 @@
+name: PIP Audit
+
+on:
+  pull_request:
+    paths:
+      - "container/requirements.txt"
+      - ".github/workflows/pip-audit.yml"
+  push:
+    branches: [develop, main]
+    paths:
+      - "container/requirements.txt"
+      - ".github/workflows/pip-audit.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pip-audit-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pip-audit:
+    name: Audit container/requirements.txt
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install pip-audit
+        run: python -m pip install pip-audit packaging
+
+      - name: Audit pinned requirements across all platforms (OSV)
+        env:
+          REQUIREMENTS: container/requirements.txt
+        run: |
+          python - <<'EOF'
+          import json
+          import os
+          import subprocess
+          import sys
+          import tempfile
+          from pathlib import Path
+          from packaging.requirements import Requirement
+          from packaging.specifiers import SpecifierSet
+          from packaging.utils import InvalidWheelFilename, canonicalize_name, parse_wheel_filename
+          from packaging.version import InvalidVersion, Version
+
+          manifest = Path(os.environ["REQUIREMENTS"])
+
+          def wheel_version(url: str) -> str:
+              filename = url.split("#", 1)[0].split("?", 1)[0].rsplit("/", 1)[-1]
+              try:
+                  return str(parse_wheel_filename(filename)[1])
+              except InvalidWheelFilename:
+                  return ""
+
+          def audited_requirement(line: str) -> str:
+              text = line.split(" #", 1)[0].strip()
+              if not text or text.startswith(("#", "-")):
+                  return ""
+              req = Requirement(text)
+              if req.url:
+                  ver = wheel_version(req.url)
+                  return f"{req.name}=={Version(ver).public}" if ver else f"{req.name} @ {req.url}"
+              specs = []
+              for sp in req.specifier:
+                  if sp.operator == "==":
+                      try:
+                          specs.append(f"=={Version(sp.version).public}")
+                          continue
+                      except InvalidVersion:
+                          pass
+                  specs.append(str(sp))
+              return f"{req.name}{SpecifierSet(','.join(specs))}"
+
+          lines = [audited_requirement(raw) for raw in manifest.read_text(encoding="utf-8").splitlines()]
+          lines = [line for line in dict.fromkeys(lines) if line]
+          views = []
+          for line in lines:
+              name = str(canonicalize_name(Requirement(line).name))
+              view = next((candidate for candidate in views if name not in candidate), None)
+              if view is None:
+                  view = {}
+                  views.append(view)
+              view[name] = line
+
+          if not views:
+              raise SystemExit(f"{manifest}: no requirements to audit")
+
+          failures = []
+          with tempfile.TemporaryDirectory() as tmp:
+              for idx, view in enumerate(views, start=1):
+                  view_path = Path(tmp) / f"view-{idx}.txt"
+                  view_path.write_text("".join(f"{line}\n" for line in view.values()), encoding="utf-8")
+                  cmd = [
+                      sys.executable,
+                      "-m",
+                      "pip_audit",
+                      "--requirement",
+                      str(view_path),
+                      "--no-deps",
+                      "--disable-pip",
+                      "--vulnerability-service",
+                      "osv",
+                      "--format",
+                      "json",
+                      "--progress-spinner",
+                      "off",
+                      "--desc",
+                      "on",
+                  ]
+                  proc = subprocess.run(cmd, capture_output=True, text=True)
+                  if proc.returncode not in (0, 1):
+                      raise SystemExit(f"pip-audit failed on {manifest}:\n{proc.stderr or proc.stdout}")
+                  report = json.loads(proc.stdout)
+                  for dep in report.get("dependencies", []):
+                      skip = dep.get("skip_reason", "")
+                      if skip:
+                          failures.append(f"{manifest}: {dep.get('name')} skipped: {skip}")
+                      for vuln in dep.get("vulns", []):
+                          fixes = ", ".join(vuln.get("fix_versions", [])) or "no fixed release"
+                          failures.append(
+                              f"{manifest}: {dep.get('name')}=={dep.get('version')} has {vuln.get('id')} (fixed in {fixes})"
+                          )
+
+          if failures:
+              for msg in failures:
+                  print(f"::error file={manifest}::{msg}")
+              raise SystemExit(1)
+          print(f"Audited {sum(len(v) for v in views)} pinned requirement(s) in {manifest}: 0 vulnerabilities.")
+          EOF
+
+      - name: Audit resolved dependency tree (OSV)
+        run: python -m pip_audit --desc --vulnerability-service osv --progress-spinner off --requirement container/requirements.txt

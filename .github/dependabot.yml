@@ -4,12 +4,28 @@ updates:
     directory: "/container"
     schedule:
       interval: "weekly"
-    commit-message:
-      prefix: "deps"
+    reviewers:
+      - "robinje"
+    labels:
+      - "dependencies"
+      - "python"
 
   - package-ecosystem: "docker"
     directory: "/container"
     schedule:
       interval: "weekly"
-    commit-message:
-      prefix: "deps"
+    reviewers:
+      - "robinje"
+    labels:
+      - "dependencies"
+      - "docker"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    reviewers:
+      - "robinje"
+    labels:
+      - "dependencies"
+      - "github-actions"

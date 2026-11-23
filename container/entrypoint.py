@@ -2,21 +2,45 @@
 
 from argparse import ArgumentParser as argparse_ArgumentParser
 from ctypes import CDLL, get_errno
-from os import environ as os_environ
-from os import execv as os_execv
-from os import geteuid as os_geteuid
-from os import setgid as os_setgid
-from os import setgroups as os_setgroups
-from os import setuid as os_setuid
+from os import (
+    O_CLOEXEC,
+    O_CREAT,
+    O_EXCL,
+    O_NOFOLLOW,
+    O_RDONLY,
+    O_WRONLY,
+    environ as os_environ,
+    execv as os_execv,
+    fdopen as os_fdopen,
+    geteuid as os_geteuid,
+    open as os_open,
+    set_inheritable as os_set_inheritable,
+    setgid as os_setgid,
+    setgroups as os_setgroups,
+    setuid as os_setuid,
+)
 from pathlib import Path
 from pwd import getpwnam as pwd_getpwnam
 from shutil import which as shutil_which
 from subprocess import run as subprocess_run
-from sys import argv as sys_argv
-from sys import executable as sys_executable
+from sys import argv as sys_argv, executable as sys_executable
+from tempfile import mkdtemp as tempfile_mkdtemp
+
+from first_process import hold_signals
 
 SERVER = Path(__file__).with_name("server.py")
 COMMAND_LINE_ARGUMENTS = []
+KEY_FILE_OPTION = "--auth-token-file"
+KEY_DESCRIPTOR_OPTION = "--auth-token-fd"
+KEY_MOUNT_DIRECTORY = Path("/run/secrets")
+# The key file a start that names none reads, as a plain run of the image does: the file mounted read-only here, at the
+# same container path Tapestry's sandbox manager mounts and names.
+DEFAULT_KEY_FILE = KEY_MOUNT_DIRECTORY / "workspace-key"
+# A deployment controller with no host file to mount passes the key in this one bootstrap environment value;
+# Tapestry's Fargate controller names the same variable.
+KEY_BOOTSTRAP_VARIABLE = "TAPESTRY_WORKSPACE_KEY"
+# The image's pinned Debian bookworm base ships glibc under this stable soname; prctl is resolved from it.
+LIBC_SONAME = "libc.so.6"
 WEB_PORTS = ("80", "443")
 # Web egress never reaches private, loopback, link-local or multicast networks,
 # keeping cloud metadata and credential endpoints (169.254.169.254,
@@ -46,7 +70,7 @@ def parse_policy(argv):
 
 
 def run_firewall(binary, arguments):
-    result = subprocess_run([binary, *arguments], capture_output=True, text=True)
+    result = subprocess_run([binary, *arguments], capture_output=True, text=True, check=False)
     if result.returncode != 0:
         raise RuntimeError(f"{binary} {' '.join(arguments)} failed: {result.stderr.strip()}")
     return False
@@ -55,7 +79,7 @@ def run_firewall(binary, arguments):
 def nameserver_addresses():
     """Read the resolvers the guest must reach to resolve web destinations."""
     resolv = Path("/etc/resolv.conf")
-    lines = resolv.read_text().splitlines() if resolv.exists() else []
+    lines = resolv.read_text(encoding="utf-8").splitlines() if resolv.exists() else []
     result = [line.split()[1] for line in lines if line.strip().startswith("nameserver") and len(line.split()) > 1]
     return result
 
@@ -90,12 +114,29 @@ def enforce_egress_policy(allow_web=False):
         for resolver in resolvers:
             if (":" in resolver) == (family == "ipv6"):
                 for protocol in ("udp", "tcp"):
-                    run_firewall(binary, ["-A", "OUTPUT", "-p", protocol, "-d", resolver, "--dport", "53", "-j", "ACCEPT"])
+                    run_firewall(
+                        binary,
+                        [
+                            "-A",
+                            "OUTPUT",
+                            "-p",
+                            protocol,
+                            "-d",
+                            resolver,
+                            "--dport",
+                            "53",
+                            "-j",
+                            "ACCEPT",
+                        ],
+                    )
         if allow_web:
             for network in NON_PUBLIC_NETWORKS.get(family, ()):
                 run_firewall(binary, ["-A", "OUTPUT", "-d", network, "-j", "DROP"])
             for port in WEB_PORTS:
-                run_firewall(binary, ["-A", "OUTPUT", "-p", "tcp", "--dport", port, "-j", "ACCEPT"])
+                run_firewall(
+                    binary,
+                    ["-A", "OUTPUT", "-p", "tcp", "--dport", port, "-j", "ACCEPT"],
+                )
         run_firewall(binary, ["-P", "OUTPUT", "DROP"])
         return False
 
@@ -103,7 +144,7 @@ def enforce_egress_policy(allow_web=False):
 
     interfaces = Path("/proc/net/if_inet6")
     has_external_ipv6 = interfaces.exists() and any(
-        line.split()[-1] != "lo" for line in interfaces.read_text().splitlines() if line.split()
+        line.split()[-1] != "lo" for line in interfaces.read_text(encoding="utf-8").splitlines() if line.split()
     )
     if not has_external_ipv6:
         return False
@@ -128,32 +169,102 @@ def verify_deployment_identity():
     """Start a deployment-enforced guest without retaining privilege or gaining it on exec."""
     if os_geteuid() == 0:
         raise RuntimeError("deployment-enforced Workspace must start as nonroot")
-    status = dict(line.split(":", 1) for line in Path("/proc/self/status").read_text().splitlines() if ":" in line)
+    status = dict(line.split(":", 1) for line in Path("/proc/self/status").read_text(encoding="utf-8").splitlines() if ":" in line)
     if any(int(status.get(name, "1").strip(), 16) for name in ("CapEff", "CapPrm", "CapAmb")):
         raise RuntimeError("deployment-enforced Workspace must have zero guest capabilities")
-    libc = CDLL(None, use_errno=True)
+    libc = CDLL(LIBC_SONAME, use_errno=True)
     if libc.prctl(38, 1, 0, 0, 0) != 0:
         raise RuntimeError(f"Workspace could not install no-new-privileges: errno {get_errno()}")
 
 
+def key_file_arguments(arguments):
+    """Name the canonical key file when the start names none, so a plain run of the image reads the mounted key."""
+    result = list(arguments) if KEY_FILE_OPTION in arguments else [*arguments, KEY_FILE_OPTION, str(DEFAULT_KEY_FILE)]
+    return result
+
+
+def key_file_position(arguments):
+    """Return the position of the one key file option's value."""
+    if arguments.count(KEY_FILE_OPTION) != 1 or arguments.index(KEY_FILE_OPTION) + 1 >= len(arguments):
+        raise RuntimeError(f"sandbox server requires exactly one {KEY_FILE_OPTION} value")
+    position = arguments.index(KEY_FILE_OPTION) + 1
+    return position
+
+
+def pass_key_descriptor(arguments):
+    """Open the key file while still root and hand the server only that open descriptor across the privilege drop.
+
+    The mounted file is behind the root-only secret directory, or a bootstrap file is unlinked before service exec.
+    The server reads the descriptor once and closes it.
+    """
+    position = key_file_position(arguments)
+    descriptor = os_open(arguments[position], O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+    os_set_inheritable(descriptor, True)
+    result = [*arguments[: position - 1], KEY_DESCRIPTOR_OPTION, str(descriptor), *arguments[position + 1 :]]
+    return result
+
+
+def protect_key_directory(arguments) -> None:
+    """Keep the mounted key unreachable by tool processes even when file sharing maps its owner to the sandbox UID."""
+    position = key_file_position(arguments)
+    key_file = Path(arguments[position])
+    if not key_file.is_file():
+        raise RuntimeError(f"no Workspace key file at {key_file}: mount the key file read-only there")
+    directory = key_file.parent
+    if directory != KEY_MOUNT_DIRECTORY or directory.resolve() != directory:
+        raise RuntimeError("mounted Workspace key must be inside the canonical service-secret directory")
+    if not directory.is_dir() or directory.stat().st_uid != 0:
+        raise RuntimeError("Workspace service-secret directory must be owned by root")
+    directory.chmod(0o700)
+
+
+def write_bootstrap_key(arguments):
+    """Move a deployment's bootstrap key out of the environment into this account's own key file."""
+    key = os_environ.pop(KEY_BOOTSTRAP_VARIABLE, "")
+    if not key:
+        raise RuntimeError("deployment-enforced Workspace requires its bootstrap key")
+    position = key_file_position(arguments)
+    path = Path(tempfile_mkdtemp(prefix="workspace-key-")) / "workspace.key"
+    descriptor = os_open(str(path), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o666)
+    with os_fdopen(descriptor, "w", encoding="utf-8") as stream:
+        stream.write(key + "\n")
+    result = [*arguments[:position], str(path), *arguments[position + 1 :]]
+    return result
+
+
 def main(argv=COMMAND_LINE_ARGUMENTS):
     selected_arguments = sys_argv[1:] if argv is COMMAND_LINE_ARGUMENTS else argv
-    arguments = list(selected_arguments)
+    arguments = key_file_arguments(selected_arguments)
     policy = parse_policy(arguments)
     if policy.egress_enforcement == "deployment":
         if policy.egress_policy not in {"web", "deny"}:
             raise RuntimeError("deployment-enforced Workspace requires controlled egress")
         verify_deployment_identity()
+        arguments = write_bootstrap_key(arguments)
+        bootstrap_path = Path(arguments[key_file_position(arguments)])
+        arguments = pass_key_descriptor(arguments)
+        bootstrap_path.unlink()
+        bootstrap_path.parent.rmdir()
         os_execv(sys_executable, [sys_executable, str(SERVER), *arguments])
         return False
     if policy.egress_policy == "deny":
         enforce_egress_policy()
     elif policy.egress_policy == "web":
         enforce_egress_policy(allow_web=True)
+    protect_key_directory(arguments)
+    arguments = pass_key_descriptor(arguments)
     drop_privileges()
     os_execv(sys_executable, [sys_executable, str(SERVER), *arguments])
     return False
 
 
 if __name__ == "__main__":
-    main()
+    # The entrypoint is the container's first process and execs the server in its place. A stop signal that arrives
+    # before the server reads its signals stays pending for it instead of being dropped, as a first process drops a
+    # signal it has no handler for (first_process.py).
+    hold_signals()
+    try:
+        main()
+    except RuntimeError as err:
+        # A start the entrypoint refuses ends with its reason on one line and exit status 1, not a traceback.
+        raise SystemExit(f"Workspace entrypoint refused the start: {err}") from err

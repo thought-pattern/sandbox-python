@@ -1,0 +1,387 @@
+"""The Workspace server's read-only health figures and page, served on its own port without the Workspace key.
+
+The tool server reports each tool call and manifest request here as it arrives, as a tool call takes its tool slot, and
+as each answers. The figures keep the calls by tool and outcome, the tool calls waiting for a slot in arrival order, the
+calls in progress, the latest finished calls, the errors by kind and a sample of recent activity every SAMPLE_SECONDS. Only tool names, outcomes, error codes, times and the UUIDv7 request and root Task IDs
+in ID_FIELDS are kept, never arguments, results, file contents or the key. Every figure covers the running server only.
+
+The page assets in `assets/` are copies of Tapestry's shared health page assets (`tapestry/health_assets/`) with this
+server's own page and renderer, because the Workspace runs without the tapestry package. The snapshot has the same shape
+as every Tapestry component's, so the shared renderer draws it unchanged. The Workspace makes no model calls.
+"""
+
+from collections import deque
+from datetime import UTC, datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import BufferedReader, RawIOBase
+from json import dumps
+from os import getpid
+from pathlib import Path
+from re import fullmatch
+from socketserver import TCPServer
+from threading import Lock
+from time import monotonic
+from uuid import uuid4
+
+from health_exposition import METRICS_CONTENT_TYPE, health_exposition
+from tool_process import STALL_CHECKS
+
+RECENT_OUTCOMES = 32
+SAMPLE_SECONDS = 5.0
+# 120 five-second samples keep ten minutes of recent activity.
+HISTORY_SAMPLES = 120
+ID_FIELDS = ("request_id", "root_task_id")
+UUIDV7_PATTERN = r"[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+ASSETS = Path(__file__).with_name("assets")
+# The page's routes, each answered from one file in ASSETS with its media type.
+PAGE_FILES = {
+    "/": ("index.html", "text/html; charset=utf-8"),
+    "/health.js": ("health.js", "text/javascript; charset=utf-8"),
+    "/health-common.js": ("health-common.js", "text/javascript; charset=utf-8"),
+    "/health.css": ("health.css", "text/css; charset=utf-8"),
+}
+PAGE_HEADERS = {
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
+    "Content-Security-Policy": (
+        "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'"
+    ),
+}
+DEFAULT_IDS = {}
+
+
+def health_ids(values: dict) -> dict:
+    """Keep only the named UUIDv7 identifiers the page may show."""
+    ids = {name: values.get(name, "") for name in ID_FIELDS if fullmatch(UUIDV7_PATTERN, str(values.get(name, "")))}
+    return ids
+
+
+def operation_counts() -> dict:
+    counts = {"received": 0, "responses": 0, "outcomes": {}}
+    return counts
+
+
+class WorkspaceHealth:
+    """The tool server's figures since it started; every method takes the lock only briefly, from any request thread.
+
+    `grpc_state` is the tool transport's listener state, which the server keeps.
+    """
+
+    def __init__(self, incarnation: str):
+        self.incarnation = incarnation
+        self.lock = Lock()
+        self.began = monotonic()
+        self.started_at = datetime.now(UTC).isoformat()
+        self.items = {}
+        self.requests = {"received": 0, "responses": 0, "last_received_at": "", "last_response_at": "", "by_operation": {}}
+        self.timing = {"total_seconds": 0.0, "terminal_count": 0, "execution_seconds": 0.0, "execution_count": 0}
+        self.timing.update(queue_only_seconds=0.0, queue_only_count=0)
+        self.finished_count = 0
+        self.errors = {"by_kind": {}, "last": {}}
+        self.recent = deque(maxlen=RECENT_OUTCOMES)
+        self.history = deque(maxlen=HISTORY_SAMPLES)
+        self.last_sample = self.began - SAMPLE_SECONDS
+        self.grpc_state = {"enabled": True, "available": False, "error_type": "", "error_code": ""}
+
+    def received(self, operation: str, ids: dict = DEFAULT_IDS, *, waits: bool = False) -> str:
+        """Count one call arriving and hold it until `finished`; return its key.
+
+        A tool call that `waits` for a tool slot is held as waiting until `admitted`; any other call runs at once.
+        """
+        key = uuid4().hex
+        now = monotonic()
+        observed_at = datetime.now(UTC).isoformat()
+        request_id = ids.get("request_id", "")
+        tracked_request_id = request_id if type(request_id) is str else ""
+        item = {
+            "operation": operation,
+            "request_id": tracked_request_id,
+            "ids": health_ids(ids),
+            "accepted": now,
+            "accepted_at": observed_at,
+        }
+        if not waits:
+            item["started"] = now
+        with self.lock:
+            self.items[key] = item
+            self.count_received(operation, observed_at)
+        return key
+
+    def admitted(self, key: str) -> None:
+        """Hold a waiting tool call as running from now, when it takes its tool slot."""
+        now = monotonic()
+        with self.lock:
+            item = self.items.get(key, {})
+            if item:
+                item["started"] = now
+
+    def running_requests(self) -> list:
+        """The request IDs of the calls accepted and not yet answered, waiting for a tool slot or running, so a caller
+        that lost its reply can tell whether to wait: a waiting call runs when its turn comes."""
+        with self.lock:
+            identifiers = {item.get("request_id", "") or item.get("ids", {}).get("request_id", "") for item in self.items.values()}
+        running = sorted(identifiers - {""})
+        return running
+
+    def count_received(self, operation: str, observed_at: str) -> None:
+        """Count one call received; the lock is held."""
+        self.requests["received"] = self.requests.get("received", 0) + 1
+        self.requests["last_received_at"] = observed_at
+        row = self.requests.get("by_operation", {}).setdefault(operation, operation_counts())
+        row["received"] = row.get("received", 0) + 1
+
+    def count_answer(self, operation: str, outcome: str, error_kind: str, observed_at: str) -> None:
+        """Count one reply sent by operation and outcome, and its error kind; the lock is held."""
+        self.requests["responses"] = self.requests.get("responses", 0) + 1
+        self.requests["last_response_at"] = observed_at
+        row = self.requests.get("by_operation", {}).setdefault(operation, operation_counts())
+        row["responses"] = row.get("responses", 0) + 1
+        outcomes = row.get("outcomes", {})
+        outcomes[outcome] = outcomes.get(outcome, 0) + 1
+        if error_kind:
+            kinds = self.errors.get("by_kind", {})
+            kinds[error_kind] = kinds.get(error_kind, 0) + 1
+            self.errors["last"] = {"kind": error_kind, "operation": operation, "observed_at": observed_at}
+
+    def finished(self, key: str, outcome: str, error_kind: str = "") -> bool:
+        """Record a running call's reply; return whether the key was held, so a call finishes once."""
+        now = monotonic()
+        observed_at = datetime.now(UTC).isoformat()
+        with self.lock:
+            item = self.items.pop(key, {})
+            if not item:
+                return False
+            operation = item.get("operation", "")
+            started = item.get("started", now)
+            elapsed = max(0.0, now - started)
+            waited = max(0.0, started - item.get("accepted", started))
+            self.count_answer(operation, outcome, error_kind, observed_at)
+            for name, value in (("total_seconds", waited + elapsed), ("execution_seconds", elapsed)):
+                self.timing[name] = self.timing.get(name, 0.0) + value
+            for name in ("terminal_count", "execution_count"):
+                self.timing[name] = self.timing.get(name, 0) + 1
+            self.finished_count += 1
+            self.recent.append(
+                {
+                    "operation": operation,
+                    "kind": "request",
+                    "outcome": outcome,
+                    "error_kind": error_kind,
+                    "finished_at": observed_at,
+                    "queue_seconds": waited,
+                    "executed": True,
+                    "execution_seconds": elapsed,
+                    "total_seconds": waited + elapsed,
+                    "ids": dict(item.get("ids", {})),
+                }
+            )
+        return True
+
+    def refused(self, operation: str, outcome: str, error_kind: str) -> None:
+        """Count a call answered without running: no key, an invalid request, no root Task or an unknown tool."""
+        observed_at = datetime.now(UTC).isoformat()
+        with self.lock:
+            self.count_received(operation, observed_at)
+            self.count_answer(operation, outcome, error_kind, observed_at)
+            self.timing["terminal_count"] = self.timing.get("terminal_count", 0) + 1
+            self.timing["queue_only_count"] = self.timing.get("queue_only_count", 0) + 1
+
+    def sample(self) -> bool:
+        """Keep one recent-activity sample, at most one every SAMPLE_SECONDS, and return whether it was kept."""
+        now = monotonic()
+        with self.lock:
+            if now - self.last_sample < SAMPLE_SECONDS:
+                return False
+            self.last_sample = now
+            self.history.append(
+                {
+                    "observed_at": datetime.now(UTC).isoformat(),
+                    "elapsed_seconds": now - self.began,
+                    "queue_depth": sum(1 for item in self.items.values() if "started" not in item),
+                    "finished": self.finished_count,
+                    "responses": self.requests.get("responses", 0),
+                    "provider_calls": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                }
+            )
+        return True
+
+    def snapshot(self, readiness: dict, members: dict) -> dict:
+        """The standard snapshot every Tapestry page shows, then the Workspace's readiness and `members`.
+
+        The queue is every tool call waiting for a tool slot, oldest first, each served in that order.
+        """
+        now = monotonic()
+        with self.lock:
+            queue = [
+                {
+                    "operation": item.get("operation", ""),
+                    "wait_seconds": max(0.0, now - item.get("accepted", now)),
+                    "accepted_at": item.get("accepted_at", ""),
+                    "ids": dict(item.get("ids", {})),
+                }
+                for item in self.items.values()
+                if "started" not in item
+            ]
+            active = [
+                {
+                    "operation": item.get("operation", ""),
+                    "kind": "request",
+                    "stage": "",
+                    "elapsed_seconds": max(0.0, now - item.get("started", now)),
+                    "stage_seconds": max(0.0, now - item.get("started", now)),
+                    "ids": dict(item.get("ids", {})),
+                }
+                for item in self.items.values()
+                if "started" in item
+            ]
+            by_operation = {
+                operation: {**row, "outcomes": dict(row.get("outcomes", {}))}
+                for operation, row in self.requests.get("by_operation", {}).items()
+            }
+            requests = {**self.requests, "by_operation": by_operation}
+            errors = {"by_kind": dict(self.errors.get("by_kind", {})), "last": dict(self.errors.get("last", {}))}
+            timing = dict(self.timing)
+            recent = list(reversed(self.recent))
+            history = list(self.history)
+        for average, total, samples in (
+            ("average_total_seconds", "total_seconds", "terminal_count"),
+            ("average_execution_seconds", "execution_seconds", "execution_count"),
+        ):
+            timing[average] = timing.get(total, 0.0) / timing.get(samples, 0) if timing.get(samples, 0) else 0.0
+        ready = readiness.get("status", "") == "healthy"
+        snapshot = {
+            "component": "Workspace",
+            "observed_at": datetime.now(UTC).isoformat(),
+            "incarnation": self.incarnation,
+            "process_id": getpid(),
+            "started_at": self.started_at,
+            "uptime_seconds": max(0.0, now - self.began),
+            "ready": ready,
+            "stopping": False,
+            "fault_type": "",
+            "http": {"enabled": True, "available": True, "error_type": "", "error_code": ""},
+            "grpc": dict(self.grpc_state),
+            "refresh_seconds": SAMPLE_SECONDS,
+            "requests": requests,
+            "timing": timing,
+            "queue_depth": len(queue),
+            "oldest_wait_seconds": queue[0].get("wait_seconds", 0.0) if queue else 0.0,
+            "queue": queue,
+            "queue_display_clipped": False,
+            "active_work": active,
+            "work": {"by_operation": {}},
+            "errors": errors,
+            "recent_outcomes": recent,
+            "history": history,
+            "usage": {},
+            "readiness": {"status": readiness.get("status", ""), "checks": readiness.get("checks", {})},
+            "readiness_problem": readiness.get("error", {}).get("message", ""),
+            **members,
+        }
+        return snapshot
+
+
+def page_file(path: str) -> tuple:
+    """Return the body and media type of the page file a route names, or an empty pair for another path."""
+    name, media_type = PAGE_FILES.get(path, ("", ""))
+    if not name:
+        nothing = (b"", "")
+        return nothing
+    page = ((ASSETS / name).read_bytes(), media_type)
+    return page
+
+
+class HealthHTTPServer(ThreadingHTTPServer):
+    """Own the observation listener while the gRPC service owns its safe snapshot; `owner` is that service, which
+    answers `health_snapshot()` and `readiness()`."""
+
+    daemon_threads = False
+
+    def __init__(self, address: tuple, owner, request_read_watchdog_seconds: float):
+        self.owner = owner
+        self.request_read_watchdog_seconds = request_read_watchdog_seconds
+        super().__init__(address, HealthHandler)
+
+    def server_bind(self):
+        TCPServer.server_bind(self)
+        address = self.server_address
+        if not isinstance(address, tuple) or len(address) != 2:
+            raise RuntimeError("Workspace health listener requires an internet address")
+        host, port = address
+        if type(host) is not str or type(port) is not int:
+            raise RuntimeError("Workspace health listener returned an invalid address")
+        self.server_name = host
+        self.server_port = port
+
+
+class PatientSocketReader(RawIOBase):
+    """A health client's socket read as a stream that only lack of progress ends (D-907).
+
+    Each receive waits one watchdog interval (the socket's timeout). An interval in which bytes arrive answers the read;
+    one in which none arrive is a check without progress, and at STALL_CHECKS such checks in a row the read fails as
+    timed out, which ends the request as the standard handler ends a timed-out one.
+    """
+
+    def __init__(self, connection):
+        super().__init__()
+        self.connection = connection
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer) -> int:
+        without_progress = 0
+        while True:
+            try:
+                received = self.connection.recv_into(buffer)
+                return received
+            except TimeoutError:
+                without_progress += 1
+                if without_progress >= STALL_CHECKS:
+                    raise
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    """Public observation only; tools and manifests have no HTTP routes."""
+
+    server: HealthHTTPServer
+    server_version = "TapestryWorkspace"
+
+    def setup(self):
+        super().setup()
+        # Each receive waits one watchdog interval; the request's reads end only at STALL_CHECKS silent intervals in a row.
+        self.connection.settimeout(self.server.request_read_watchdog_seconds)
+        self.rfile = BufferedReader(PatientSocketReader(self.connection))
+
+    def do_GET(self):
+        body, media_type = page_file(self.path)
+        status = 200
+        if self.path == "/metrics":
+            body = health_exposition(self.server.owner.health_snapshot()).encode("utf-8")
+            media_type = METRICS_CONTENT_TYPE
+        if not media_type:
+            media_type = "application/json"
+            if self.path == "/api/health":
+                payload = self.server.owner.health_snapshot()
+            elif self.path == "/health/live":
+                payload = {"status": "running"}
+            elif self.path == "/health/ready":
+                payload = self.server.owner.readiness()
+                status = 200 if payload.get("status", "") == "healthy" else 503
+            else:
+                payload = {"error": "not_found"}
+                status = 404
+            body = dumps(payload, separators=(",", ":")).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", media_type)
+        self.send_header("Content-Length", str(len(body)))
+        for name, value in PAGE_HEADERS.items():
+            self.send_header(name, value)
+        self.end_headers()
+        self.wfile.write(body)
+
+    # BaseHTTPRequestHandler.log_message names its first parameter format; the override keeps the standard-library signature.
+    def log_message(self, format, *args):  # pylint: disable=redefined-builtin
+        return False
