@@ -1,4 +1,4 @@
-"""The Workspace server's duties as its container's first process (D-1182, D-1183, D-649).
+"""The Workspace server's duties as its container's first process.
 
 The server is the container's PID 1, with no separate init. pid_namespaces(7): only signals for which the first process
 has established a handler can be sent to it by the other members of its namespace; SIGKILL and SIGSTOP are forced
@@ -7,7 +7,7 @@ code a Task runs can neither kill nor stop the server. The server holds SIGTERM 
 reads each one with sigwaitinfo. It stops only on one sent from outside the container, which is the engine's stop or the
 deployment's. A tool's signal to the server names the tool and is refused.
 
-Every process whose parent exits is handed to the first process, so the server reaps each orphan that has ended (D-649).
+Every process whose parent exits is handed to the first process, so the server reaps each orphan that has ended.
 Each tool leader's exit status stays with its own wait: a leader is held out of the reaper's reach from the moment it is
 started until its wait has it.
 

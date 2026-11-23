@@ -244,7 +244,7 @@ def test_health_page_and_api_answer_without_the_key_and_count_tool_calls_without
 
     try:
         for path, marker in (
-            ("/", b"Workspace health"),
+            ("/", b"Workspace Health"),
             ("/health.js", b"renderStandard"),
             ("/health-common.js", b"export function start"),
         ):

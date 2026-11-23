@@ -1,5 +1,5 @@
 """A finished tool process's output as the Workspace server answers it: read from disk a line at a time for a tool that
-parses it, or kept on disk for its caller to read in parts when it is larger than the caller's read part (D-1145).
+parses it, or kept on disk for its caller to read in parts when it is larger than the caller's read part.
 
 The server runs each tool process with its stdout and stderr written to anonymous files as they are produced. Nothing
 here holds an output whole: a parser reads one line at a time, and a kept copy is made a block at a time.

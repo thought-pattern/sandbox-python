@@ -106,12 +106,12 @@ DEFAULT_PORT = 8080
 DEFAULT_HEALTH_PORT = 8081
 DEFAULT_MAX_CONCURRENT_REQUESTS = 4
 # The interval at which the watchdog checks a running tool process's CPU time and output size; it ends the process at
-# STALL_CHECKS checks in a row in which neither moved (D-907).
+# STALL_CHECKS checks in a row in which neither moved.
 DEFAULT_PROCESS_WATCHDOG_SECONDS = 120
 # How often a running tool process is looked at for its exit between the watchdog's checks.
 WATCHDOG_POLL_SECONDS = 1.0
 # The interval at which the health listener checks a client's read for bytes; it ends the read at STALL_CHECKS checks in
-# a row in which no byte arrived (D-907).
+# a row in which no byte arrived.
 DEFAULT_REQUEST_READ_WATCHDOG_SECONDS = 10.0
 # The depth a listing has when its caller names none: the whole tree.
 WHOLE_TREE_DEPTH = -1
@@ -132,7 +132,7 @@ IMAGE = ""
 PUBLIC_PATHS = {"/", "/health.js", "/health-common.js", "/health.css", "/api/health", "/metrics", "/health/live", "/health/ready"}
 PROCESS_WATCHDOG_SECONDS = DEFAULT_PROCESS_WATCHDOG_SECONDS
 # The Workspace's own Git configuration, beside this file and read-only with it: the identity of a commit whose
-# repository names none (D-1186). No system or host configuration reaches a Git tool.
+# repository names none. No system or host configuration reaches a Git tool.
 GIT_CONFIG_FILE = Path(__file__).resolve().parent / "gitconfig"
 GIT_ENV = {
     **os_environ,
@@ -421,7 +421,7 @@ def internal_run_process(
     parser's value is the result's stdout; any other run's stdout is answered as an output is.
     A watchdog ends a process that has stopped making progress: every PROCESS_WATCHDOG_SECONDS it reads the invocation's
     CPU time and output sizes, a check that sees either move resets the count, and at STALL_CHECKS checks in a row in
-    which neither moved the invocation is ended and the result is `stalled` (D-907). A process that keeps working runs
+    which neither moved the invocation is ended and the result is `stalled`. A process that keeps working runs
     to its end. When the direct child exits, its process group is ended: a background descendant still
     holding the output open cannot keep a finished tool running.
     The program starts with the signals the server holds unblocked (`program_command`), and its leader is held from the
@@ -785,7 +785,7 @@ def scoped_repository_file(root: Path, target: Path) -> tuple:
                     dir_fd=directory,
                 )
             # A missing folder is not_found and a file where a folder belongs is not_directory, as for any path; only a
-            # component that became a symlink, an escape, is path_escape (D-096).
+            # component that became a symlink, an escape, is path_escape.
             except (FileNotFoundError, PermissionError):
                 raise
             except NotADirectoryError as err:
@@ -1831,7 +1831,7 @@ def parse_args(argv: list):
 
 
 def withhold_process_access() -> None:
-    """Close the server's own process to every other process of its account before it reads its key (D-1181).
+    """Close the server's own process to every other process of its account before it reads its key.
 
     Tool processes run under the server's account, and processes of one account can otherwise open each other's memory,
     descriptors and environment through /proc and ptrace, so code a Task runs could read the key out of the server's

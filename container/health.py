@@ -317,7 +317,7 @@ class HealthHTTPServer(ThreadingHTTPServer):
 
 
 class PatientSocketReader(RawIOBase):
-    """A health client's socket read as a stream that only lack of progress ends (D-907).
+    """A health client's socket read as a stream that only lack of progress ends.
 
     Each receive waits one watchdog interval (the socket's timeout). An interval in which bytes arrive answers the read;
     one in which none arrive is a check without progress, and at STALL_CHECKS such checks in a row the read fails as

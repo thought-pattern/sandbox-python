@@ -6,39 +6,28 @@
 const SVG = "http://www.w3.org/2000/svg";
 // Samples further apart than this many seconds leave a gap in a chart: the page was not sampling then.
 const GAP_SECONDS = 15;
-const SCOPES = {
-  own_model: "This component's own model calls",
-  requested: "Model work this component requested from other components",
-};
-
 const SUMMARY = `
 <section class="cards" aria-label="Standard metrics">
   <article><h2>Service</h2><p id="std-readiness" class="value">-</p><dl id="std-service"></dl></article>
   <article><h2>Requests</h2><p id="std-received" class="value">-</p><p class="subtle">Requests received</p><dl id="std-requests"></dl></article>
-  <article><h2>Tokens</h2><p id="std-calls" class="value">-</p><p id="std-usage-scope" class="subtle"></p><dl id="std-tokens"></dl></article>
   <article><h2>Errors</h2><p id="std-errors" class="value">-</p><p class="subtle">Errors since start</p><dl id="std-error-facts"></dl></article>
 </section>`;
 
 const DETAIL = `
-<section class="panel"><h2>Recent activity</h2><p class="subtle">Five-second samples for ten minutes; gaps stay visible; counters reset when the component restarts.</p>
+<section class="panel"><h2>Recent Activity</h2><p class="subtle">Five-second samples for ten minutes; gaps stay visible; counters reset when the component restarts.</p>
   <div class="charts">
-    <div><h3>Items waiting</h3><svg id="std-queue-chart" viewBox="0 0 600 150" role="img" aria-label="Items waiting over time"></svg></div>
-    <div><h3>Items finished per second</h3><svg id="std-finished-chart" viewBox="0 0 600 150" role="img" aria-label="Items finished per second"></svg></div>
-    <div><h3>Tokens per second</h3><svg id="std-token-chart" viewBox="0 0 600 150" role="img" aria-label="Tokens per second"></svg></div>
+    <div><h3>Items Waiting</h3><svg id="std-queue-chart" viewBox="0 0 600 150" role="img" aria-label="Items waiting over time"></svg></div>
+    <div><h3>Items Finished per Second</h3><svg id="std-finished-chart" viewBox="0 0 600 150" role="img" aria-label="Items finished per second"></svg></div>
   </div>
 </section>
 <section class="tables">
   <article class="panel"><h2>Queue</h2><p id="std-queue-note" class="subtle"></p><div class="table-scroll"><table><thead><tr><th>Operation</th><th>Wait</th><th>Accepted</th><th>IDs</th></tr></thead><tbody id="std-queue-rows"></tbody></table></div></article>
-  <article class="panel"><h2>Active work</h2><div class="table-scroll"><table><thead><tr><th>Operation</th><th>Stage</th><th>Elapsed</th><th>In stage</th><th>IDs</th></tr></thead><tbody id="std-active-rows"></tbody></table></div></article>
+  <article class="panel"><h2>Active Work</h2><div class="table-scroll"><table><thead><tr><th>Operation</th><th>Stage</th><th>Elapsed</th><th>In stage</th><th>IDs</th></tr></thead><tbody id="std-active-rows"></tbody></table></div></article>
 </section>
-<section class="panel"><h2>Recent outcomes</h2><p class="subtle">The latest 32 finished items, newest first.</p><div class="table-scroll"><table><thead><tr><th>Operation</th><th>Outcome</th><th>Wait / run</th><th>Finished</th><th>IDs</th></tr></thead><tbody id="std-outcome-rows"></tbody></table></div></section>
+<section class="panel"><h2>Recent Outcomes</h2><p class="subtle">The latest 32 finished items, newest first.</p><div class="table-scroll"><table><thead><tr><th>Operation</th><th>Outcome</th><th>Wait / run</th><th>Finished</th><th>IDs</th></tr></thead><tbody id="std-outcome-rows"></tbody></table></div></section>
 <section class="tables">
-  <article class="panel"><h2>Requests by operation</h2><div class="table-scroll"><table><thead><tr><th>Operation</th><th>Received</th><th>Responses</th><th>Outcomes</th></tr></thead><tbody id="std-request-rows"></tbody></table></div></article>
-  <article class="panel"><h2>Work handed to other components</h2><div class="table-scroll"><table><thead><tr><th>Operation</th><th>Started</th><th>Finished</th><th>Outcomes</th></tr></thead><tbody id="std-work-rows"></tbody></table></div></article>
-</section>
-<section class="tables">
-  <article class="panel"><h2>Tokens by model</h2><div class="table-scroll"><table><thead><tr><th>Model</th><th>Calls</th><th>Input</th><th>Output</th></tr></thead><tbody id="std-model-rows"></tbody></table></div></article>
-  <article class="panel"><h2>Tokens by operation</h2><div class="table-scroll"><table><thead><tr><th>Operation</th><th>Calls</th><th>Input</th><th>Output</th></tr></thead><tbody id="std-token-operation-rows"></tbody></table></div></article>
+  <article class="panel"><h2>Requests by Operation</h2><div class="table-scroll"><table><thead><tr><th>Operation</th><th>Received</th><th>Responses</th><th>Outcomes</th></tr></thead><tbody id="std-request-rows"></tbody></table></div></article>
+  <article class="panel"><h2>Work Handed to Other Components</h2><div class="table-scroll"><table><thead><tr><th>Operation</th><th>Started</th><th>Finished</th><th>Outcomes</th></tr></thead><tbody id="std-work-rows"></tbody></table></div></article>
 </section>`;
 
 export const byId = (id) => document.getElementById(id);
@@ -82,11 +71,6 @@ export function correlation(ids) {
   details.append(element("summary", entries.length === 1 ? "1 ID" : entries.length + " IDs"));
   for (const [name, value] of entries) details.append(element("p", name.replace(/_/g, " ") + ": " + value, "mono"));
   return details;
-}
-
-export function provider(cache, direction) {
-  const reported = (cache || {})[direction + "_reported_calls"] || 0;
-  return reported ? count(cache[direction + "_input_tokens"]) + " tokens · " + count(reported) + " reporting calls" : "Not reported";
 }
 
 function filled(node, value) {
@@ -190,10 +174,6 @@ function average(seconds, samples, noun) {
   return samples ? duration(seconds) + " · " + count(samples) + " " + noun : "No samples yet";
 }
 
-function tokenColumns() {
-  return [([name]) => name, ([, usage]) => count(usage.calls), ([, usage]) => count(usage.prompt_tokens), ([, usage]) => count(usage.completion_tokens)];
-}
-
 function operationColumns(first, second) {
   return [([operation]) => operation, ([, row]) => count(row[first]), ([, row]) => count(row[second]), ([, row]) => tally(row.outcomes)];
 }
@@ -228,18 +208,6 @@ export function renderStandard(component, snapshot) {
     ["Average running time", average(timing.average_execution_seconds, timing.execution_count, "run")],
     ["Answered without running", count(timing.queue_only_count)],
   ]);
-  const usage = snapshot.usage || {};
-  const called = (usage.total_calls || 0) > 0 || Object.keys(usage.by_model || {}).length > 0;
-  text("std-calls", called ? count(usage.total_calls) : "No model calls");
-  text("std-usage-scope", SCOPES[usage.scope] || "");
-  const cache = usage.provider_cache || {};
-  facts("std-tokens", [
-    ["Tokens in", count(usage.total_prompt_tokens)],
-    ["Tokens out", count(usage.total_completion_tokens)],
-    ["Provider cache read", provider(cache, "read")],
-    ["Provider cache write", provider(cache, "write")],
-    ["Provider failures", count(usage.total_provider_failures)],
-  ]);
   const errors = snapshot.errors || {};
   const last = errors.last || {};
   text("std-errors", count(Object.values(errors.by_kind || {}).reduce((sum, value) => sum + value, 0)));
@@ -250,7 +218,6 @@ export function renderStandard(component, snapshot) {
   const history = snapshot.history || [];
   chart("std-queue-chart", history, "queue_depth");
   chart("std-finished-chart", history, "finished", true);
-  chart("std-token-chart", history.map((sample) => ({ ...sample, tokens: sample.input_tokens + sample.output_tokens })), "tokens", true);
   const queue = snapshot.queue || [];
   text(
     "std-queue-note",
@@ -277,8 +244,6 @@ export function renderStandard(component, snapshot) {
   );
   table("std-request-rows", Object.entries(requests.by_operation || {}), operationColumns("received", "responses"), "No requests yet.");
   table("std-work-rows", Object.entries((snapshot.work || {}).by_operation || {}), operationColumns("started", "finished"), "No work handed on.");
-  table("std-model-rows", Object.entries(usage.by_model || {}), tokenColumns(), "No model calls.");
-  table("std-token-operation-rows", Object.entries(usage.by_operation || {}), tokenColumns(), "No model calls.");
 }
 
 // Poll /api/health with one request outstanding, paused while the tab is hidden; a failed poll marks the page stale,

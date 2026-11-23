@@ -15,7 +15,7 @@ from subprocess import TimeoutExpired as subprocess_TimeoutExpired
 # The environment variable each tool invocation's processes inherit, whose value names the invocation.
 INVOCATION_MARKER_VARIABLE = "TAPESTRY_TOOL_INVOCATION"
 # The checks in a row without progress at which the Workspace's watchdogs end stalled work: a tool invocation, and a
-# health client's read (D-907). The Workspace image holds no Tapestry code, so it keeps this count of its own.
+# health client's read. The Workspace image holds no Tapestry code, so it keeps this count of its own.
 STALL_CHECKS = 3
 LOGGER = logging_getLogger("tapestry.workspace.server")
 
