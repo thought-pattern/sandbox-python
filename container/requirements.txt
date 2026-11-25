@@ -1,6 +1,6 @@
 # Declared component transport dependencies follow the root runtime pins.
 grpcio==1.85.3
-protobuf==7.35.1
+protobuf==7.36.2
 msgpack==1.2.3
 # Retained component checks and generated Python deliverables use pytest.
 pytest==9.2.0
