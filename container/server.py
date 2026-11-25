@@ -13,7 +13,13 @@ from hashlib import sha256 as hashlib_sha256
 from hmac import compare_digest as hmac_compare_digest
 from inspect import Parameter as inspect_Parameter, signature as inspect_signature
 from logging import (
+    CRITICAL as logging_CRITICAL,
+    DEBUG as logging_DEBUG,
+    ERROR as logging_ERROR,
     INFO as logging_INFO,
+    WARNING as logging_WARNING,
+    Formatter as logging_Formatter,
+    StreamHandler as logging_StreamHandler,
     basicConfig as logging_basicConfig,
     getLogger as logging_getLogger,
 )
@@ -1890,10 +1896,21 @@ def configure(args):
     return False
 
 
+class JournalStreamFormatter(logging_Formatter):
+    """Prefix the stream record with its syslog priority for systemd's journal stream."""
+
+    priorities = {logging_CRITICAL: 2, logging_ERROR: 3, logging_WARNING: 4, logging_INFO: 6, logging_DEBUG: 7}
+
+    def format(self, record):
+        return f"<{self.priorities.get(record.levelno, 6)}>{super().format(record)}"
+
+
 def main(argv: list):
     # Before any thread exists, so every thread and tool process the server starts inherits the block (first_process).
     hold_signals()
-    logging_basicConfig(level=logging_INFO, format="%(asctime)s %(levelname)s %(message)s")
+    handler = logging_StreamHandler()
+    handler.setFormatter(JournalStreamFormatter("%(asctime)s %(levelname)s %(message)s"))
+    logging_basicConfig(level=logging_INFO, handlers=[handler])
     withhold_process_access()
     args = parse_args(argv)
     auth_token = read_auth_token(args)

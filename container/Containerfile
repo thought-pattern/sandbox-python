@@ -8,7 +8,8 @@ RUN apt-get update && apt-get install -y \
     ripgrep \
     && rm -rf /var/lib/apt/lists/*
 
-RUN useradd --create-home --shell /usr/sbin/nologin sandbox
+RUN groupadd --gid 1000 sandbox \
+    && useradd --uid 1000 --gid sandbox --create-home --shell /usr/sbin/nologin sandbox
 
 COPY requirements.txt /opt/tapestry/
 RUN pip install --no-cache-dir -r /opt/tapestry/requirements.txt
