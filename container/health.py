@@ -39,6 +39,11 @@ PAGE_FILES = {
     "/health.js": ("health.js", "text/javascript; charset=utf-8"),
     "/health-common.js": ("health-common.js", "text/javascript; charset=utf-8"),
     "/health.css": ("health.css", "text/css; charset=utf-8"),
+    "/brand.css": ("brand.css", "text/css; charset=utf-8"),
+    "/brand-logo.svg": ("brand-logo.svg", "image/svg+xml"),
+    "/cormorant-garamond.woff2": ("cormorant-garamond.woff2", "font/woff2"),
+    "/space-mono-400.woff2": ("space-mono-400.woff2", "font/woff2"),
+    "/space-mono-700.woff2": ("space-mono-700.woff2", "font/woff2"),
 }
 PAGE_HEADERS = {
     "Cache-Control": "no-store",
