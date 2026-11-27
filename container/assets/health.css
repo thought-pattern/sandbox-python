@@ -169,15 +169,26 @@ th,
   stroke-width: 2;
 }
 
-.charts svg text {
-  font: 12px var(--tp-mono);
-  fill: var(--tp-muted);
+.chart-peak, .chart-axis {
+  color: var(--tp-muted);
+  font: 400 .75rem/1.45 var(--tp-mono);
 }
+.chart-axis {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  padding: 0 1.67% 0 3.33%;
+}
+.time-tick:nth-child(2) { text-align: center; }
+.time-tick:nth-child(3) { text-align: right; }
 
 .tables {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1.5fr);
   gap: 18px;
+}
+
+.tables.operation-tables {
+  grid-template-columns: minmax(0, 1.3fr) minmax(0, 0.9fr);
 }
 
 .tables[hidden] {
@@ -205,6 +216,23 @@ td {
 
 td:first-child {
   overflow-wrap: anywhere;
+}
+
+.operation-table td:first-child {
+  overflow-wrap: normal;
+  white-space: nowrap;
+}
+
+.operation-table th:nth-child(2),
+.operation-table td:nth-child(2),
+.operation-table th:nth-child(3),
+.operation-table td:nth-child(3) {
+  text-align: right;
+  white-space: nowrap;
+}
+
+.operation-table td:nth-child(4) {
+  overflow-wrap: break-word;
 }
 
 .mono {
@@ -245,9 +273,52 @@ footer {
   .cards {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+
+  .tables,
+  .tables.operation-tables {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 @media (max-width: 700px) {
+  .operation-table, .operation-table tbody { display: block; }
+  .operation-table thead {
+    position: absolute;
+    clip-path: inset(50%);
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+  }
+  .operation-table tbody tr {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 4px 12px;
+    padding: 9px 0;
+    border-bottom: 1px solid var(--tp-line);
+  }
+  .operation-table td,
+  .operation-table td:nth-child(2),
+  .operation-table td:nth-child(3) {
+    border: 0;
+    padding: 0;
+    text-align: left;
+    white-space: normal;
+  }
+  .operation-table td:first-child {
+    grid-column: 1 / -1;
+    color: var(--tp-ink);
+    font-weight: 600;
+    white-space: normal;
+    overflow-wrap: break-word;
+  }
+  .operation-table td.subtle { font-weight: 400; color: var(--tp-muted); }
+  .operation-table td[data-label] { font-size: .9rem; overflow-wrap: break-word; }
+  .operation-table td[data-label]:nth-child(4) { grid-column: 1 / -1; }
+  .operation-table td[data-label]::before {
+    content: attr(data-label) ": ";
+    color: var(--tp-muted);
+    font: 400 .75rem/1.4 var(--tp-mono);
+  }
   main {
     padding: 26px 16px;
   }
@@ -273,4 +344,25 @@ footer {
   .cards article {
     padding: 18px;
   }
+}
+
+.work-activity { display: block; color: var(--tp-muted); font-weight: normal; }
+.active-work-name { font-weight: 600; }
+.panel.health-summary { padding: 14px 20px 10px; }
+.health-summary .summary-values {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+.summary-values > div + div { border-left: 1px solid var(--tp-line); padding-left: 14px; }
+.health-summary .summary-values dd { color: var(--tp-ink); font: 1.3rem/1.3 var(--tp-mono); }
+.health-summary details { margin-top: 8px; }
+.summary-details { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; padding: 16px 0; }
+.summary-details section { min-width: 0; }
+.health-summary summary { font: .78rem/1.45 var(--tp-mono); }
+@media (max-width: 700px) {
+  .summary-details { grid-template-columns: minmax(0, 1fr); }
+  .health-summary .summary-values dd { font-size: 1.05rem; }
+  .health-summary .summary-values dt { font-size: .7rem; }
+  .summary-values > div + div { padding-left: 8px; }
 }

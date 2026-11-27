@@ -7,27 +7,34 @@ const SVG = "http://www.w3.org/2000/svg";
 // Samples further apart than this many seconds leave a gap in a chart: the page was not sampling then.
 const GAP_SECONDS = 15;
 const SUMMARY = `
-<section class="cards" aria-label="Standard metrics">
-  <article><h2>Service</h2><p id="std-readiness" class="value">-</p><dl id="std-service"></dl></article>
-  <article><h2>Requests</h2><p id="std-received" class="value">-</p><p class="subtle">Requests received</p><dl id="std-requests"></dl></article>
-  <article><h2>Errors</h2><p id="std-errors" class="value">-</p><p class="subtle">Errors since start</p><dl id="std-error-facts"></dl></article>
-</section>`;
+<dl class="summary-values">
+  <div><dt>Service</dt><dd id="std-readiness">-</dd></div>
+  <div><dt>Requests</dt><dd id="std-received">-</dd></div>
+  <div><dt>Errors</dt><dd id="std-errors">-</dd></div>
+</dl>
+<details><summary>Service diagnostics</summary>
+  <div class="summary-details">
+    <section><h3>Service</h3><dl id="std-service"></dl></section>
+    <section><h3>Requests</h3><dl id="std-requests"></dl></section>
+    <section><h3>Errors</h3><dl id="std-error-facts"></dl></section>
+  </div>
+</details>`;
 
 const DETAIL = `
 <section class="panel"><h2>Recent Activity</h2><p class="subtle">Five-second samples for ten minutes; gaps stay visible; counters reset when the component restarts.</p>
   <div class="charts">
-    <div><h3>Items Waiting</h3><svg id="std-queue-chart" viewBox="0 0 600 150" role="img" aria-label="Items waiting over time"></svg></div>
-    <div><h3>Items Finished per Second</h3><svg id="std-finished-chart" viewBox="0 0 600 150" role="img" aria-label="Items finished per second"></svg></div>
+    <div><h3>Items Waiting</h3><div class="chart-peak"></div><svg id="std-queue-chart" viewBox="0 0 600 150" role="img" aria-label="Items waiting over time"></svg><div class="chart-axis"></div></div>
+    <div><h3>Items Finished per Second</h3><div class="chart-peak"></div><svg id="std-finished-chart" viewBox="0 0 600 150" role="img" aria-label="Items finished per second"></svg><div class="chart-axis"></div></div>
   </div>
 </section>
 <section class="tables">
   <article class="panel"><h2>Queue</h2><p id="std-queue-note" class="subtle"></p><div class="table-scroll"><table><thead><tr><th>Operation</th><th>Wait</th><th>Accepted</th><th>IDs</th></tr></thead><tbody id="std-queue-rows"></tbody></table></div></article>
-  <article class="panel"><h2>Active Work</h2><div class="table-scroll"><table><thead><tr><th>Operation</th><th>Stage</th><th>Elapsed</th><th>In stage</th><th>IDs</th></tr></thead><tbody id="std-active-rows"></tbody></table></div></article>
+  <article class="panel"><h2>Active Work</h2><div class="table-scroll"><table><thead><tr><th>Work</th><th>Stage</th><th>Elapsed</th><th>In stage</th><th>IDs</th></tr></thead><tbody id="std-active-rows"></tbody></table></div></article>
 </section>
 <section class="panel"><h2>Recent Outcomes</h2><p class="subtle">The latest 32 finished items, newest first.</p><div class="table-scroll"><table><thead><tr><th>Operation</th><th>Outcome</th><th>Wait / run</th><th>Finished</th><th>IDs</th></tr></thead><tbody id="std-outcome-rows"></tbody></table></div></section>
-<section class="tables">
-  <article class="panel"><h2>Requests by Operation</h2><div class="table-scroll"><table><thead><tr><th>Operation</th><th>Received</th><th>Responses</th><th>Outcomes</th></tr></thead><tbody id="std-request-rows"></tbody></table></div></article>
-  <article class="panel"><h2>Work Handed to Other Components</h2><div class="table-scroll"><table><thead><tr><th>Operation</th><th>Started</th><th>Finished</th><th>Outcomes</th></tr></thead><tbody id="std-work-rows"></tbody></table></div></article>
+<section class="tables operation-tables">
+  <article class="panel"><h2>Requests by Operation</h2><div class="table-scroll"><table class="operation-table"><thead><tr><th>Operation</th><th>Received</th><th>Responses</th><th>Outcomes</th></tr></thead><tbody id="std-request-rows"></tbody></table></div></article>
+  <article class="panel"><h2>Work Handed to Other Components</h2><div class="table-scroll"><table class="operation-table"><thead><tr><th>Operation</th><th>Started</th><th>Finished</th><th>Outcomes</th></tr></thead><tbody id="std-work-rows"></tbody></table></div></article>
 </section>`;
 
 export const byId = (id) => document.getElementById(id);
@@ -41,7 +48,13 @@ export const duration = (value) => {
   return (value / 3600).toFixed(1) + " h";
 };
 
-export const time = (value) => (value ? new Date(value).toLocaleString() : "Not observed");
+const utcDateTime = new Intl.DateTimeFormat("en-GB", {
+  timeZone: "UTC", year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit",
+});
+export function time(value) {
+  const date = new Date(value);
+  return value && Number.isFinite(date.getTime()) ? utcDateTime.format(date) + " UTC" : "Not observed";
+}
 
 export const yesNo = (value) => (value ? "Yes" : "No");
 
@@ -87,7 +100,16 @@ export function facts(id, pairs) {
   for (const [label, value] of pairs) list.append(element("dt", label), filled(document.createElement("dd"), value));
 }
 
-// Fill a <tbody> with one row per value; each column maps a value to text or a node.
+function activeWorkLabel(item) {
+  const words = item.operation.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/[_-]+/g, " ");
+  const activity = words.charAt(0).toUpperCase() + words.slice(1);
+  if (!item.work_name && !item.ids?.task_id) return activity;
+  const label = element("div", item.work_name || "Task name unavailable", "active-work-name");
+  label.append(element("small", activity, "work-activity"));
+  return label;
+}
+
+// Fill the table with one row per item.
 export function table(id, values, columns, empty) {
   const body = byId(id);
   if (!body) return;
@@ -100,9 +122,14 @@ export function table(id, values, columns, empty) {
     body.append(row);
     return;
   }
+  const headings = body.closest("table")?.tHead?.rows[0]?.cells;
   for (const value of values) {
     const row = element("tr");
-    for (const column of columns) row.append(filled(document.createElement("td"), column(value)));
+    columns.forEach((column, index) => {
+      const cell = filled(document.createElement("td"), column(value));
+      if (index && headings?.[index]) cell.dataset.label = headings[index].textContent;
+      row.append(cell);
+    });
     body.append(row);
   }
 }
@@ -116,14 +143,37 @@ export function chart(id, samples, field, rate = false) {
     if (!rate) return { x: sample.elapsed_seconds, y: sample[field] };
     const prior = samples[index - 1];
     const interval = prior ? sample.elapsed_seconds - prior.elapsed_seconds : 0;
-    return { x: sample.elapsed_seconds, y: interval > 0 ? (sample[field] - prior[field]) / interval : null };
+    return { x: sample.elapsed_seconds, y: interval > 0 && interval <= GAP_SECONDS ? (sample[field] - prior[field]) / interval : null };
   });
   const valid = points.filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y));
-  const label = document.createElementNS(SVG, "text");
-  label.setAttribute("x", "0");
-  label.setAttribute("y", "14");
+  const label = svg.previousElementSibling;
+  const axis = svg.nextElementSibling;
+  axis.replaceChildren();
   label.textContent = valid.length ? "Peak " + Math.max(...valid.map((point) => point.y)).toFixed(1) : "No samples yet";
-  svg.append(label);
+  const subject = svg.parentElement.querySelector("h3").textContent;
+  svg.setAttribute("aria-label", subject + " · " + label.textContent);
+  if (samples.length) {
+    const startAt = samples[0].observed_at;
+    const endAt = samples[samples.length - 1].observed_at;
+    const beginning = Date.parse(startAt);
+    const end = Date.parse(endAt);
+    const fractions = beginning === end ? [0] : [0, 0.5, 1];
+    const crossesDate = startAt.slice(0, 10) !== endAt.slice(0, 10);
+    for (const fraction of fractions) {
+      const iso = new Date(beginning + (end - beginning) * fraction).toISOString();
+      const x = 20 + 570 * fraction;
+      const tick = document.createElementNS(SVG, "path");
+      tick.setAttribute("d", "M " + x + " 134 v5");
+      tick.setAttribute("stroke", "currentColor");
+      const stamp = element("time", "", "time-tick");
+      stamp.dateTime = iso;
+      stamp.textContent = (crossesDate && fraction !== 0.5 ? iso.slice(5, 10) + " " : "") +
+        iso.slice(11, 19) + (fraction === fractions[fractions.length - 1] ? " UTC" : "");
+      svg.append(tick);
+      axis.append(stamp);
+    }
+    svg.setAttribute("aria-label", subject + " · " + label.textContent + " · " + time(startAt) + " to " + time(endAt));
+  }
   if (!valid.length) return;
   const first = samples[0].elapsed_seconds;
   const last = samples[samples.length - 1].elapsed_seconds;
@@ -185,7 +235,7 @@ export function mountStandard(summary, detail) {
 }
 
 export function renderStandard(component, snapshot) {
-  text("scope", "Since " + component + " started · " + time(snapshot.started_at));
+  text("scope", readiness(snapshot) + " · Observed " + time(snapshot.observed_at));
   text("observed", "Observed " + time(snapshot.observed_at));
   text("std-readiness", readiness(snapshot));
   facts("std-service", [
@@ -227,7 +277,7 @@ export function renderStandard(component, snapshot) {
   table(
     "std-active-rows",
     snapshot.active_work || [],
-    [(item) => item.operation, (item) => item.stage || "-", (item) => duration(item.elapsed_seconds), (item) => duration(item.stage_seconds), (item) => correlation(item.ids)],
+    [activeWorkLabel, (item) => item.stage || "-", (item) => duration(item.elapsed_seconds), (item) => duration(item.stage_seconds), (item) => correlation(item.ids)],
     "Nothing in progress."
   );
   table(
