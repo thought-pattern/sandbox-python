@@ -1,4 +1,4 @@
-"""A file written to a Task's folder in parts, of any content and any size (D-1207).
+"""A file written to a Task's folder in parts, of any content and any size.
 
 A caller sends a file's raw bytes a part at a time with `file_write_part`. Each part names the file's path, the part's
 offset, and the whole file's size and SHA-256, so a write is named by its root Task, path, size and digest. The parts of

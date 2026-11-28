@@ -75,7 +75,7 @@ class ArtifactHandler(SimpleHTTPRequestHandler):
         super().do_GET()
 
     # SimpleHTTPRequestHandler.log_message names its first parameter format; the override keeps the standard-library signature.
-    def log_message(self, format, *arguments):  # pylint: disable=redefined-builtin
+    def log_message(self, format, *arguments):
         """Requests are retained by the fixture owner."""
 
 
@@ -244,7 +244,7 @@ def test_health_page_and_api_answer_without_the_key_and_count_tool_calls_without
 
     try:
         for path, marker in (
-            ("/", b"Workspace health"),
+            ("/", b"Workspace Health"),
             ("/health.js", b"renderStandard"),
             ("/health-common.js", b"export function start"),
         ):

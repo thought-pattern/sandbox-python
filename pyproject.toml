@@ -36,7 +36,7 @@ ignore = ["**/*_pb2.py", "**/*_pb2_grpc.py"]
 [tool.vulture]
 paths = ["container", "tests"]
 exclude = ["*_pb2.py", "*_pb2_grpc.py"]
-min_confidence = 65
+min_confidence = 60
 ignore_names = [
     "cancel_futures",
     "exc_type",
@@ -50,3 +50,5 @@ ignore_names = [
 
 [tool.bandit]
 exclude_dirs = ["/.venv/"]
+# Inside its isolated container network namespace, the sandbox health server listens on 0.0.0.0 so the host reaches it.
+skips = ["B104"]

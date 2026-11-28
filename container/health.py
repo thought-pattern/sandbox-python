@@ -39,6 +39,11 @@ PAGE_FILES = {
     "/health.js": ("health.js", "text/javascript; charset=utf-8"),
     "/health-common.js": ("health-common.js", "text/javascript; charset=utf-8"),
     "/health.css": ("health.css", "text/css; charset=utf-8"),
+    "/brand.css": ("brand.css", "text/css; charset=utf-8"),
+    "/brand-logo.svg": ("brand-logo.svg", "image/svg+xml"),
+    "/cormorant-garamond.woff2": ("cormorant-garamond.woff2", "font/woff2"),
+    "/space-mono-400.woff2": ("space-mono-400.woff2", "font/woff2"),
+    "/space-mono-700.woff2": ("space-mono-700.woff2", "font/woff2"),
 }
 PAGE_HEADERS = {
     "Cache-Control": "no-store",
@@ -317,7 +322,7 @@ class HealthHTTPServer(ThreadingHTTPServer):
 
 
 class PatientSocketReader(RawIOBase):
-    """A health client's socket read as a stream that only lack of progress ends (D-907).
+    """A health client's socket read as a stream that only lack of progress ends.
 
     Each receive waits one watchdog interval (the socket's timeout). An interval in which bytes arrive answers the read;
     one in which none arrive is a check without progress, and at STALL_CHECKS such checks in a row the read fails as
@@ -356,6 +361,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.rfile = BufferedReader(PatientSocketReader(self.connection))
 
     def do_GET(self):
+        """Serve static health assets, Prometheus metrics, and JSON health endpoints."""
         body, media_type = page_file(self.path)
         status = 200
         if self.path == "/metrics":
@@ -383,5 +389,5 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     # BaseHTTPRequestHandler.log_message names its first parameter format; the override keeps the standard-library signature.
-    def log_message(self, format, *args):  # pylint: disable=redefined-builtin
+    def log_message(self, format, *args):
         return False

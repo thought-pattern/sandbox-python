@@ -6,39 +6,35 @@
 const SVG = "http://www.w3.org/2000/svg";
 // Samples further apart than this many seconds leave a gap in a chart: the page was not sampling then.
 const GAP_SECONDS = 15;
-const SCOPES = {
-  own_model: "This component's own model calls",
-  requested: "Model work this component requested from other components",
-};
-
 const SUMMARY = `
-<section class="cards" aria-label="Standard metrics">
-  <article><h2>Service</h2><p id="std-readiness" class="value">-</p><dl id="std-service"></dl></article>
-  <article><h2>Requests</h2><p id="std-received" class="value">-</p><p class="subtle">Requests received</p><dl id="std-requests"></dl></article>
-  <article><h2>Tokens</h2><p id="std-calls" class="value">-</p><p id="std-usage-scope" class="subtle"></p><dl id="std-tokens"></dl></article>
-  <article><h2>Errors</h2><p id="std-errors" class="value">-</p><p class="subtle">Errors since start</p><dl id="std-error-facts"></dl></article>
-</section>`;
+<dl class="summary-values">
+  <div><dt>Service</dt><dd id="std-readiness">-</dd></div>
+  <div><dt>Requests</dt><dd id="std-received">-</dd></div>
+  <div><dt>Errors</dt><dd id="std-errors">-</dd></div>
+</dl>
+<details><summary>Service diagnostics</summary>
+  <div class="summary-details">
+    <section><h3>Service</h3><dl id="std-service"></dl></section>
+    <section><h3>Requests</h3><dl id="std-requests"></dl></section>
+    <section><h3>Errors</h3><dl id="std-error-facts"></dl></section>
+  </div>
+</details>`;
 
 const DETAIL = `
-<section class="panel"><h2>Recent activity</h2><p class="subtle">Five-second samples for ten minutes; gaps stay visible; counters reset when the component restarts.</p>
+<section class="panel"><h2>Recent Activity</h2><p class="subtle">Five-second samples for ten minutes; gaps stay visible; counters reset when the component restarts.</p>
   <div class="charts">
-    <div><h3>Items waiting</h3><svg id="std-queue-chart" viewBox="0 0 600 150" role="img" aria-label="Items waiting over time"></svg></div>
-    <div><h3>Items finished per second</h3><svg id="std-finished-chart" viewBox="0 0 600 150" role="img" aria-label="Items finished per second"></svg></div>
-    <div><h3>Tokens per second</h3><svg id="std-token-chart" viewBox="0 0 600 150" role="img" aria-label="Tokens per second"></svg></div>
+    <div><h3>Items Waiting</h3><div class="chart-peak"></div><svg id="std-queue-chart" viewBox="0 0 600 150" role="img" aria-label="Items waiting over time"></svg><div class="chart-axis"></div></div>
+    <div><h3>Items Finished per Second</h3><div class="chart-peak"></div><svg id="std-finished-chart" viewBox="0 0 600 150" role="img" aria-label="Items finished per second"></svg><div class="chart-axis"></div></div>
   </div>
 </section>
 <section class="tables">
   <article class="panel"><h2>Queue</h2><p id="std-queue-note" class="subtle"></p><div class="table-scroll"><table><thead><tr><th>Operation</th><th>Wait</th><th>Accepted</th><th>IDs</th></tr></thead><tbody id="std-queue-rows"></tbody></table></div></article>
-  <article class="panel"><h2>Active work</h2><div class="table-scroll"><table><thead><tr><th>Operation</th><th>Stage</th><th>Elapsed</th><th>In stage</th><th>IDs</th></tr></thead><tbody id="std-active-rows"></tbody></table></div></article>
+  <article class="panel"><h2>Active Work</h2><div class="table-scroll"><table><thead><tr><th>Work</th><th>Stage</th><th>Elapsed</th><th>In stage</th><th>IDs</th></tr></thead><tbody id="std-active-rows"></tbody></table></div></article>
 </section>
-<section class="panel"><h2>Recent outcomes</h2><p class="subtle">The latest 32 finished items, newest first.</p><div class="table-scroll"><table><thead><tr><th>Operation</th><th>Outcome</th><th>Wait / run</th><th>Finished</th><th>IDs</th></tr></thead><tbody id="std-outcome-rows"></tbody></table></div></section>
-<section class="tables">
-  <article class="panel"><h2>Requests by operation</h2><div class="table-scroll"><table><thead><tr><th>Operation</th><th>Received</th><th>Responses</th><th>Outcomes</th></tr></thead><tbody id="std-request-rows"></tbody></table></div></article>
-  <article class="panel"><h2>Work handed to other components</h2><div class="table-scroll"><table><thead><tr><th>Operation</th><th>Started</th><th>Finished</th><th>Outcomes</th></tr></thead><tbody id="std-work-rows"></tbody></table></div></article>
-</section>
-<section class="tables">
-  <article class="panel"><h2>Tokens by model</h2><div class="table-scroll"><table><thead><tr><th>Model</th><th>Calls</th><th>Input</th><th>Output</th></tr></thead><tbody id="std-model-rows"></tbody></table></div></article>
-  <article class="panel"><h2>Tokens by operation</h2><div class="table-scroll"><table><thead><tr><th>Operation</th><th>Calls</th><th>Input</th><th>Output</th></tr></thead><tbody id="std-token-operation-rows"></tbody></table></div></article>
+<section class="panel"><h2>Recent Outcomes</h2><p class="subtle">The latest 32 finished items, newest first.</p><div class="table-scroll"><table><thead><tr><th>Operation</th><th>Outcome</th><th>Wait / run</th><th>Finished</th><th>IDs</th></tr></thead><tbody id="std-outcome-rows"></tbody></table></div></section>
+<section class="tables operation-tables">
+  <article class="panel"><h2>Requests by Operation</h2><div class="table-scroll"><table class="operation-table"><thead><tr><th>Operation</th><th>Received</th><th>Responses</th><th>Outcomes</th></tr></thead><tbody id="std-request-rows"></tbody></table></div></article>
+  <article class="panel"><h2>Work Handed to Other Components</h2><div class="table-scroll"><table class="operation-table"><thead><tr><th>Operation</th><th>Started</th><th>Finished</th><th>Outcomes</th></tr></thead><tbody id="std-work-rows"></tbody></table></div></article>
 </section>`;
 
 export const byId = (id) => document.getElementById(id);
@@ -52,7 +48,13 @@ export const duration = (value) => {
   return (value / 3600).toFixed(1) + " h";
 };
 
-export const time = (value) => (value ? new Date(value).toLocaleString() : "Not observed");
+const utcDateTime = new Intl.DateTimeFormat("en-GB", {
+  timeZone: "UTC", year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit",
+});
+export function time(value) {
+  const date = new Date(value);
+  return value && Number.isFinite(date.getTime()) ? utcDateTime.format(date) + " UTC" : "Not observed";
+}
 
 export const yesNo = (value) => (value ? "Yes" : "No");
 
@@ -84,11 +86,6 @@ export function correlation(ids) {
   return details;
 }
 
-export function provider(cache, direction) {
-  const reported = (cache || {})[direction + "_reported_calls"] || 0;
-  return reported ? count(cache[direction + "_input_tokens"]) + " tokens · " + count(reported) + " reporting calls" : "Not reported";
-}
-
 function filled(node, value) {
   if (value instanceof Node) node.append(value);
   else node.textContent = value;
@@ -103,7 +100,16 @@ export function facts(id, pairs) {
   for (const [label, value] of pairs) list.append(element("dt", label), filled(document.createElement("dd"), value));
 }
 
-// Fill a <tbody> with one row per value; each column maps a value to text or a node.
+function activeWorkLabel(item) {
+  const words = item.operation.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/[_-]+/g, " ");
+  const activity = words.charAt(0).toUpperCase() + words.slice(1);
+  if (!item.work_name && !item.ids?.task_id) return activity;
+  const label = element("div", item.work_name || "Task name unavailable", "active-work-name");
+  label.append(element("small", activity, "work-activity"));
+  return label;
+}
+
+// Fill the table with one row per item.
 export function table(id, values, columns, empty) {
   const body = byId(id);
   if (!body) return;
@@ -116,9 +122,14 @@ export function table(id, values, columns, empty) {
     body.append(row);
     return;
   }
+  const headings = body.closest("table")?.tHead?.rows[0]?.cells;
   for (const value of values) {
     const row = element("tr");
-    for (const column of columns) row.append(filled(document.createElement("td"), column(value)));
+    columns.forEach((column, index) => {
+      const cell = filled(document.createElement("td"), column(value));
+      if (index && headings?.[index]) cell.dataset.label = headings[index].textContent;
+      row.append(cell);
+    });
     body.append(row);
   }
 }
@@ -132,14 +143,37 @@ export function chart(id, samples, field, rate = false) {
     if (!rate) return { x: sample.elapsed_seconds, y: sample[field] };
     const prior = samples[index - 1];
     const interval = prior ? sample.elapsed_seconds - prior.elapsed_seconds : 0;
-    return { x: sample.elapsed_seconds, y: interval > 0 ? (sample[field] - prior[field]) / interval : null };
+    return { x: sample.elapsed_seconds, y: interval > 0 && interval <= GAP_SECONDS ? (sample[field] - prior[field]) / interval : null };
   });
   const valid = points.filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y));
-  const label = document.createElementNS(SVG, "text");
-  label.setAttribute("x", "0");
-  label.setAttribute("y", "14");
+  const label = svg.previousElementSibling;
+  const axis = svg.nextElementSibling;
+  axis.replaceChildren();
   label.textContent = valid.length ? "Peak " + Math.max(...valid.map((point) => point.y)).toFixed(1) : "No samples yet";
-  svg.append(label);
+  const subject = svg.parentElement.querySelector("h3").textContent;
+  svg.setAttribute("aria-label", subject + " · " + label.textContent);
+  if (samples.length) {
+    const startAt = samples[0].observed_at;
+    const endAt = samples[samples.length - 1].observed_at;
+    const beginning = Date.parse(startAt);
+    const end = Date.parse(endAt);
+    const fractions = beginning === end ? [0] : [0, 0.5, 1];
+    const crossesDate = startAt.slice(0, 10) !== endAt.slice(0, 10);
+    for (const fraction of fractions) {
+      const iso = new Date(beginning + (end - beginning) * fraction).toISOString();
+      const x = 20 + 570 * fraction;
+      const tick = document.createElementNS(SVG, "path");
+      tick.setAttribute("d", "M " + x + " 134 v5");
+      tick.setAttribute("stroke", "currentColor");
+      const stamp = element("time", "", "time-tick");
+      stamp.dateTime = iso;
+      stamp.textContent = (crossesDate && fraction !== 0.5 ? iso.slice(5, 10) + " " : "") +
+        iso.slice(11, 19) + (fraction === fractions[fractions.length - 1] ? " UTC" : "");
+      svg.append(tick);
+      axis.append(stamp);
+    }
+    svg.setAttribute("aria-label", subject + " · " + label.textContent + " · " + time(startAt) + " to " + time(endAt));
+  }
   if (!valid.length) return;
   const first = samples[0].elapsed_seconds;
   const last = samples[samples.length - 1].elapsed_seconds;
@@ -190,10 +224,6 @@ function average(seconds, samples, noun) {
   return samples ? duration(seconds) + " · " + count(samples) + " " + noun : "No samples yet";
 }
 
-function tokenColumns() {
-  return [([name]) => name, ([, usage]) => count(usage.calls), ([, usage]) => count(usage.prompt_tokens), ([, usage]) => count(usage.completion_tokens)];
-}
-
 function operationColumns(first, second) {
   return [([operation]) => operation, ([, row]) => count(row[first]), ([, row]) => count(row[second]), ([, row]) => tally(row.outcomes)];
 }
@@ -205,7 +235,7 @@ export function mountStandard(summary, detail) {
 }
 
 export function renderStandard(component, snapshot) {
-  text("scope", "Since " + component + " started · " + time(snapshot.started_at));
+  text("scope", readiness(snapshot) + " · Observed " + time(snapshot.observed_at));
   text("observed", "Observed " + time(snapshot.observed_at));
   text("std-readiness", readiness(snapshot));
   facts("std-service", [
@@ -228,18 +258,6 @@ export function renderStandard(component, snapshot) {
     ["Average running time", average(timing.average_execution_seconds, timing.execution_count, "run")],
     ["Answered without running", count(timing.queue_only_count)],
   ]);
-  const usage = snapshot.usage || {};
-  const called = (usage.total_calls || 0) > 0 || Object.keys(usage.by_model || {}).length > 0;
-  text("std-calls", called ? count(usage.total_calls) : "No model calls");
-  text("std-usage-scope", SCOPES[usage.scope] || "");
-  const cache = usage.provider_cache || {};
-  facts("std-tokens", [
-    ["Tokens in", count(usage.total_prompt_tokens)],
-    ["Tokens out", count(usage.total_completion_tokens)],
-    ["Provider cache read", provider(cache, "read")],
-    ["Provider cache write", provider(cache, "write")],
-    ["Provider failures", count(usage.total_provider_failures)],
-  ]);
   const errors = snapshot.errors || {};
   const last = errors.last || {};
   text("std-errors", count(Object.values(errors.by_kind || {}).reduce((sum, value) => sum + value, 0)));
@@ -250,7 +268,6 @@ export function renderStandard(component, snapshot) {
   const history = snapshot.history || [];
   chart("std-queue-chart", history, "queue_depth");
   chart("std-finished-chart", history, "finished", true);
-  chart("std-token-chart", history.map((sample) => ({ ...sample, tokens: sample.input_tokens + sample.output_tokens })), "tokens", true);
   const queue = snapshot.queue || [];
   text(
     "std-queue-note",
@@ -260,7 +277,7 @@ export function renderStandard(component, snapshot) {
   table(
     "std-active-rows",
     snapshot.active_work || [],
-    [(item) => item.operation, (item) => item.stage || "-", (item) => duration(item.elapsed_seconds), (item) => duration(item.stage_seconds), (item) => correlation(item.ids)],
+    [activeWorkLabel, (item) => item.stage || "-", (item) => duration(item.elapsed_seconds), (item) => duration(item.stage_seconds), (item) => correlation(item.ids)],
     "Nothing in progress."
   );
   table(
@@ -277,21 +294,17 @@ export function renderStandard(component, snapshot) {
   );
   table("std-request-rows", Object.entries(requests.by_operation || {}), operationColumns("received", "responses"), "No requests yet.");
   table("std-work-rows", Object.entries((snapshot.work || {}).by_operation || {}), operationColumns("started", "finished"), "No work handed on.");
-  table("std-model-rows", Object.entries(usage.by_model || {}), tokenColumns(), "No model calls.");
-  table("std-token-operation-rows", Object.entries(usage.by_operation || {}), tokenColumns(), "No model calls.");
 }
 
-// Poll /api/health with one request outstanding and a four-second timeout, paused while the tab is hidden; a failed
-// poll marks the page stale, and a new incarnation shows the restart notice.
+// Poll /api/health with one request outstanding, paused while the tab is hidden; a failed poll marks the page stale,
+// and a new incarnation shows the restart notice.
 export function start(component, render) {
   const state = { snapshot: null, incarnation: "", pending: false, timer: null };
   async function load() {
     if (state.pending || document.hidden) return;
     state.pending = true;
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 4000);
     try {
-      const reply = await fetch("/api/health", { cache: "no-store", signal: controller.signal });
+      const reply = await fetch("/api/health", { cache: "no-store" });
       if (!reply.ok) throw new Error("HTTP " + reply.status);
       const snapshot = await reply.json();
       if (state.incarnation && state.incarnation !== snapshot.incarnation) {
@@ -304,10 +317,9 @@ export function start(component, render) {
       text("connection", "Live");
       byId("connection").className = "status live";
     } catch (error) {
-      text("connection", "Stale · " + (error.name === "AbortError" ? "timed out" : error.message));
+      text("connection", "Stale · " + error.message);
       byId("connection").className = "status stale";
     } finally {
-      clearTimeout(timeout);
       state.pending = false;
       clearTimeout(state.timer);
       if (!document.hidden) state.timer = setTimeout(load, 1000 * (state.snapshot?.refresh_seconds || 5));

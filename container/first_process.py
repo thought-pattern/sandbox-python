@@ -1,4 +1,4 @@
-"""The Workspace server's duties as its container's first process (D-1182, D-1183, D-649).
+"""The Workspace server's duties as its container's first process.
 
 The server is the container's PID 1, with no separate init. pid_namespaces(7): only signals for which the first process
 has established a handler can be sent to it by the other members of its namespace; SIGKILL and SIGSTOP are forced
@@ -7,7 +7,7 @@ code a Task runs can neither kill nor stop the server. The server holds SIGTERM 
 reads each one with sigwaitinfo. It stops only on one sent from outside the container, which is the engine's stop or the
 deployment's. A tool's signal to the server names the tool and is refused.
 
-Every process whose parent exits is handed to the first process, so the server reaps each orphan that has ended (D-649).
+Every process whose parent exits is handed to the first process, so the server reaps each orphan that has ended.
 Each tool leader's exit status stays with its own wait: a leader is held out of the reaper's reach from the moment it is
 started until its wait has it.
 
@@ -23,15 +23,8 @@ from os import WNOHANG, defpath as os_defpath, getpid as os_getpid, waitpid as o
 from pathlib import Path
 from shutil import which as shutil_which
 from signal import SIG_BLOCK, SIGCHLD, SIGINT, SIGTERM, pthread_sigmask as signal_pthread_sigmask
-import sys
-from sys import executable as sys_executable
+from sys import executable as sys_executable, modules as sys_modules, platform as sys_platform
 from threading import Event as threading_Event, Lock as threading_Lock
-
-# sigwaitinfo exists only on Linux, where the server runs as a container's first process; the in-process uses of the
-# server on another host never serve its signals. Imported apart, under the platform test Pyright reads, so it is
-# checked for Linux only.
-if sys.platform == "linux":
-    from signal import sigwaitinfo as signal_sigwaitinfo  # pylint: disable=ungrouped-imports
 
 # The signals the server holds blocked in every thread and reads itself; a tool program gets them unblocked.
 HELD_SIGNALS = (SIGTERM, SIGINT, SIGCHLD)
@@ -135,7 +128,8 @@ class FirstProcess:
     def serve(self) -> None:
         """Read the held signals for the server's life: reap orphans on SIGCHLD, stop on a stop signal from outside the
         container, refuse one from a process inside it."""
-        if sys.platform != "linux":
+        signal_sigwaitinfo = getattr(sys_modules.get("signal", False), "sigwaitinfo", False)
+        if sys_platform != "linux" or not callable(signal_sigwaitinfo):
             raise RuntimeError("the Workspace server reads its signals only on Linux")
         try:
             while True:

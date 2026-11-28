@@ -12,9 +12,14 @@ from functools import partial as functools_partial
 from hashlib import sha256 as hashlib_sha256
 from hmac import compare_digest as hmac_compare_digest
 from inspect import Parameter as inspect_Parameter, signature as inspect_signature
-from json import loads as json_loads
 from logging import (
+    CRITICAL as logging_CRITICAL,
+    DEBUG as logging_DEBUG,
+    ERROR as logging_ERROR,
     INFO as logging_INFO,
+    WARNING as logging_WARNING,
+    Formatter as logging_Formatter,
+    StreamHandler as logging_StreamHandler,
     basicConfig as logging_basicConfig,
     getLogger as logging_getLogger,
 )
@@ -87,10 +92,11 @@ from process_output import (
     json_document,
     keep_output,
     log_commits,
+    nfkc_stream_line,
     output_detail,
     output_lines,
     remove_unowned_run_outputs,
-    ripgrep_relative_path,
+    scoped_ripgrep_matches,
     search_matches,
     text_lines,
 )
@@ -106,12 +112,12 @@ DEFAULT_PORT = 8080
 DEFAULT_HEALTH_PORT = 8081
 DEFAULT_MAX_CONCURRENT_REQUESTS = 4
 # The interval at which the watchdog checks a running tool process's CPU time and output size; it ends the process at
-# STALL_CHECKS checks in a row in which neither moved (D-907).
+# STALL_CHECKS checks in a row in which neither moved.
 DEFAULT_PROCESS_WATCHDOG_SECONDS = 120
 # How often a running tool process is looked at for its exit between the watchdog's checks.
 WATCHDOG_POLL_SECONDS = 1.0
 # The interval at which the health listener checks a client's read for bytes; it ends the read at STALL_CHECKS checks in
-# a row in which no byte arrived (D-907).
+# a row in which no byte arrived.
 DEFAULT_REQUEST_READ_WATCHDOG_SECONDS = 10.0
 # The depth a listing has when its caller names none: the whole tree.
 WHOLE_TREE_DEPTH = -1
@@ -132,7 +138,7 @@ IMAGE = ""
 PUBLIC_PATHS = {"/", "/health.js", "/health-common.js", "/health.css", "/api/health", "/metrics", "/health/live", "/health/ready"}
 PROCESS_WATCHDOG_SECONDS = DEFAULT_PROCESS_WATCHDOG_SECONDS
 # The Workspace's own Git configuration, beside this file and read-only with it: the identity of a commit whose
-# repository names none (D-1186). No system or host configuration reaches a Git tool.
+# repository names none. No system or host configuration reaches a Git tool.
 GIT_CONFIG_FILE = Path(__file__).resolve().parent / "gitconfig"
 GIT_ENV = {
     **os_environ,
@@ -421,7 +427,7 @@ def internal_run_process(
     parser's value is the result's stdout; any other run's stdout is answered as an output is.
     A watchdog ends a process that has stopped making progress: every PROCESS_WATCHDOG_SECONDS it reads the invocation's
     CPU time and output sizes, a check that sees either move resets the count, and at STALL_CHECKS checks in a row in
-    which neither moved the invocation is ended and the result is `stalled` (D-907). A process that keeps working runs
+    which neither moved the invocation is ended and the result is `stalled`. A process that keeps working runs
     to its end. When the direct child exits, its process group is ended: a background descendant still
     holding the output open cannot keep a finished tool running.
     The program starts with the signals the server holds unblocked (`program_command`), and its leader is held from the
@@ -785,7 +791,7 @@ def scoped_repository_file(root: Path, target: Path) -> tuple:
                     dir_fd=directory,
                 )
             # A missing folder is not_found and a file where a folder belongs is not_directory, as for any path; only a
-            # component that became a symlink, an escape, is path_escape (D-096).
+            # component that became a symlink, an escape, is path_escape.
             except (FileNotFoundError, PermissionError):
                 raise
             except NotADirectoryError as err:
@@ -1089,38 +1095,11 @@ def file_search(pattern: str, path: str = ".", max_results: int = 0):
     return computed_return_value
 
 
-def nfkc_matching_line(root: Path, relative: str, canonical_symbol: str) -> int:
-    """First 1-based line number in `relative` whose UTF-8 NFKC text contains `canonical_symbol`, or 0."""
-    target = (root / decode_path_text(relative)).resolve()
-    if not target.is_relative_to(root):
-        raise ToolError("Scoped Python search escaped its repository root", code="path_escape", status=400)
-    try:
-        opened, state = scoped_repository_file(root, target)
-    except (FileNotFoundError, PermissionError, NotADirectoryError):
-        return 0
-    del state
-    matched_line = 0
-    with opened:
-        for line_number, raw_line in enumerate(opened, start=1):
-            try:
-                decoded = raw_line.decode("utf-8")
-            except UnicodeDecodeError:
-                return 0
-            if canonical_symbol in unicodedata_normalize("NFKC", decoded):
-                matched_line = line_number
-                break
-    return matched_line
-
-
 @tool
 def file_search_scoped(repository_root: str, symbol: str, max_results: int = 0):
     """Return every distinct Python-source path that names the symbol, or the caller's positive `max_results` of them."""
     if type(repository_root) is not str or not repository_root or type(symbol) is not str:
-        raise ToolError(
-            "Scoped Python search requires repository root and symbol",
-            code="bad_arguments",
-            status=400,
-        )
+        raise ToolError("Scoped Python search requires repository root and symbol", code="bad_arguments", status=400)
     if not symbol.isidentifier():
         raise ToolError("Scoped Python search symbol is invalid", code="bad_arguments", status=400)
     if type(max_results) is not int or max_results < 0:
@@ -1129,103 +1108,49 @@ def file_search_scoped(repository_root: str, symbol: str, max_results: int = 0):
     if not root.is_dir():
         raise ToolError("Scoped Python repository root is missing", code="path_missing", status=404)
     canonical_symbol = unicodedata_normalize("NFKC", symbol)
+    base_rg = ["rg", "--json", "--hidden", "--glob", "*.py", "--glob", "!**/.git/**"]
+    parser = functools_partial(scoped_matches, root=root)
     result = internal_run_process(
-        [
-            "rg",
-            "--json",
-            "--hidden",
-            "--fixed-strings",
-            "--glob",
-            "*.py",
-            "--glob",
-            "!**/.git/**",
-            "-e",
-            canonical_symbol,
-            "--",
-            str(root),
-        ],
-        stdout_parser=functools_partial(scoped_matches, root=root),
-        parsed_exit_codes=(0, 1),
+        [*base_rg, "--fixed-strings", "-e", canonical_symbol, "--", str(root)], stdout_parser=parser, parsed_exit_codes=(0, 1)
     )
     if result.get("exitCode", -1) not in (0, 1):
         require_process_success(result, "scoped Python search")
     matches_by_path = {entry.get("relative_path", ""): entry for entry in result.get("stdout", [])}
     non_ascii = internal_run_process(
-        [
-            "rg",
-            "--json",
-            "--hidden",
-            "--glob",
-            "*.py",
-            "--glob",
-            "!**/.git/**",
-            "-e",
-            r"[^\x00-\x7F]",
-            "--",
-            str(root),
-        ],
-        stdout_parser=functools_partial(scoped_matches, root=root),
-        parsed_exit_codes=(0, 1),
+        [*base_rg, "-e", r"[^\x00-\x7F]", "--", str(root)], stdout_parser=parser, parsed_exit_codes=(0, 1)
     )
     if non_ascii.get("exitCode", -1) not in (0, 1):
         require_process_success(non_ascii, "scoped Python search")
     for candidate in non_ascii.get("stdout", []):
         relative = candidate.get("relative_path", "")
-        if relative and relative not in matches_by_path:
-            matched_line = nfkc_matching_line(root, relative, canonical_symbol)
-            if matched_line > 0:
-                matches_by_path[relative] = {"relative_path": relative, "line": matched_line}
+        if not relative or relative in matches_by_path:
+            continue
+        target = (root / decode_path_text(relative)).resolve()
+        if not target.is_relative_to(root):
+            raise ToolError("Scoped Python search escaped its repository root", code="path_escape", status=400)
+        try:
+            opened, state = scoped_repository_file(root, target)
+        except (FileNotFoundError, PermissionError, NotADirectoryError):
+            continue
+        del state
+        with opened:
+            matched_line = nfkc_stream_line(opened, canonical_symbol)
+        if matched_line > 0:
+            matches_by_path[relative] = {"relative_path": relative, "line": matched_line}
     matches = [matches_by_path.get(path, {}) for path in sorted(matches_by_path)]
-    truncated = False
-    if max_results and len(matches) > max_results:
+    truncated = bool(max_results) and len(matches) > max_results
+    if truncated:
         matches = matches[:max_results]
-        truncated = True
-    search = {
-        "repository_root": str(root),
-        "symbol": symbol,
-        "matches": matches,
-        "truncated": truncated,
-    }
+    search = {"repository_root": str(root), "symbol": symbol, "matches": matches, "truncated": truncated}
     return search
 
 
 def scoped_matches(lines, root: Path) -> list:
-    """Each distinct Python-source path beneath `root` that ripgrep's JSON lines name, with its first matching line,
-    read one line at a time and sorted by path."""
-    matches_by_path = {}
-    for line in lines:
-        data = json_loads(line) if line.strip() else {}
-        if data.get("type", "") != "match":
-            continue
-        path_field = data.get("data", {}).get("path", {})
-        try:
-            raw_relative = ripgrep_relative_path(path_field, root)
-        except ValueError as err:
-            raise ToolError(
-                "Scoped Python search escaped its repository root",
-                code="path_escape",
-                status=400,
-            ) from err
-        if not raw_relative or raw_relative == ".":
-            raise ToolError(
-                "Scoped Python search escaped its repository root",
-                code="path_escape",
-                status=400,
-            )
-        selected = (root / decode_path_text(raw_relative)).resolve()
-        if not selected.is_relative_to(root):
-            raise ToolError(
-                "Scoped Python search escaped its repository root",
-                code="path_escape",
-                status=400,
-            )
-        relative = encode_path_bytes(os_fsencode(selected.relative_to(root)))
-        if relative not in matches_by_path:
-            matches_by_path[relative] = {
-                "relative_path": relative,
-                "line": data.get("data", {}).get("line_number", 0),
-            }
-    matches = [matches_by_path.get(path, {}) for path in sorted(matches_by_path)]
+    """Each distinct Python-source path beneath `root` that ripgrep's JSON lines name, sorted by path."""
+    try:
+        matches = scoped_ripgrep_matches(lines, root)
+    except ValueError as err:
+        raise ToolError("Scoped Python search escaped its repository root", code="path_escape", status=400) from err
     return matches
 
 
@@ -1912,7 +1837,7 @@ def parse_args(argv: list):
 
 
 def withhold_process_access() -> None:
-    """Close the server's own process to every other process of its account before it reads its key (D-1181).
+    """Close the server's own process to every other process of its account before it reads its key.
 
     Tool processes run under the server's account, and processes of one account can otherwise open each other's memory,
     descriptors and environment through /proc and ptrace, so code a Task runs could read the key out of the server's
@@ -1971,17 +1896,28 @@ def configure(args):
     return False
 
 
+class JournalStreamFormatter(logging_Formatter):
+    """Prefix the stream record with its syslog priority for systemd's journal stream."""
+
+    priorities = {logging_CRITICAL: 2, logging_ERROR: 3, logging_WARNING: 4, logging_INFO: 6, logging_DEBUG: 7}
+
+    def format(self, record):
+        return f"<{self.priorities.get(record.levelno, 6)}>{super().format(record)}"
+
+
 def main(argv: list):
     # Before any thread exists, so every thread and tool process the server starts inherits the block (first_process).
     hold_signals()
-    logging_basicConfig(level=logging_INFO, format="%(asctime)s %(levelname)s %(message)s")
+    handler = logging_StreamHandler()
+    handler.setFormatter(JournalStreamFormatter("%(asctime)s %(levelname)s %(message)s"))
+    logging_basicConfig(level=logging_INFO, handlers=[handler])
     withhold_process_access()
     args = parse_args(argv)
     auth_token = read_auth_token(args)
     configure(args)
     owner = WorkspaceService(auth_token, args)
     # The container listens on every interface of its own network namespace so the published host port reaches it.
-    server = HealthHTTPServer(("0.0.0.0", args.health_port), owner, args.request_read_watchdog_seconds)  # nosec B104
+    server = HealthHTTPServer(("0.0.0.0", args.health_port), owner, args.request_read_watchdog_seconds)
     owner.start(f"0.0.0.0:{args.port}")
     # The signal reader runs for the server's life; the process ends with the main thread once the server has drained.
     threading_Thread(target=FIRST_PROCESS.serve, name="workspace-signals", daemon=True).start()

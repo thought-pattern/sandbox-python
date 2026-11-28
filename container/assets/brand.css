@@ -1,0 +1,88 @@
+/* Thought Pattern AI visual identity from https://thought-pattern.com/. */
+@font-face {
+  font-family: "Cormorant Garamond";
+  src: url("/cormorant-garamond.woff2") format("woff2");
+  font-weight: 300 700;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Space Mono";
+  src: url("/space-mono-400.woff2") format("woff2");
+  font-weight: 400;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Space Mono";
+  src: url("/space-mono-700.woff2") format("woff2");
+  font-weight: 700;
+  font-display: swap;
+}
+
+:root {
+  color-scheme: dark;
+  --tp-bg: #160716;
+  --tp-recessed: #0d040d;
+  --tp-card: #2a0f2c;
+  --tp-raised: #3d1940;
+  --tp-ink: #f7f3f7;
+  --tp-body: #ded5de;
+  --tp-muted: #b9adb9;
+  --tp-yellow: #e4e527;
+  --tp-yellow-hover: #f2f36b;
+  --tp-line: rgba(247, 243, 247, .12);
+  --tp-line-strong: rgba(247, 243, 247, .22);
+  --tp-rule: rgba(228, 229, 39, .35);
+  --tp-success: #4ade80;
+  --tp-success-bg: rgba(74, 222, 128, .12);
+  --tp-running: #7dd3fc;
+  --tp-warning: #fbbf24;
+  --tp-warning-bg: rgba(251, 191, 36, .14);
+  --tp-danger: #f87171;
+  --tp-danger-bg: rgba(248, 113, 113, .15);
+  --tp-ground:
+    radial-gradient(1200px 600px at 20% -10%, rgba(196, 92, 206, .1), transparent 60%),
+    radial-gradient(900px 500px at 85% 110%, rgba(196, 92, 206, .12), transparent 50%),
+    linear-gradient(180deg, #160716, #0d040d);
+  --tp-display: "Fitzgerald Black", "Century Gothic", "Futura", "Avenir Next", sans-serif;
+  --tp-serif: "Cormorant Garamond", "EB Garamond", Garamond, Georgia, serif;
+  --tp-mono: "Space Mono", "SF Mono", ui-monospace, Menlo, Consolas, "Liberation Mono", monospace;
+
+  background: var(--tp-bg);
+  color: var(--tp-body);
+  font-family: var(--tp-serif);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--tp-ground), var(--tp-bg);
+  background-attachment: fixed;
+}
+
+h1,
+h2 {
+  color: var(--tp-ink);
+  font-family: var(--tp-display);
+  font-weight: 400;
+}
+
+.eyebrow {
+  color: var(--tp-yellow);
+  font: 400 .75rem/1.5 var(--tp-mono);
+  letter-spacing: .12em;
+  margin: 0;
+}
+
+button, a, input, summary {
+  outline-offset: 4px;
+}
+
+:focus-visible {
+  outline: 2px solid var(--tp-yellow);
+}
