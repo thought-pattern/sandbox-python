@@ -361,6 +361,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.rfile = BufferedReader(PatientSocketReader(self.connection))
 
     def do_GET(self):
+        """Serve static health assets, Prometheus metrics, and JSON health endpoints."""
         body, media_type = page_file(self.path)
         status = 200
         if self.path == "/metrics":
@@ -388,5 +389,5 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     # BaseHTTPRequestHandler.log_message names its first parameter format; the override keeps the standard-library signature.
-    def log_message(self, format, *args):  # pylint: disable=redefined-builtin
+    def log_message(self, format, *args):
         return False

@@ -1917,7 +1917,7 @@ def main(argv: list):
     configure(args)
     owner = WorkspaceService(auth_token, args)
     # The container listens on every interface of its own network namespace so the published host port reaches it.
-    server = HealthHTTPServer(("0.0.0.0", args.health_port), owner, args.request_read_watchdog_seconds)  # nosec B104
+    server = HealthHTTPServer(("0.0.0.0", args.health_port), owner, args.request_read_watchdog_seconds)
     owner.start(f"0.0.0.0:{args.port}")
     # The signal reader runs for the server's life; the process ends with the main thread once the server has drained.
     threading_Thread(target=FIRST_PROCESS.serve, name="workspace-signals", daemon=True).start()

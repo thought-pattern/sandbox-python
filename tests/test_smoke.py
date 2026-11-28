@@ -75,7 +75,7 @@ class ArtifactHandler(SimpleHTTPRequestHandler):
         super().do_GET()
 
     # SimpleHTTPRequestHandler.log_message names its first parameter format; the override keeps the standard-library signature.
-    def log_message(self, format, *arguments):  # pylint: disable=redefined-builtin
+    def log_message(self, format, *arguments):
         """Requests are retained by the fixture owner."""
 
 
